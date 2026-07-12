@@ -20,6 +20,16 @@ def test_initializes_expected_stage_zero_tables(tmp_path: Path) -> None:
             ).fetchall()
         }
         journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+        kb_document_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(knowledge_base_documents)").fetchall()
+        }
+        migration_versions = [
+            row["version"]
+            for row in connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            ).fetchall()
+        ]
 
     assert {
         "knowledge_bases",
@@ -30,6 +40,8 @@ def test_initializes_expected_stage_zero_tables(tmp_path: Path) -> None:
         "api_calls",
     }.issubset(tables)
     assert journal_mode.lower() == "wal"
+    assert {"status", "last_job_id"}.issubset(kb_document_columns)
+    assert migration_versions == [1, 2]
 
 
 def test_cache_round_trip_and_api_record_have_no_payload(tmp_path: Path) -> None:

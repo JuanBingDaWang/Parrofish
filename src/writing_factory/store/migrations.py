@@ -108,6 +108,15 @@ MIGRATIONS: tuple[str, ...] = (
     CREATE INDEX IF NOT EXISTS idx_api_calls_created ON api_calls(created_at);
     CREATE INDEX IF NOT EXISTS idx_api_calls_request ON api_calls(request_hash);
     """,
+    """
+    ALTER TABLE knowledge_base_documents
+        ADD COLUMN status TEXT NOT NULL DEFAULT 'indexing'
+        CHECK (status IN ('indexing', 'ready', 'failed'));
+    ALTER TABLE knowledge_base_documents
+        ADD COLUMN last_job_id TEXT;
+    CREATE INDEX IF NOT EXISTS idx_kb_documents_status
+        ON knowledge_base_documents(kb_id, status);
+    """,
 )
 
 

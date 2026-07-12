@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from PyQt6.QtCore import QSize
@@ -22,15 +23,24 @@ from PyQt6.QtWidgets import (
 )
 
 from writing_factory.llm.models import ChatResult
+from writing_factory.ui.knowledge_page import KnowledgeBasePage
 from writing_factory.ui.workers import BackgroundTaskManager, TaskContext
 
 
 class MainWindow(QMainWindow):
     """Application shell with non-blocking provider diagnostics."""
 
-    def __init__(self, siliconflow_check: Callable[[], ChatResult]) -> None:
+    def __init__(
+        self,
+        siliconflow_check: Callable[[], ChatResult],
+        *,
+        ingest_document: Callable[[Path, TaskContext], Any] | None = None,
+        list_documents: Callable[[], list[dict[str, object]]] | None = None,
+    ) -> None:
         super().__init__()
         self._siliconflow_check = siliconflow_check
+        self._ingest_document = ingest_document
+        self._list_documents = list_documents or (lambda: [])
         self._tasks = BackgroundTaskManager(self)
         self._check_task_id: str | None = None
         self._close_pending = False
@@ -65,11 +75,19 @@ class MainWindow(QMainWindow):
             self.navigation.addItem(item)
 
         self.pages = QStackedWidget()
-        for title in ("项目", "知识库", "作者档案", "写作任务"):
-            self.pages.addWidget(self._empty_page(title))
+        self.pages.addWidget(self._empty_page("项目"))
+        self.knowledge_page = KnowledgeBasePage(
+            self._tasks,
+            ingest_document=self._ingest_document,
+            list_documents=self._list_documents,
+            show_message=self.statusBar().showMessage,
+        )
+        self.pages.addWidget(self.knowledge_page)
+        self.pages.addWidget(self._empty_page("作者档案"))
+        self.pages.addWidget(self._empty_page("写作任务"))
         self.pages.addWidget(self._settings_page())
         self.navigation.currentRowChanged.connect(self.pages.setCurrentIndex)
-        self.navigation.setCurrentRow(4)
+        self.navigation.setCurrentRow(1)
 
         root_layout.addWidget(self.navigation)
         root_layout.addWidget(self.pages, 1)
@@ -277,5 +295,34 @@ QStatusBar {
     background: #ffffff;
     border-top: 1px solid #dce2e8;
     color: #55616e;
+}
+QTableWidget {
+    background: #ffffff;
+    alternate-background-color: #f4f6f8;
+    border: 1px solid #dce2e8;
+    border-radius: 5px;
+    gridline-color: #e7ebef;
+}
+QHeaderView::section {
+    background: #edf1f4;
+    color: #485564;
+    border: 0;
+    border-bottom: 1px solid #d4dbe2;
+    padding: 8px 10px;
+    font-weight: 600;
+}
+QTableWidget::item {
+    padding: 8px;
+}
+QProgressBar {
+    background: #e7ebef;
+    border: 0;
+    border-radius: 4px;
+    color: #28323c;
+    text-align: center;
+}
+QProgressBar::chunk {
+    background: #27806b;
+    border-radius: 4px;
 }
 """

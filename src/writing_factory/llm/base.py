@@ -5,11 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import threading
 import time
 import uuid
 from collections.abc import Mapping
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -17,35 +15,14 @@ from pydantic import SecretStr
 from tenacity import Retrying, retry_if_exception_type, stop_after_attempt
 from tenacity.wait import wait_exponential_jitter
 
+from writing_factory.llm.common import (
+    ExternalServiceError,
+    RateLimiter,
+    RetryableServiceError,
+)
 from writing_factory.store import ApiCallRecord, Database
 
 logger = logging.getLogger(__name__)
-
-
-class ExternalServiceError(RuntimeError):
-    """A sanitized provider failure safe to show in the desktop UI."""
-
-
-class RetryableServiceError(ExternalServiceError):
-    """A transient error eligible for bounded retry."""
-
-
-class RateLimiter:
-    """Serialize request starts when a minimum interval is configured."""
-
-    def __init__(self, minimum_interval_seconds: float) -> None:
-        self._minimum_interval = max(0.0, minimum_interval_seconds)
-        self._last_request_at = 0.0
-        self._lock = threading.Lock()
-
-    def wait(self) -> None:
-        """Wait only on the worker thread that is making the request."""
-
-        with self._lock:
-            delay = self._minimum_interval - (time.monotonic() - self._last_request_at)
-            if delay > 0:
-                time.sleep(delay)
-            self._last_request_at = time.monotonic()
 
 
 class ServiceTransport:
@@ -63,7 +40,6 @@ class ServiceTransport:
         max_retries: int,
         minimum_interval_seconds: float = 0.0,
         http_client: httpx.Client | None = None,
-        unauthenticated_client: httpx.Client | None = None,
     ) -> None:
         self.provider = provider
         self.base_url = base_url.rstrip("/")
@@ -71,7 +47,6 @@ class ServiceTransport:
         self.max_retries = max(1, max_retries)
         self.rate_limiter = RateLimiter(minimum_interval_seconds)
         self._owns_client = http_client is None
-        self._owns_unauthenticated_client = unauthenticated_client is None
         timeout = httpx.Timeout(
             connect=connect_timeout_seconds,
             read=read_timeout_seconds,
@@ -86,76 +61,12 @@ class ServiceTransport:
             },
             timeout=timeout,
         )
-        # Presigned object-storage URLs must never receive the provider token.
-        self._unauthenticated_client = unauthenticated_client or httpx.Client(timeout=timeout)
 
     def close(self) -> None:
         """Release the owned connection pool."""
 
         if self._owns_client:
             self._client.close()
-        if self._owns_unauthenticated_client:
-            self._unauthenticated_client.close()
-
-    def upload_file(
-        self,
-        upload_url: str,
-        file_path: Path,
-        *,
-        operation: str,
-        content_type: str = "application/octet-stream",
-    ) -> None:
-        """Upload to a presigned URL without forwarding provider credentials."""
-
-        path = file_path.resolve(strict=True)
-        request_hash = hashlib.sha256(
-            f"{self.provider}:{operation}:{path.stat().st_size}:{path.suffix}".encode()
-        ).hexdigest()
-        call_id = str(uuid.uuid4())
-        started_at = time.perf_counter()
-        try:
-            Retrying(
-                stop=stop_after_attempt(self.max_retries),
-                wait=wait_exponential_jitter(initial=0.5, max=8.0),
-                retry=retry_if_exception_type(RetryableServiceError),
-                reraise=True,
-            )(self._upload_once, upload_url, path, content_type)
-        except Exception as exc:
-            safe_error = (
-                exc
-                if isinstance(exc, ExternalServiceError)
-                else ExternalServiceError(f"{self.provider} upload failed")
-            )
-            self._record_call(
-                call_id=call_id,
-                request_hash=request_hash,
-                operation=operation,
-                model=None,
-                reasoning_effort=None,
-                prompt_summary=json.dumps(
-                    {"bytes": path.stat().st_size, "suffix": path.suffix.lower()}
-                ),
-                cache_hit=False,
-                status="error",
-                duration_ms=self._elapsed_ms(started_at),
-                error_type=type(safe_error).__name__,
-            )
-            if safe_error is exc:
-                raise
-            raise safe_error from exc
-        self._record_call(
-            call_id=call_id,
-            request_hash=request_hash,
-            operation=operation,
-            model=None,
-            reasoning_effort=None,
-            prompt_summary=json.dumps(
-                {"bytes": path.stat().st_size, "suffix": path.suffix.lower()}
-            ),
-            cache_hit=False,
-            status="success",
-            duration_ms=self._elapsed_ms(started_at),
-        )
 
     def request_json(
         self,
@@ -274,26 +185,6 @@ class ServiceTransport:
         if not isinstance(data, dict):
             raise ExternalServiceError(f"{self.provider} returned an invalid response shape")
         return data
-
-    def _upload_once(self, upload_url: str, path: Path, content_type: str) -> None:
-        self.rate_limiter.wait()
-        try:
-            with path.open("rb") as source:
-                response = self._unauthenticated_client.put(
-                    upload_url,
-                    content=source,
-                    headers={"Content-Type": content_type},
-                )
-        except (OSError, httpx.TimeoutException, httpx.NetworkError) as exc:
-            raise RetryableServiceError(f"{self.provider} upload network error") from exc
-        if response.status_code == 429 or response.status_code >= 500:
-            raise RetryableServiceError(
-                f"{self.provider} upload temporary error (HTTP {response.status_code})"
-            )
-        if response.is_error:
-            raise ExternalServiceError(
-                f"{self.provider} upload was rejected (HTTP {response.status_code})"
-            )
 
     def _record_call(
         self,

@@ -97,8 +97,10 @@ def test_mineru_typed_operations(settings, tmp_path: Path) -> None:
     database.initialize()
     client = MinerUClient(settings, database)
     client.transport.close()
+    client.transfers.close()
     transport = FakeTransport()
     client.transport = transport
+    client.transfers = transport
     source = tmp_path / "paper.pdf"
     source.write_bytes(b"pdf")
 

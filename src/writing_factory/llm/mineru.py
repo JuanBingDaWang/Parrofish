@@ -9,6 +9,7 @@ from typing import Any
 from writing_factory.config import Settings
 from writing_factory.llm.base import ExternalServiceError, ServiceTransport
 from writing_factory.llm.models import MinerUBatchUpload, MinerUTask
+from writing_factory.llm.transfers import FileTransferTransport
 from writing_factory.store import Database
 
 
@@ -26,11 +27,20 @@ class MinerUClient:
             max_retries=settings.max_retries,
             minimum_interval_seconds=settings.min_request_interval_seconds,
         )
+        self.transfers = FileTransferTransport(
+            provider="mineru",
+            database=database,
+            connect_timeout_seconds=settings.connect_timeout_seconds,
+            read_timeout_seconds=settings.read_timeout_seconds,
+            max_retries=settings.max_retries,
+            minimum_interval_seconds=settings.min_request_interval_seconds,
+        )
 
     def close(self) -> None:
         """Close the underlying HTTP connection pool."""
 
         self.transport.close()
+        self.transfers.close()
 
     def submit_url(
         self,
@@ -113,10 +123,19 @@ class MinerUClient:
     def upload_file(self, upload_url: str, file_path: Path) -> None:
         """Upload a local document to a MinerU presigned URL without auth leakage."""
 
-        self.transport.upload_file(
+        self.transfers.upload_file(
             upload_url,
             file_path,
             operation="upload_document",
+        )
+
+    def download_result(self, download_url: str, destination: Path) -> Path:
+        """Download a completed result archive without forwarding MinerU auth."""
+
+        return self.transfers.download_file(
+            download_url,
+            destination,
+            operation="download_parse_result",
         )
 
     def get_batch_result(self, batch_id: str) -> dict[str, Any]:

@@ -1,0 +1,282 @@
+"""SQLite repositories for knowledge bases, documents, chunks, and ingest jobs."""
+
+from __future__ import annotations
+
+import json
+import uuid
+from pathlib import Path
+
+from writing_factory.kb.models import (
+    Bibliography,
+    Chunk,
+    ChunkedDocument,
+    ManagedDocument,
+    ParsedDocument,
+)
+from writing_factory.store.database import Database, utc_now
+
+
+class KnowledgeBaseRepository:
+    """Persist KB membership and ingestion state with SQLite as source of truth."""
+
+    def __init__(self, database: Database) -> None:
+        self.database = database
+
+    def ensure_default(self) -> str:
+        """Create and return the stable default knowledge base."""
+
+        return self.create("默认知识库", kb_id="kb_default")
+
+    def create(self, name: str, *, kb_id: str | None = None) -> str:
+        """Create a named KB or return the existing record with that identifier."""
+
+        identifier = kb_id or f"kb_{uuid.uuid4().hex}"
+        now = utc_now()
+        with self.database.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO knowledge_bases(kb_id, name, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(kb_id) DO UPDATE SET updated_at = excluded.updated_at
+                """,
+                (identifier, name, now, now),
+            )
+        return identifier
+
+    def list_knowledge_bases(self) -> list[dict[str, object]]:
+        """Return KBs with ready document counts for the desktop UI."""
+
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT kb.kb_id, kb.name, kb.description,
+                       COUNT(CASE WHEN kbd.status = 'ready' THEN 1 END) AS document_count
+                FROM knowledge_bases kb
+                LEFT JOIN knowledge_base_documents kbd ON kbd.kb_id = kb.kb_id
+                GROUP BY kb.kb_id
+                ORDER BY kb.created_at
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def create_job(self, kb_id: str, source_path: Path) -> str:
+        """Persist a pending job before any file or network operation starts."""
+
+        job_id = f"job_{uuid.uuid4().hex}"
+        now = utc_now()
+        with self.database.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO ingest_jobs(
+                    job_id, kb_id, source_path, status, created_at, updated_at
+                ) VALUES (?, ?, ?, 'pending', ?, ?)
+                """,
+                (job_id, kb_id, str(source_path), now, now),
+            )
+        return job_id
+
+    def update_job(
+        self,
+        job_id: str,
+        status: str,
+        *,
+        document_id: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        """Move a job forward or mark a sanitized terminal failure."""
+
+        with self.database.connection() as connection:
+            connection.execute(
+                """
+                UPDATE ingest_jobs
+                SET status = ?, document_id = COALESCE(?, document_id),
+                    error_message = ?, updated_at = ?
+                WHERE job_id = ?
+                """,
+                (status, document_id, error_message, utc_now(), job_id),
+            )
+
+    def ready_document(self, kb_id: str, sha256: str) -> tuple[str, int] | None:
+        """Return an already indexed document and child count for idempotent import."""
+
+        with self.database.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT d.doc_id, COUNT(c.chunk_id) AS child_count
+                FROM documents d
+                JOIN knowledge_base_documents kbd ON kbd.doc_id = d.doc_id
+                LEFT JOIN chunks c ON c.doc_id = d.doc_id AND c.chunk_kind = 'child'
+                WHERE kbd.kb_id = ? AND d.sha256 = ? AND kbd.status = 'ready'
+                GROUP BY d.doc_id
+                """,
+                (kb_id, sha256),
+            ).fetchone()
+        if row is None:
+            return None
+        return row["doc_id"], row["child_count"]
+
+    def save_document_and_chunks(
+        self,
+        *,
+        kb_id: str,
+        job_id: str,
+        managed: ManagedDocument,
+        bibliography: Bibliography,
+        parsed: ParsedDocument,
+        chunked: ChunkedDocument,
+    ) -> None:
+        """Atomically replace canonical metadata and chunks before index publication."""
+
+        now = utc_now()
+        with self.database.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO documents(
+                    doc_id, sha256, filename, format, source_path, managed_path,
+                    bib_json, parser_name, parser_version, canonical_text,
+                    ingest_date, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(doc_id) DO UPDATE SET
+                    source_path = excluded.source_path,
+                    managed_path = excluded.managed_path,
+                    bib_json = excluded.bib_json,
+                    parser_name = excluded.parser_name,
+                    parser_version = excluded.parser_version,
+                    canonical_text = excluded.canonical_text,
+                    ingest_date = excluded.ingest_date
+                """,
+                (
+                    managed.doc_id,
+                    managed.sha256,
+                    managed.filename,
+                    managed.format,
+                    str(managed.source_path),
+                    str(managed.managed_path),
+                    bibliography.model_dump_json(),
+                    parsed.parser_name,
+                    parsed.parser_version,
+                    chunked.canonical_text,
+                    now,
+                    now,
+                ),
+            )
+            connection.execute("DELETE FROM chunks WHERE doc_id = ?", (managed.doc_id,))
+            for chunk in sorted(
+                chunked.chunks, key=lambda item: (item.chunk_kind == "child", item.chunk_index)
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO chunks(
+                        chunk_id, doc_id, text, page_start, page_end, section_heading,
+                        chunk_index, char_start, char_end, parent_id, chunk_kind, metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        chunk.chunk_id,
+                        chunk.doc_id,
+                        chunk.text,
+                        chunk.page_start,
+                        chunk.page_end,
+                        chunk.section_heading,
+                        chunk.chunk_index,
+                        chunk.char_start,
+                        chunk.char_end,
+                        chunk.parent_id,
+                        chunk.chunk_kind,
+                        json.dumps(chunk.metadata, ensure_ascii=False),
+                    ),
+                )
+            connection.execute(
+                """
+                INSERT INTO knowledge_base_documents(
+                    kb_id, doc_id, added_at, status, last_job_id
+                ) VALUES (?, ?, ?, 'indexing', ?)
+                ON CONFLICT(kb_id, doc_id) DO UPDATE SET
+                    status = 'indexing', last_job_id = excluded.last_job_id
+                """,
+                (kb_id, managed.doc_id, now, job_id),
+            )
+        self.update_job(job_id, "indexing", document_id=managed.doc_id)
+
+    def mark_ready(self, kb_id: str, doc_id: str, job_id: str) -> None:
+        """Publish a fully indexed document to retrieval."""
+
+        with self.database.connection() as connection:
+            connection.execute(
+                """
+                UPDATE knowledge_base_documents
+                SET status = 'ready', last_job_id = ?
+                WHERE kb_id = ? AND doc_id = ?
+                """,
+                (job_id, kb_id, doc_id),
+            )
+        self.update_job(job_id, "ready", document_id=doc_id)
+
+    def mark_failed(self, job_id: str, error_type: str) -> None:
+        """Record a recoverable failure without storing provider or document payloads."""
+
+        with self.database.connection() as connection:
+            row = connection.execute(
+                "SELECT kb_id, document_id FROM ingest_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is not None and row["document_id"]:
+                connection.execute(
+                    """
+                    UPDATE knowledge_base_documents SET status = 'failed'
+                    WHERE kb_id = ? AND doc_id = ? AND last_job_id = ?
+                    """,
+                    (row["kb_id"], row["document_id"], job_id),
+                )
+        self.update_job(job_id, "failed", error_message=error_type)
+
+    def ready_child_chunks(self, kb_id: str) -> list[Chunk]:
+        """Load the authoritative sparse-index corpus for one KB."""
+
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT c.* FROM chunks c
+                JOIN knowledge_base_documents kbd ON kbd.doc_id = c.doc_id
+                WHERE kbd.kb_id = ? AND kbd.status = 'ready' AND c.chunk_kind = 'child'
+                ORDER BY c.doc_id, c.chunk_index
+                """,
+                (kb_id,),
+            ).fetchall()
+        return [self._chunk_from_row(row) for row in rows]
+
+    def list_documents(self, kb_id: str) -> list[dict[str, object]]:
+        """Return document metadata and status for the minimal KB interface."""
+
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT d.doc_id, d.filename, d.format, d.bib_json, d.ingest_date,
+                       kbd.status,
+                       COUNT(CASE WHEN c.chunk_kind = 'child' THEN 1 END) AS chunk_count
+                FROM knowledge_base_documents kbd
+                JOIN documents d ON d.doc_id = kbd.doc_id
+                LEFT JOIN chunks c ON c.doc_id = d.doc_id
+                WHERE kbd.kb_id = ?
+                GROUP BY d.doc_id
+                ORDER BY d.ingest_date DESC
+                """,
+                (kb_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def _chunk_from_row(row) -> Chunk:
+        return Chunk(
+            chunk_id=row["chunk_id"],
+            doc_id=row["doc_id"],
+            text=row["text"],
+            page_start=row["page_start"],
+            page_end=row["page_end"],
+            section_heading=row["section_heading"],
+            chunk_index=row["chunk_index"],
+            char_start=row["char_start"],
+            char_end=row["char_end"],
+            parent_id=row["parent_id"],
+            chunk_kind=row["chunk_kind"],
+            metadata=json.loads(row["metadata_json"]),
+        )

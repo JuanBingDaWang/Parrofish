@@ -21,6 +21,9 @@ class Settings(BaseModel):
     project_root: Path
     data_dir: Path
     database_path: Path
+    lancedb_path: Path
+    managed_documents_dir: Path
+    mineru_artifacts_dir: Path
     log_dir: Path
     siliconflow_api_key: SecretStr = Field(repr=False)
     mineru_api_token: SecretStr = Field(repr=False)
@@ -34,6 +37,9 @@ class Settings(BaseModel):
     read_timeout_seconds: float = 180.0
     max_retries: int = 3
     min_request_interval_seconds: float = 0.0
+    mineru_poll_interval_seconds: float = 3.0
+    mineru_timeout_seconds: float = 600.0
+    embedding_batch_size: int = 32
 
     @field_validator("siliconflow_base_url", "mineru_base_url")
     @classmethod
@@ -48,6 +54,9 @@ class Settings(BaseModel):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        self.lancedb_path.mkdir(parents=True, exist_ok=True)
+        self.managed_documents_dir.mkdir(parents=True, exist_ok=True)
+        self.mineru_artifacts_dir.mkdir(parents=True, exist_ok=True)
 
 
 def _default_project_root() -> Path:
@@ -95,6 +104,9 @@ def load_settings(
         project_root=root,
         data_dir=data_dir.resolve(),
         database_path=(data_dir / "writing_factory.db").resolve(),
+        lancedb_path=(data_dir / "lancedb").resolve(),
+        managed_documents_dir=(data_dir / "documents").resolve(),
+        mineru_artifacts_dir=(data_dir / "mineru").resolve(),
         log_dir=log_dir.resolve(),
         siliconflow_api_key=_required_secret(
             "SILICONFLOW_API_KEY",

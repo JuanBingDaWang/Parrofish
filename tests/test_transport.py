@@ -9,6 +9,7 @@ import pytest
 from pydantic import SecretStr
 
 from writing_factory.llm.base import ExternalServiceError, ServiceTransport
+from writing_factory.llm.transfers import FileTransferTransport
 from writing_factory.store import Database
 
 
@@ -117,16 +118,13 @@ def test_presigned_upload_never_sends_provider_authorization(tmp_path: Path) -> 
     source = tmp_path / "source.pdf"
     source.write_bytes(b"document")
     unauthenticated_client = httpx.Client(transport=httpx.MockTransport(upload_handler))
-    transport = ServiceTransport(
+    transport = FileTransferTransport(
         provider="mineru",
-        base_url="https://mineru.example/v4",
-        credential=SecretStr("must-not-leak"),
         database=_database(tmp_path),
         connect_timeout_seconds=1,
         read_timeout_seconds=1,
         max_retries=1,
-        http_client=httpx.Client(base_url="https://mineru.example/v4"),
-        unauthenticated_client=unauthenticated_client,
+        http_client=unauthenticated_client,
     )
 
     transport.upload_file(
@@ -137,3 +135,33 @@ def test_presigned_upload_never_sends_provider_authorization(tmp_path: Path) -> 
 
     assert len(uploaded_headers) == 1
     assert "authorization" not in uploaded_headers[0]
+    assert "content-type" not in uploaded_headers[0]
+
+
+def test_presigned_download_is_atomic_and_credential_free(tmp_path: Path) -> None:
+    headers: list[httpx.Headers] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        headers.append(request.headers)
+        return httpx.Response(200, content=b"archive")
+
+    transport = FileTransferTransport(
+        provider="mineru",
+        database=_database(tmp_path),
+        connect_timeout_seconds=1,
+        read_timeout_seconds=1,
+        max_retries=1,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    destination = tmp_path / "result.zip"
+
+    returned = transport.download_file(
+        "https://object-storage.example/result?signature=private",
+        destination,
+        operation="download_parse_result",
+    )
+
+    assert returned == destination.resolve()
+    assert destination.read_bytes() == b"archive"
+    assert "authorization" not in headers[0]
+    assert not list(tmp_path.glob("*.part"))
