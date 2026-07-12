@@ -1,0 +1,136 @@
+"""Versioned SQLite schema for local, recoverable application state."""
+
+from __future__ import annotations
+
+import sqlite3
+
+MIGRATIONS: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+        version INTEGER PRIMARY KEY,
+        applied_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS knowledge_bases (
+        kb_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        description TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS documents (
+        doc_id TEXT PRIMARY KEY,
+        sha256 TEXT NOT NULL UNIQUE,
+        filename TEXT NOT NULL,
+        format TEXT NOT NULL,
+        source_path TEXT NOT NULL,
+        managed_path TEXT NOT NULL,
+        bib_json TEXT NOT NULL DEFAULT '{}',
+        parser_name TEXT,
+        parser_version TEXT,
+        canonical_text TEXT NOT NULL DEFAULT '',
+        ingest_date TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS knowledge_base_documents (
+        kb_id TEXT NOT NULL REFERENCES knowledge_bases(kb_id) ON DELETE CASCADE,
+        doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+        added_at TEXT NOT NULL,
+        PRIMARY KEY (kb_id, doc_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS chunks (
+        chunk_id TEXT PRIMARY KEY,
+        doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,
+        text TEXT NOT NULL,
+        page_start INTEGER,
+        page_end INTEGER,
+        section_heading TEXT,
+        chunk_index INTEGER NOT NULL,
+        char_start INTEGER NOT NULL,
+        char_end INTEGER NOT NULL,
+        parent_id TEXT REFERENCES chunks(chunk_id) ON DELETE CASCADE,
+        chunk_kind TEXT NOT NULL CHECK (chunk_kind IN ('parent', 'child')),
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        CHECK (char_start >= 0 AND char_end >= char_start),
+        UNIQUE (doc_id, chunk_kind, chunk_index)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(doc_id);
+    CREATE INDEX IF NOT EXISTS idx_chunks_parent ON chunks(parent_id);
+
+    CREATE TABLE IF NOT EXISTS ingest_jobs (
+        job_id TEXT PRIMARY KEY,
+        kb_id TEXT NOT NULL REFERENCES knowledge_bases(kb_id) ON DELETE CASCADE,
+        source_path TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (
+            status IN ('pending', 'parsing', 'chunking', 'indexing', 'ready', 'failed')
+        ),
+        document_id TEXT REFERENCES documents(doc_id) ON DELETE SET NULL,
+        error_message TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_ingest_jobs_kb_status
+        ON ingest_jobs(kb_id, status);
+
+    CREATE TABLE IF NOT EXISTS api_cache (
+        cache_key TEXT PRIMARY KEY,
+        provider TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        response_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS api_calls (
+        call_id TEXT PRIMARY KEY,
+        request_hash TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        model TEXT,
+        reasoning_effort TEXT,
+        prompt_summary TEXT NOT NULL,
+        cache_hit INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        total_tokens INTEGER,
+        duration_ms INTEGER NOT NULL,
+        result_summary TEXT,
+        error_type TEXT,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_api_calls_created ON api_calls(created_at);
+    CREATE INDEX IF NOT EXISTS idx_api_calls_request ON api_calls(request_hash);
+    """,
+)
+
+
+def apply_migrations(connection: sqlite3.Connection) -> None:
+    """Apply each migration exactly once inside a transaction."""
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        )
+        """
+    )
+    applied = {
+        row[0] for row in connection.execute("SELECT version FROM schema_migrations").fetchall()
+    }
+    for version, script in enumerate(MIGRATIONS, start=1):
+        if version in applied:
+            continue
+        connection.executescript(script)
+        connection.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, datetime('now'))",
+            (version,),
+        )
+    connection.commit()

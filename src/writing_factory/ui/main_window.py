@@ -1,0 +1,281 @@
+"""Quiet operational PyQt6 shell for project workflows."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Any
+
+from PyQt6.QtCore import QSize
+from PyQt6.QtGui import QCloseEvent
+from PyQt6.QtWidgets import (
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QPushButton,
+    QStackedWidget,
+    QStyle,
+    QVBoxLayout,
+    QWidget,
+)
+
+from writing_factory.llm.models import ChatResult
+from writing_factory.ui.workers import BackgroundTaskManager, TaskContext
+
+
+class MainWindow(QMainWindow):
+    """Application shell with non-blocking provider diagnostics."""
+
+    def __init__(self, siliconflow_check: Callable[[], ChatResult]) -> None:
+        super().__init__()
+        self._siliconflow_check = siliconflow_check
+        self._tasks = BackgroundTaskManager(self)
+        self._check_task_id: str | None = None
+        self._close_pending = False
+        self._tasks.task_finished.connect(self._task_finished)
+
+        self.setWindowTitle("写作工厂")
+        self.setMinimumSize(960, 640)
+        self.resize(1120, 720)
+        self.setStyleSheet(_STYLESHEET)
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        root = QWidget()
+        root_layout = QHBoxLayout(root)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        self.navigation = QListWidget()
+        self.navigation.setObjectName("navigation")
+        self.navigation.setFixedWidth(184)
+        self.navigation.setIconSize(self.navigation.iconSize())
+        nav_items = (
+            ("项目", QStyle.StandardPixmap.SP_DirIcon),
+            ("知识库", QStyle.StandardPixmap.SP_FileDialogDetailedView),
+            ("作者档案", QStyle.StandardPixmap.SP_FileIcon),
+            ("写作任务", QStyle.StandardPixmap.SP_CommandLink),
+            ("设置", QStyle.StandardPixmap.SP_ComputerIcon),
+        )
+        for label, icon_type in nav_items:
+            item = QListWidgetItem(self.style().standardIcon(icon_type), label)
+            item.setSizeHint(QSize(160, 44))
+            self.navigation.addItem(item)
+
+        self.pages = QStackedWidget()
+        for title in ("项目", "知识库", "作者档案", "写作任务"):
+            self.pages.addWidget(self._empty_page(title))
+        self.pages.addWidget(self._settings_page())
+        self.navigation.currentRowChanged.connect(self.pages.setCurrentIndex)
+        self.navigation.setCurrentRow(4)
+
+        root_layout.addWidget(self.navigation)
+        root_layout.addWidget(self.pages, 1)
+        self.setCentralWidget(root)
+        self.statusBar().showMessage("就绪")
+
+    def _empty_page(self, title: str) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(32, 28, 32, 28)
+        heading = QLabel(title)
+        heading.setObjectName("pageTitle")
+        layout.addWidget(heading)
+        layout.addStretch(1)
+        return page
+
+    def _settings_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(32, 28, 32, 28)
+        layout.setSpacing(20)
+        heading = QLabel("设置")
+        heading.setObjectName("pageTitle")
+        layout.addWidget(heading)
+
+        section_title = QLabel("外部服务")
+        section_title.setObjectName("sectionTitle")
+        layout.addWidget(section_title)
+
+        siliconflow_row = QFrame()
+        siliconflow_row.setObjectName("serviceRow")
+        row_layout = QHBoxLayout(siliconflow_row)
+        row_layout.setContentsMargins(18, 14, 14, 14)
+        row_layout.setSpacing(16)
+        provider = QLabel("SiliconFlow")
+        provider.setObjectName("providerName")
+        model = QLabel("DeepSeek-V4-Flash")
+        model.setObjectName("mutedText")
+        self.siliconflow_status = QLabel("未检测")
+        self.siliconflow_status.setObjectName("statusNeutral")
+        self.check_button = QPushButton(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload), "检测"
+        )
+        self.check_button.setToolTip("检测 SiliconFlow 连接")
+        self.check_button.clicked.connect(self._start_siliconflow_check)
+        row_layout.addWidget(provider)
+        row_layout.addWidget(model)
+        row_layout.addStretch(1)
+        row_layout.addWidget(self.siliconflow_status)
+        row_layout.addWidget(self.check_button)
+        layout.addWidget(siliconflow_row)
+
+        mineru_row = QFrame()
+        mineru_row.setObjectName("serviceRow")
+        mineru_layout = QHBoxLayout(mineru_row)
+        mineru_layout.setContentsMargins(18, 14, 14, 14)
+        mineru_layout.setSpacing(16)
+        mineru_name = QLabel("MinerU")
+        mineru_name.setObjectName("providerName")
+        mineru_endpoint = QLabel("API v4")
+        mineru_endpoint.setObjectName("mutedText")
+        mineru_status = QLabel("凭据已加载")
+        mineru_status.setObjectName("statusReady")
+        mineru_layout.addWidget(mineru_name)
+        mineru_layout.addWidget(mineru_endpoint)
+        mineru_layout.addStretch(1)
+        mineru_layout.addWidget(mineru_status)
+        layout.addWidget(mineru_row)
+        layout.addStretch(1)
+        return page
+
+    def _start_siliconflow_check(self) -> None:
+        if self._check_task_id is not None:
+            return
+        self.check_button.setEnabled(False)
+        self.siliconflow_status.setText("检测中")
+        self.siliconflow_status.setObjectName("statusBusy")
+        self.siliconflow_status.style().unpolish(self.siliconflow_status)
+        self.siliconflow_status.style().polish(self.siliconflow_status)
+        self.statusBar().showMessage("正在检测 SiliconFlow")
+
+        def task(context: TaskContext) -> ChatResult:
+            context.report_progress(20, "正在连接")
+            result = self._siliconflow_check()
+            context.report_progress(100, "完成")
+            return result
+
+        self._check_task_id = self._tasks.start(
+            task,
+            on_success=self._check_succeeded,
+            on_error=self._check_failed,
+            on_progress=self._check_progress,
+        )
+
+    def _check_succeeded(self, result: Any) -> None:
+        chat = result if isinstance(result, ChatResult) else None
+        tokens = chat.usage.total_tokens if chat is not None else 0
+        self.siliconflow_status.setText("可用")
+        self.siliconflow_status.setObjectName("statusReady")
+        self.statusBar().showMessage(f"SiliconFlow 可用 · {tokens} tokens", 5000)
+        self._finish_check()
+
+    def _check_failed(self, message: str) -> None:
+        self.siliconflow_status.setText("不可用")
+        self.siliconflow_status.setObjectName("statusError")
+        self.statusBar().showMessage(message, 8000)
+        self._finish_check()
+
+    def _check_progress(self, percent: int, message: str) -> None:
+        if message:
+            self.statusBar().showMessage(f"{message} · {percent}%")
+
+    def _finish_check(self) -> None:
+        self.siliconflow_status.style().unpolish(self.siliconflow_status)
+        self.siliconflow_status.style().polish(self.siliconflow_status)
+        self.check_button.setEnabled(True)
+        self._check_task_id = None
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        """Request cooperative task cancellation before closing."""
+
+        if self._tasks.active_count:
+            self._close_pending = True
+            self._tasks.cancel_all()
+            self.statusBar().showMessage("正在结束后台任务")
+            event.ignore()
+            return
+        self._tasks.cancel_all()
+        super().closeEvent(event)
+
+    def _task_finished(self, _task_id: str) -> None:
+        if self._close_pending and self._tasks.active_count == 0:
+            self._close_pending = False
+            self.close()
+
+
+_STYLESHEET = """
+QMainWindow, QWidget {
+    background: #f7f8fa;
+    color: #1f2933;
+    font-size: 14px;
+}
+#navigation {
+    background: #20262e;
+    color: #dfe4ea;
+    border: 0;
+    padding: 18px 10px;
+    outline: 0;
+}
+#navigation::item {
+    min-height: 42px;
+    padding: 0 12px;
+    margin: 2px 0;
+    border-radius: 5px;
+}
+#navigation::item:selected {
+    background: #3a4653;
+    color: #ffffff;
+}
+#navigation::item:hover:!selected {
+    background: #2b343e;
+}
+#pageTitle {
+    font-size: 24px;
+    font-weight: 600;
+    color: #18212b;
+}
+#sectionTitle {
+    font-size: 15px;
+    font-weight: 600;
+    color: #485564;
+}
+#serviceRow {
+    background: #ffffff;
+    border: 1px solid #dce2e8;
+    border-radius: 6px;
+    min-height: 58px;
+}
+#providerName {
+    font-weight: 600;
+    min-width: 112px;
+}
+#mutedText {
+    color: #6b7785;
+}
+#statusNeutral, #statusBusy, #statusReady, #statusError {
+    min-width: 72px;
+    font-weight: 600;
+}
+#statusNeutral { color: #6b7785; }
+#statusBusy { color: #a06400; }
+#statusReady { color: #17705b; }
+#statusError { color: #b42318; }
+QPushButton {
+    background: #ffffff;
+    border: 1px solid #aeb8c2;
+    border-radius: 5px;
+    padding: 7px 13px;
+    min-height: 20px;
+}
+QPushButton:hover { background: #eef2f5; }
+QPushButton:pressed { background: #e2e8ed; }
+QPushButton:disabled { color: #9ca5ae; background: #f2f4f6; }
+QStatusBar {
+    background: #ffffff;
+    border-top: 1px solid #dce2e8;
+    color: #55616e;
+}
+"""

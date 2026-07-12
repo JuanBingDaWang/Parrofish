@@ -1,0 +1,139 @@
+"""Unified transport retry, cache, and failure-boundary tests."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import httpx
+import pytest
+from pydantic import SecretStr
+
+from writing_factory.llm.base import ExternalServiceError, ServiceTransport
+from writing_factory.store import Database
+
+
+def _database(tmp_path: Path) -> Database:
+    database = Database(tmp_path / "transport.db")
+    database.initialize()
+    return database
+
+
+def test_retries_transient_failure_then_caches(tmp_path: Path) -> None:
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        if requests == 1:
+            return httpx.Response(500, json={"message": "temporary"})
+        return httpx.Response(
+            200,
+            json={"data": [{"index": 0}], "usage": {"total_tokens": 3}},
+        )
+
+    client = httpx.Client(
+        base_url="https://example.invalid/v1",
+        transport=httpx.MockTransport(handler),
+    )
+    database = _database(tmp_path)
+    transport = ServiceTransport(
+        provider="test",
+        base_url="https://example.invalid/v1",
+        credential=SecretStr("private-token"),
+        database=database,
+        connect_timeout_seconds=1,
+        read_timeout_seconds=1,
+        max_retries=2,
+        http_client=client,
+    )
+
+    first = transport.request_json(
+        "POST",
+        "/operation",
+        operation="operation",
+        payload={"text": "sensitive-input"},
+        prompt_summary={"character_count": 15},
+        use_cache=True,
+    )
+    second = transport.request_json(
+        "POST",
+        "/operation",
+        operation="operation",
+        payload={"text": "sensitive-input"},
+        prompt_summary={"character_count": 15},
+        use_cache=True,
+    )
+
+    assert first == second
+    assert requests == 2
+    with database.connection() as connection:
+        calls = connection.execute(
+            "SELECT cache_hit, prompt_summary, result_summary FROM api_calls ORDER BY created_at"
+        ).fetchall()
+    assert [row["cache_hit"] for row in calls] == [0, 1]
+    assert all("sensitive-input" not in row["prompt_summary"] for row in calls)
+    assert all("sensitive-input" not in row["result_summary"] for row in calls)
+
+
+def test_provider_error_does_not_echo_response_or_secret(tmp_path: Path) -> None:
+    secret = "private-token"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"message": secret, "input": "private text"})
+
+    transport = ServiceTransport(
+        provider="test",
+        base_url="https://example.invalid/v1",
+        credential=SecretStr(secret),
+        database=_database(tmp_path),
+        connect_timeout_seconds=1,
+        read_timeout_seconds=1,
+        max_retries=1,
+        http_client=httpx.Client(
+            base_url="https://example.invalid/v1",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    with pytest.raises(ExternalServiceError) as error:
+        transport.request_json(
+            "POST",
+            "/operation",
+            operation="operation",
+            payload={"text": "private text"},
+        )
+
+    assert secret not in str(error.value)
+    assert "private text" not in str(error.value)
+
+
+def test_presigned_upload_never_sends_provider_authorization(tmp_path: Path) -> None:
+    uploaded_headers: list[httpx.Headers] = []
+
+    def upload_handler(request: httpx.Request) -> httpx.Response:
+        uploaded_headers.append(request.headers)
+        return httpx.Response(200)
+
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"document")
+    unauthenticated_client = httpx.Client(transport=httpx.MockTransport(upload_handler))
+    transport = ServiceTransport(
+        provider="mineru",
+        base_url="https://mineru.example/v4",
+        credential=SecretStr("must-not-leak"),
+        database=_database(tmp_path),
+        connect_timeout_seconds=1,
+        read_timeout_seconds=1,
+        max_retries=1,
+        http_client=httpx.Client(base_url="https://mineru.example/v4"),
+        unauthenticated_client=unauthenticated_client,
+    )
+
+    transport.upload_file(
+        "https://object-storage.example/presigned?signature=private",
+        source,
+        operation="upload_document",
+    )
+
+    assert len(uploaded_headers) == 1
+    assert "authorization" not in uploaded_headers[0]
