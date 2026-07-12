@@ -108,6 +108,108 @@ def test_provider_error_does_not_echo_response_or_secret(tmp_path: Path) -> None
     assert "private text" not in str(error.value)
 
 
+def test_request_can_limit_attempts_and_override_timeout(tmp_path: Path) -> None:
+    requests = 0
+    timeout_extensions: list[dict[str, float]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        timeout_extensions.append(request.extensions["timeout"])
+        return httpx.Response(500, json={"message": "temporary"})
+
+    transport = ServiceTransport(
+        provider="test",
+        base_url="https://example.invalid/v1",
+        credential=SecretStr("private-token"),
+        database=_database(tmp_path),
+        connect_timeout_seconds=1,
+        read_timeout_seconds=1,
+        max_retries=3,
+        http_client=httpx.Client(
+            base_url="https://example.invalid/v1",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    with pytest.raises(ExternalServiceError):
+        transport.request_json(
+            "POST",
+            "/operation",
+            operation="operation",
+            request_timeout_seconds=600,
+            request_attempts=1,
+        )
+
+    assert requests == 1
+    assert timeout_extensions[0]["read"] == 600
+
+
+def test_protocol_disconnect_is_a_retryable_transport_failure(tmp_path: Path) -> None:
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        if requests == 1:
+            raise httpx.RemoteProtocolError("disconnected", request=request)
+        return httpx.Response(200, json={"result": "ok"})
+
+    transport = ServiceTransport(
+        provider="test",
+        base_url="https://example.invalid/v1",
+        credential=SecretStr("private-token"),
+        database=_database(tmp_path),
+        connect_timeout_seconds=1,
+        read_timeout_seconds=1,
+        max_retries=2,
+        http_client=httpx.Client(
+            base_url="https://example.invalid/v1",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    result = transport.request_json("POST", "/operation", operation="operation")
+
+    assert result == {"result": "ok"}
+    assert requests == 2
+
+
+def test_sse_response_is_collected_inside_unified_transport(tmp_path: Path) -> None:
+    body = (
+        'data: {"choices":[{"delta":{"content":"你"}}]}\n\n'
+        'data: {"choices":[{"delta":{"content":"好"},"finish_reason":"stop"}]}\n\n'
+        "data: [DONE]\n\n"
+    )
+
+    transport = ServiceTransport(
+        provider="test",
+        base_url="https://example.invalid/v1",
+        credential=SecretStr("private-token"),
+        database=_database(tmp_path),
+        connect_timeout_seconds=1,
+        read_timeout_seconds=1,
+        max_retries=1,
+        http_client=httpx.Client(
+            base_url="https://example.invalid/v1",
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, text=body)),
+        ),
+    )
+
+    result = transport.request_json(
+        "POST",
+        "/stream",
+        operation="stream",
+        payload={"stream": True},
+        stream_response=True,
+    )
+
+    assert [chunk["choices"][0]["delta"]["content"] for chunk in result["chunks"]] == [
+        "你",
+        "好",
+    ]
+
+
 def test_presigned_upload_never_sends_provider_authorization(tmp_path: Path) -> None:
     uploaded_headers: list[httpx.Headers] = []
 

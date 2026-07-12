@@ -117,6 +117,67 @@ MIGRATIONS: tuple[str, ...] = (
     CREATE INDEX IF NOT EXISTS idx_kb_documents_status
         ON knowledge_base_documents(kb_id, status);
     """,
+    """
+    CREATE TABLE IF NOT EXISTS persona_specs (
+        persona_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        mode TEXT NOT NULL CHECK (mode IN ('person', 'topic')),
+        kb_id TEXT NOT NULL REFERENCES knowledge_bases(kb_id) ON DELETE CASCADE,
+        status TEXT NOT NULL CHECK (
+            status IN ('pending', 'mapping', 'reducing', 'validating', 'ready', 'failed')
+        ),
+        spec_json TEXT,
+        markdown TEXT,
+        source_hash TEXT NOT NULL,
+        research_date TEXT,
+        error_type TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_persona_specs_kb_status
+        ON persona_specs(kb_id, status);
+
+    CREATE TABLE IF NOT EXISTS distillation_runs (
+        run_id TEXT PRIMARY KEY,
+        persona_id TEXT NOT NULL REFERENCES persona_specs(persona_id) ON DELETE CASCADE,
+        input_hash TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (
+            status IN ('pending', 'mapping', 'reducing', 'validating', 'ready', 'failed')
+        ),
+        source_doc_ids_json TEXT NOT NULL,
+        map_total INTEGER NOT NULL DEFAULT 0,
+        map_completed INTEGER NOT NULL DEFAULT 0,
+        error_type TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_distillation_runs_persona
+        ON distillation_runs(persona_id, status);
+    CREATE INDEX IF NOT EXISTS idx_distillation_runs_input
+        ON distillation_runs(input_hash, status);
+
+    CREATE TABLE IF NOT EXISTS distillation_map_results (
+        run_id TEXT NOT NULL REFERENCES distillation_runs(run_id) ON DELETE CASCADE,
+        unit_id TEXT NOT NULL,
+        input_hash TEXT NOT NULL,
+        chunk_ids_json TEXT NOT NULL,
+        result_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (run_id, unit_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS persona_evaluations (
+        evaluation_id TEXT PRIMARY KEY,
+        persona_id TEXT NOT NULL REFERENCES persona_specs(persona_id) ON DELETE CASCADE,
+        evaluation_type TEXT NOT NULL,
+        score INTEGER,
+        result_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    """,
 )
 
 

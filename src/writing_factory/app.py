@@ -6,6 +6,11 @@ from dataclasses import dataclass
 
 from writing_factory.config import Settings, load_settings
 from writing_factory.config.logging import configure_logging
+from writing_factory.distill.extraction import PersonaMapExtractor
+from writing_factory.distill.fidelity import FidelityService, PersonaFidelityEvaluator
+from writing_factory.distill.service import DistillationService
+from writing_factory.distill.sources import SourceCorpusBuilder
+from writing_factory.distill.synthesis import PersonaSynthesizer
 from writing_factory.kb.chunking import StructureChunker
 from writing_factory.kb.files import ManagedFileStore
 from writing_factory.kb.ingestion import IngestionService
@@ -15,6 +20,7 @@ from writing_factory.llm import MinerUClient, SiliconFlowClient
 from writing_factory.store import Database
 from writing_factory.store.bm25_index import BM25Index
 from writing_factory.store.kb_repository import KnowledgeBaseRepository
+from writing_factory.store.persona_repository import PersonaRepository
 from writing_factory.store.vector_index import LanceVectorIndex
 
 
@@ -30,6 +36,9 @@ class ApplicationContext:
     ingestion: IngestionService
     dense_retriever: DenseRetriever
     sparse_retriever: SparseRetriever
+    persona_repository: PersonaRepository
+    distillation: DistillationService
+    fidelity: FidelityService
     default_kb_id: str
 
     def close(self) -> None:
@@ -59,6 +68,7 @@ def build_application(settings: Settings | None = None) -> ApplicationContext:
     default_kb_id = repository.ensure_default()
     vectors = LanceVectorIndex(resolved.lancedb_path)
     bm25 = BM25Index(repository)
+    persona_repository = PersonaRepository(database)
     ingestion = IngestionService(
         resolved,
         repository,
@@ -78,5 +88,16 @@ def build_application(settings: Settings | None = None) -> ApplicationContext:
         ingestion=ingestion,
         dense_retriever=DenseRetriever(repository, vectors, siliconflow),
         sparse_retriever=SparseRetriever(bm25),
+        persona_repository=persona_repository,
+        distillation=DistillationService(
+            persona_repository,
+            SourceCorpusBuilder(repository),
+            PersonaMapExtractor(siliconflow),
+            PersonaSynthesizer(siliconflow),
+        ),
+        fidelity=FidelityService(
+            persona_repository,
+            PersonaFidelityEvaluator(siliconflow),
+        ),
         default_kb_id=default_kb_id,
     )

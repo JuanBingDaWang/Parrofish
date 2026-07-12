@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from PyQt6.QtCore import Qt
 
@@ -31,6 +32,7 @@ def test_connection_button_runs_check_in_background(qtbot) -> None:
 
     assert window.check_button.isEnabled()
     assert "3 tokens" in window.statusBar().currentMessage()
+    qtbot.waitUntil(lambda: window._tasks.active_count == 0, timeout=2000)
 
 
 def test_document_import_updates_table_without_blocking(qtbot, tmp_path: Path) -> None:
@@ -73,3 +75,92 @@ def test_document_import_updates_table_without_blocking(qtbot, tmp_path: Path) -
     assert page.document_table.item(0, 0).text() == "资料.txt"
     assert page.document_table.item(0, 1).text() == "可检索"
     assert page.import_button.isEnabled()
+    qtbot.waitUntil(lambda: window._tasks.active_count == 0, timeout=2000)
+
+
+def test_persona_page_distills_checked_sources_in_background(qtbot) -> None:
+    profiles: list[dict[str, object]] = []
+    received: list[tuple[str, str, set[str]]] = []
+
+    def distill(name, mode, doc_ids, context):
+        received.append((name, mode, doc_ids))
+        context.report_progress(60, "归并")
+        time.sleep(0.05)
+        profiles.append(
+            {
+                "name": name,
+                "mode": mode,
+                "status": "ready",
+                "model_count": 3,
+                "research_date": "2026-07-12",
+            }
+        )
+        return SimpleNamespace(persona=SimpleNamespace(mental_models=[1, 2, 3]))
+
+    window = MainWindow(
+        lambda: ChatResult(content="OK", model="test"),
+        list_documents=lambda: [
+            {
+                "doc_id": "doc_one",
+                "filename": "论文.pdf",
+                "status": "ready",
+                "chunk_count": 4,
+            }
+        ],
+        distill_persona=distill,
+        list_personas=lambda: profiles,
+    )
+    qtbot.addWidget(window)
+    window.show()
+    page = window.persona_page
+    page.name_input.setText("叶芃")
+
+    assert page.distill_button.isEnabled()
+    page.start_distillation()
+    qtbot.waitUntil(lambda: page.profile_table.rowCount() == 1, timeout=2000)
+
+    assert received == [("叶芃", "person", {"doc_one"})]
+    assert page.profile_table.item(0, 0).text() == "叶芃"
+    assert page.profile_table.item(0, 3).text() == "3"
+    qtbot.waitUntil(lambda: window._tasks.active_count == 0, timeout=2000)
+
+
+def test_persona_fidelity_check_runs_in_background_and_refreshes_score(qtbot) -> None:
+    profiles = [
+        {
+            "persona_id": "persona_one",
+            "name": "叶芃",
+            "mode": "person",
+            "status": "ready",
+            "model_count": 3,
+            "fidelity_score": None,
+            "research_date": "2026-07-12",
+        }
+    ]
+    received: list[str] = []
+
+    def evaluate(persona_id, context):
+        received.append(persona_id)
+        context.report_progress(50, "中性评分")
+        time.sleep(0.05)
+        profiles[0]["fidelity_score"] = 88
+        return SimpleNamespace(total=88)
+
+    window = MainWindow(
+        lambda: ChatResult(content="OK", model="test"),
+        evaluate_persona=evaluate,
+        list_personas=lambda: profiles,
+    )
+    qtbot.addWidget(window)
+    window.show()
+    page = window.persona_page
+    page.profile_table.selectRow(0)
+
+    assert page.evaluate_button.isEnabled()
+    qtbot.mouseClick(page.evaluate_button, Qt.MouseButton.LeftButton)
+    assert not page.evaluate_button.isEnabled()
+    qtbot.waitUntil(lambda: page.profile_table.item(0, 4).text() == "88/100", timeout=2000)
+
+    assert received == ["persona_one"]
+    assert page.evaluate_button.isEnabled()
+    qtbot.waitUntil(lambda: window._tasks.active_count == 0, timeout=2000)

@@ -79,6 +79,9 @@ class ServiceTransport:
         reasoning_effort: str | None = None,
         prompt_summary: Mapping[str, Any] | None = None,
         use_cache: bool = False,
+        request_timeout_seconds: float | None = None,
+        request_attempts: int | None = None,
+        stream_response: bool = False,
     ) -> dict[str, Any]:
         """Execute one JSON request and record only structural summaries."""
 
@@ -106,12 +109,19 @@ class ServiceTransport:
                 return cached
 
         try:
+            request_once = self._request_sse_once if stream_response else self._request_once
             response = Retrying(
-                stop=stop_after_attempt(self.max_retries),
+                stop=stop_after_attempt(max(1, request_attempts or self.max_retries)),
                 wait=wait_exponential_jitter(initial=0.5, max=8.0),
                 retry=retry_if_exception_type(RetryableServiceError),
                 reraise=True,
-            )(self._request_once, method, path, normalized_payload)
+            )(
+                request_once,
+                method,
+                path,
+                normalized_payload,
+                request_timeout_seconds,
+            )
         except Exception as exc:
             safe_error = (
                 exc
@@ -155,20 +165,86 @@ class ServiceTransport:
         )
         return response
 
+    def _request_sse_once(
+        self,
+        method: str,
+        path: str,
+        payload: Mapping[str, Any],
+        request_timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        """Collect one server-sent event response through the shared transport boundary."""
+
+        self.rate_limiter.wait()
+        timeout_kwargs = (
+            {"timeout": request_timeout_seconds} if request_timeout_seconds is not None else {}
+        )
+        chunks: list[dict[str, Any]] = []
+        try:
+            with self._client.stream(
+                method,
+                path,
+                json=payload or None,
+                **timeout_kwargs,
+            ) as response:
+                self._raise_for_status(response)
+                for line in response.iter_lines():
+                    value = line.strip()
+                    if not value.startswith("data:"):
+                        continue
+                    data = value[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        decoded = json.loads(data)
+                    except ValueError as exc:
+                        raise ExternalServiceError(
+                            f"{self.provider} returned invalid event JSON"
+                        ) from exc
+                    if not isinstance(decoded, dict):
+                        raise ExternalServiceError(
+                            f"{self.provider} returned an invalid event shape"
+                        )
+                    chunks.append(decoded)
+        except httpx.TransportError as exc:
+            raise RetryableServiceError(f"{self.provider} network error") from exc
+        if not chunks:
+            raise ExternalServiceError(f"{self.provider} returned an empty event stream")
+        return {"chunks": chunks}
+
     def _request_once(
         self,
         method: str,
         path: str,
         payload: Mapping[str, Any],
+        request_timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         self.rate_limiter.wait()
+        timeout_kwargs = (
+            {"timeout": request_timeout_seconds} if request_timeout_seconds is not None else {}
+        )
         try:
             if method.upper() == "GET":
-                response = self._client.request(method, path, params=payload or None)
+                response = self._client.request(
+                    method, path, params=payload or None, **timeout_kwargs
+                )
             else:
-                response = self._client.request(method, path, json=payload or None)
-        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                response = self._client.request(
+                    method, path, json=payload or None, **timeout_kwargs
+                )
+        except httpx.TransportError as exc:
             raise RetryableServiceError(f"{self.provider} network error") from exc
+
+        self._raise_for_status(response)
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise ExternalServiceError(f"{self.provider} returned invalid JSON") from exc
+        if not isinstance(data, dict):
+            raise ExternalServiceError(f"{self.provider} returned an invalid response shape")
+        return data
+
+    def _raise_for_status(self, response: httpx.Response) -> None:
+        """Apply the same sanitized status policy to JSON and SSE responses."""
 
         if response.status_code == 429 or response.status_code >= 500:
             raise RetryableServiceError(
@@ -178,13 +254,6 @@ class ServiceTransport:
             raise ExternalServiceError(
                 f"{self.provider} rejected the request (HTTP {response.status_code})"
             )
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise ExternalServiceError(f"{self.provider} returned invalid JSON") from exc
-        if not isinstance(data, dict):
-            raise ExternalServiceError(f"{self.provider} returned an invalid response shape")
-        return data
 
     def _record_call(
         self,

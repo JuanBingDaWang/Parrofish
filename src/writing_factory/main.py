@@ -43,10 +43,30 @@ def main() -> int:
             check_cancelled=task_context.check_cancelled,
         )
 
+    def distill_persona(name, mode, doc_ids, task_context: TaskContext):
+        return context.distillation.distill(
+            kb_id=context.default_kb_id,
+            name=name,
+            mode=mode,
+            doc_ids=doc_ids,
+            progress=task_context.report_progress,
+            check_cancelled=task_context.check_cancelled,
+        )
+
+    def evaluate_persona(persona_id: str, task_context: TaskContext):
+        task_context.check_cancelled()
+        task_context.report_progress(10, "设计自检问题")
+        result = context.fidelity.evaluate(persona_id)
+        task_context.report_progress(100, "自检完成")
+        return result
+
     window = MainWindow(
         check_siliconflow,
         ingest_document=ingest_document,
         list_documents=lambda: context.repository.list_documents(context.default_kb_id),
+        distill_persona=distill_persona,
+        evaluate_persona=evaluate_persona,
+        list_personas=lambda: context.persona_repository.list_personas(context.default_kb_id),
     )
     application.aboutToQuit.connect(context.close)
     window.show()

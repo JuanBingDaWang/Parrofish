@@ -80,6 +80,8 @@ def test_siliconflow_typed_operations(settings) -> None:
     chat = client.chat(
         [{"role": "user", "content": "test"}],
         thinking=False,
+        request_timeout_seconds=600,
+        request_attempts=1,
     )
     embeddings = client.embeddings(["甲", "乙"])
     rerank = client.rerank("查询", ["无关", "相关"])
@@ -87,8 +89,39 @@ def test_siliconflow_typed_operations(settings) -> None:
     assert chat.content == "OK"
     assert chat.usage.total_tokens == 3
     assert "reasoning_effort" not in transport.calls[0][2]["payload"]
+    assert transport.calls[0][2]["request_timeout_seconds"] == 600
+    assert transport.calls[0][2]["request_attempts"] == 1
     assert embeddings.vectors == [[0.1, 0.2], [0.3, 0.4]]
     assert rerank.results[0].index == 1
+    client.close()
+
+
+def test_siliconflow_assembles_streamed_chat(settings) -> None:
+    database = Database(settings.database_path)
+    database.initialize()
+    client = SiliconFlowClient(settings, database)
+    client.transport.close()
+    transport = FakeTransport()
+    client.transport = transport
+    transport.request_json = lambda *args, **kwargs: {
+        "chunks": [
+            {
+                "model": "stream-model",
+                "choices": [{"delta": {"reasoning_content": "思考"}}],
+            },
+            {
+                "choices": [{"delta": {"content": "完成"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+            },
+        ]
+    }
+
+    result = client.chat([{"role": "user", "content": "test"}], thinking=True, stream=True)
+
+    assert result.content == "完成"
+    assert result.reasoning_content == "思考"
+    assert result.finish_reason == "stop"
+    assert result.usage.total_tokens == 5
     client.close()
 
 

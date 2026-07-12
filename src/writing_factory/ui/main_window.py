@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
 
 from writing_factory.llm.models import ChatResult
 from writing_factory.ui.knowledge_page import KnowledgeBasePage
+from writing_factory.ui.persona_page import PersonaPage
 from writing_factory.ui.workers import BackgroundTaskManager, TaskContext
 
 
@@ -36,11 +37,17 @@ class MainWindow(QMainWindow):
         *,
         ingest_document: Callable[[Path, TaskContext], Any] | None = None,
         list_documents: Callable[[], list[dict[str, object]]] | None = None,
+        distill_persona: Callable[[str, str, set[str], TaskContext], Any] | None = None,
+        evaluate_persona: Callable[[str, TaskContext], Any] | None = None,
+        list_personas: Callable[[], list[dict[str, object]]] | None = None,
     ) -> None:
         super().__init__()
         self._siliconflow_check = siliconflow_check
         self._ingest_document = ingest_document
         self._list_documents = list_documents or (lambda: [])
+        self._distill_persona = distill_persona
+        self._evaluate_persona = evaluate_persona
+        self._list_personas = list_personas or (lambda: [])
         self._tasks = BackgroundTaskManager(self)
         self._check_task_id: str | None = None
         self._close_pending = False
@@ -83,7 +90,15 @@ class MainWindow(QMainWindow):
             show_message=self.statusBar().showMessage,
         )
         self.pages.addWidget(self.knowledge_page)
-        self.pages.addWidget(self._empty_page("作者档案"))
+        self.persona_page = PersonaPage(
+            self._tasks,
+            distill_persona=self._distill_persona,
+            evaluate_persona=self._evaluate_persona,
+            list_sources=self._list_documents,
+            list_personas=self._list_personas,
+            show_message=self.statusBar().showMessage,
+        )
+        self.pages.addWidget(self.persona_page)
         self.pages.addWidget(self._empty_page("写作任务"))
         self.pages.addWidget(self._settings_page())
         self.navigation.currentRowChanged.connect(self.pages.setCurrentIndex)
@@ -324,5 +339,14 @@ QProgressBar {
 QProgressBar::chunk {
     background: #27806b;
     border-radius: 4px;
+}
+#modeButton {
+    min-height: 20px;
+    padding: 7px 8px;
+}
+#modeButton:checked {
+    background: #27806b;
+    border-color: #1f6a59;
+    color: #ffffff;
 }
 """

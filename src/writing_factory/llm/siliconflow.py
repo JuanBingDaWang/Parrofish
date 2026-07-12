@@ -49,9 +49,13 @@ class SiliconFlowClient:
         temperature: float = 0.2,
         max_tokens: int = 1024,
         seed: int | None = None,
+        response_format: Literal["text", "json_object"] = "text",
         use_cache: bool = True,
+        request_timeout_seconds: float | None = None,
+        request_attempts: int | None = None,
+        stream: bool = False,
     ) -> ChatResult:
-        """Run a deterministic or creative non-streaming chat request."""
+        """Run a deterministic or creative chat request, optionally over SSE."""
 
         payload: dict[str, Any] = {
             "model": self.settings.chat_model,
@@ -59,8 +63,11 @@ class SiliconFlowClient:
             "enable_thinking": thinking,
             "temperature": temperature,
             "max_tokens": max_tokens,
-            "stream": False,
+            "stream": stream,
+            "response_format": {"type": response_format},
         }
+        if stream:
+            payload["stream_options"] = {"include_usage": True}
         if thinking:
             payload["reasoning_effort"] = reasoning_effort
         if seed is not None:
@@ -78,7 +85,12 @@ class SiliconFlowClient:
                 "thinking": thinking,
             },
             use_cache=use_cache,
+            request_timeout_seconds=request_timeout_seconds,
+            request_attempts=request_attempts,
+            stream_response=stream,
         )
+        if stream:
+            return self._streamed_chat_result(response)
         try:
             choice = response["choices"][0]
             message = choice["message"]
@@ -92,6 +104,42 @@ class SiliconFlowClient:
             )
         except (KeyError, IndexError, TypeError) as exc:
             raise ExternalServiceError("SiliconFlow returned an invalid chat response") from exc
+
+    def _streamed_chat_result(self, response: dict[str, Any]) -> ChatResult:
+        """Assemble OpenAI-compatible SSE deltas without exposing them to callers."""
+
+        content: list[str] = []
+        reasoning: list[str] = []
+        finish_reason: str | None = None
+        model = self.settings.chat_model
+        usage: dict[str, Any] = {}
+        trace_id: str | None = None
+        try:
+            for chunk in response["chunks"]:
+                model = chunk.get("model") or model
+                trace_id = chunk.get("trace_id") or trace_id
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                delta = choice.get("delta") or {}
+                if delta.get("content"):
+                    content.append(delta["content"])
+                if delta.get("reasoning_content"):
+                    reasoning.append(delta["reasoning_content"])
+                finish_reason = choice.get("finish_reason") or finish_reason
+        except (KeyError, TypeError) as exc:
+            raise ExternalServiceError("SiliconFlow returned invalid chat events") from exc
+        return ChatResult(
+            content="".join(content),
+            reasoning_content="".join(reasoning) or None,
+            finish_reason=finish_reason,
+            model=model,
+            usage=self._usage({"usage": usage}),
+            trace_id=trace_id,
+        )
 
     def embeddings(
         self,

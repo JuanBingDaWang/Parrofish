@@ -244,6 +244,66 @@ class KnowledgeBaseRepository:
             ).fetchall()
         return [self._chunk_from_row(row) for row in rows]
 
+    def ready_parent_chunks(self, kb_id: str, *, doc_ids: set[str] | None = None) -> list[Chunk]:
+        """Load non-overlapping parent chunks used as distillation source units."""
+
+        parameters: list[object] = [kb_id]
+        document_filter = ""
+        if doc_ids:
+            placeholders = ",".join("?" for _ in doc_ids)
+            document_filter = f" AND c.doc_id IN ({placeholders})"
+            parameters.extend(sorted(doc_ids))
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT c.* FROM chunks c
+                JOIN knowledge_base_documents kbd ON kbd.doc_id = c.doc_id
+                WHERE kbd.kb_id = ? AND kbd.status = 'ready'
+                  AND c.chunk_kind = 'parent' {document_filter}
+                ORDER BY c.doc_id, c.chunk_index
+                """,
+                parameters,
+            ).fetchall()
+        return [self._chunk_from_row(row) for row in rows]
+
+    def source_documents(
+        self, kb_id: str, *, doc_ids: set[str] | None = None
+    ) -> list[dict[str, object]]:
+        """Return ready document metadata for PersonaSpec provenance."""
+
+        parameters: list[object] = [kb_id]
+        document_filter = ""
+        if doc_ids:
+            placeholders = ",".join("?" for _ in doc_ids)
+            document_filter = f" AND d.doc_id IN ({placeholders})"
+            parameters.extend(sorted(doc_ids))
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT d.doc_id, d.filename, d.bib_json,
+                       COUNT(c.chunk_id) AS chunk_count
+                FROM documents d
+                JOIN knowledge_base_documents kbd ON kbd.doc_id = d.doc_id
+                JOIN chunks c ON c.doc_id = d.doc_id AND c.chunk_kind = 'parent'
+                WHERE kbd.kb_id = ? AND kbd.status = 'ready' {document_filter}
+                GROUP BY d.doc_id
+                ORDER BY d.ingest_date, d.doc_id
+                """,
+                parameters,
+            ).fetchall()
+        documents: list[dict[str, object]] = []
+        for row in rows:
+            bibliography = json.loads(row["bib_json"])
+            documents.append(
+                {
+                    "doc_id": row["doc_id"],
+                    "filename": row["filename"],
+                    "title": bibliography.get("title") or Path(row["filename"]).stem,
+                    "chunk_count": row["chunk_count"],
+                }
+            )
+        return documents
+
     def list_documents(self, kb_id: str) -> list[dict[str, object]]:
         """Return document metadata and status for the minimal KB interface."""
 
