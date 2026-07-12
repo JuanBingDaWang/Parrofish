@@ -22,7 +22,7 @@ uv sync --all-groups --index-url https://pypi.tuna.tsinghua.edu.cn/simple
 uv run writing-factory
 ```
 
-知识库页支持直接导入 PDF、Word、PPT 和 UTF-8 TXT。PDF/Word/PPT 通过 MinerU 解析，TXT 使用本地兜底 loader；导入文件会复制到内容寻址的本地托管目录。当前按文件名生成默认书目标题，不弹出书目确认对话框。
+知识库页支持一次多选 PDF、Word、PPT 和 UTF-8 TXT，并在单个后台任务中按顺序入库，避免并发占用 MinerU 配额。PDF/Word/PPT 通过 MinerU 解析，TXT 使用本地兜底 loader；导入文件会复制到内容寻址的本地托管目录。当前按文件名生成默认书目标题，不弹出书目确认对话框。
 
 作者档案页可选择已入库文档，运行可恢复的 Map-Reduce 蒸馏。最终档案强制保留 3–7 个通过跨域复现、生成力和排他性验证的心智模型；表达统计由本地代码计算，矛盾与信息不足不会被自动补造。付费的 Nüwa 保真度自检只在用户点击“自检”后运行，并由独立的出题、作答和中性评分调用组成。
 

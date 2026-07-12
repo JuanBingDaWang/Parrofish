@@ -46,6 +46,7 @@ def test_document_import_updates_table_without_blocking(qtbot, tmp_path: Path) -
         time.sleep(0.05)
         documents.append(
             {
+                "doc_id": "doc",
                 "filename": source.name,
                 "status": "ready",
                 "chunk_count": 1,
@@ -74,8 +75,87 @@ def test_document_import_updates_table_without_blocking(qtbot, tmp_path: Path) -
 
     assert page.document_table.item(0, 0).text() == "资料.txt"
     assert page.document_table.item(0, 1).text() == "可检索"
+    assert window.persona_page.source_table.rowCount() == 1
     assert page.import_button.isEnabled()
     qtbot.waitUntil(lambda: window._tasks.active_count == 0, timeout=2000)
+
+
+def test_batch_document_import_runs_sequentially(qtbot, tmp_path: Path) -> None:
+    documents: list[dict[str, object]] = []
+    sources = [tmp_path / "一.pdf", tmp_path / "二.pdf"]
+    for source in sources:
+        source.write_bytes(b"fixture")
+    active = 0
+    max_active = 0
+    received: list[Path] = []
+
+    def ingest(path: Path, context) -> IngestResult:
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        received.append(path)
+        context.report_progress(50, "解析中")
+        time.sleep(0.03)
+        documents.append(
+            {
+                "doc_id": f"doc_{len(documents)}",
+                "filename": path.name,
+                "status": "ready",
+                "chunk_count": 2,
+                "ingest_date": "2026-07-12T10:00:00+00:00",
+            }
+        )
+        active -= 1
+        return IngestResult(
+            job_id=f"job_{len(documents)}",
+            kb_id="kb",
+            doc_id=str(documents[-1]["doc_id"]),
+            child_chunk_count=2,
+        )
+
+    window = MainWindow(
+        lambda: ChatResult(content="OK", model="test"),
+        ingest_document=ingest,
+        list_documents=lambda: documents,
+    )
+    qtbot.addWidget(window)
+    window.show()
+
+    window.knowledge_page.start_ingestions(sources)
+    qtbot.waitUntil(
+        lambda: window.knowledge_page.document_table.rowCount() == 2,
+        timeout=3000,
+    )
+
+    assert received == sources
+    assert max_active == 1
+    assert window.persona_page.source_table.rowCount() == 2
+    assert "2 个文件" in window.statusBar().currentMessage()
+    qtbot.waitUntil(lambda: window._tasks.active_count == 0, timeout=2000)
+
+
+def test_entering_persona_page_refreshes_external_document_changes(qtbot) -> None:
+    documents: list[dict[str, object]] = []
+    window = MainWindow(
+        lambda: ChatResult(content="OK", model="test"),
+        list_documents=lambda: documents,
+    )
+    qtbot.addWidget(window)
+    window.show()
+    assert window.persona_page.source_table.rowCount() == 0
+    documents.append(
+        {
+            "doc_id": "doc_new",
+            "filename": "新论文.pdf",
+            "status": "ready",
+            "chunk_count": 3,
+        }
+    )
+
+    window.navigation.setCurrentRow(2)
+
+    assert window.persona_page.source_table.rowCount() == 1
+    assert window.persona_page.source_table.item(0, 1).text() == "新论文.pdf"
 
 
 def test_persona_page_distills_checked_sources_in_background(qtbot) -> None:

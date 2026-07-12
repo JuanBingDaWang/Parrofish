@@ -42,6 +42,19 @@ class TaskContext:
 
         self._progress_callback(max(0, min(100, percent)), message)
 
+    def scaled(self, start: int, end: int, *, prefix: str = "") -> TaskContext:
+        """Create a child context that maps its progress into one parent range."""
+
+        lower = max(0, min(100, start))
+        upper = max(lower, min(100, end))
+
+        def report(percent: int, message: str) -> None:
+            mapped = lower + round((upper - lower) * max(0, min(100, percent)) / 100)
+            label = f"{prefix}{message}" if message else prefix.removesuffix(" · ")
+            self.report_progress(mapped, label)
+
+        return TaskContext(self._cancel_event, report)
+
 
 class Worker(QObject):
     """Execute one callable in its assigned QThread."""

@@ -99,15 +99,25 @@ class MainWindow(QMainWindow):
             show_message=self.statusBar().showMessage,
         )
         self.pages.addWidget(self.persona_page)
+        self.knowledge_page.documents_changed.connect(self.persona_page.refresh)
         self.pages.addWidget(self._empty_page("写作任务"))
         self.pages.addWidget(self._settings_page())
-        self.navigation.currentRowChanged.connect(self.pages.setCurrentIndex)
+        self.navigation.currentRowChanged.connect(self._switch_page)
         self.navigation.setCurrentRow(1)
 
         root_layout.addWidget(self.navigation)
         root_layout.addWidget(self.pages, 1)
         self.setCentralWidget(root)
         self.statusBar().showMessage("就绪")
+
+    def _switch_page(self, index: int) -> None:
+        """Switch pages and refresh views backed by mutable local storage."""
+
+        self.pages.setCurrentIndex(index)
+        if index == 1:
+            self.knowledge_page.refresh_documents()
+        elif index == 2:
+            self.persona_page.refresh()
 
     def _empty_page(self, title: str) -> QWidget:
         page = QWidget()
