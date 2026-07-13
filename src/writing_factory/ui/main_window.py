@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QPushButton,
+    QSpinBox,
     QStackedWidget,
     QStyle,
     QVBoxLayout,
@@ -24,7 +25,12 @@ from PyQt6.QtWidgets import (
 
 from writing_factory.llm.models import ChatResult
 from writing_factory.ui.knowledge_page import KnowledgeBasePage
-from writing_factory.ui.persona_editor import PersonaLoader, PersonaSaver
+from writing_factory.ui.persona_editor import (
+    PersonaLoader,
+    PersonaSaver,
+    PersonaVersionLoader,
+    RuntimePersonaLoader,
+)
 from writing_factory.ui.persona_page import PersonaPage
 from writing_factory.ui.workers import BackgroundTaskManager, TaskContext
 
@@ -39,12 +45,17 @@ class MainWindow(QMainWindow):
         ingest_document: Callable[[Path, TaskContext], Any] | None = None,
         list_documents: Callable[[], list[dict[str, object]]] | None = None,
         delete_documents: Callable[[set[str], TaskContext], Any] | None = None,
-        distill_persona: Callable[[str, str, set[str], TaskContext], Any] | None = None,
+        distill_persona: Callable[[str, str, set[str], set[str], str, TaskContext], Any]
+        | None = None,
         evaluate_persona: Callable[[str, TaskContext], Any] | None = None,
         list_personas: Callable[[], list[dict[str, object]]] | None = None,
         delete_personas: Callable[[set[str], TaskContext], Any] | None = None,
         load_persona: PersonaLoader | None = None,
         save_persona: PersonaSaver | None = None,
+        load_runtime_persona: RuntimePersonaLoader | None = None,
+        list_persona_versions: PersonaVersionLoader | None = None,
+        get_siliconflow_concurrency: Callable[[], int] | None = None,
+        set_siliconflow_concurrency: Callable[[int], None] | None = None,
     ) -> None:
         super().__init__()
         self._siliconflow_check = siliconflow_check
@@ -57,6 +68,10 @@ class MainWindow(QMainWindow):
         self._delete_personas = delete_personas
         self._load_persona = load_persona
         self._save_persona = save_persona
+        self._load_runtime_persona = load_runtime_persona
+        self._list_persona_versions = list_persona_versions
+        self._get_siliconflow_concurrency = get_siliconflow_concurrency or (lambda: 3)
+        self._set_siliconflow_concurrency = set_siliconflow_concurrency
         self._tasks = BackgroundTaskManager(self)
         self._check_task_id: str | None = None
         self._close_pending = False
@@ -109,6 +124,8 @@ class MainWindow(QMainWindow):
             delete_personas=self._delete_personas,
             load_persona=self._load_persona,
             save_persona=self._save_persona,
+            load_runtime_persona=self._load_runtime_persona,
+            list_persona_versions=self._list_persona_versions,
             show_message=self.statusBar().showMessage,
         )
         self.pages.addWidget(self.persona_page)
@@ -178,6 +195,26 @@ class MainWindow(QMainWindow):
         row_layout.addWidget(self.check_button)
         layout.addWidget(siliconflow_row)
 
+        concurrency_row = QFrame()
+        concurrency_row.setObjectName("serviceRow")
+        concurrency_layout = QHBoxLayout(concurrency_row)
+        concurrency_layout.setContentsMargins(18, 14, 14, 14)
+        concurrency_layout.setSpacing(16)
+        concurrency_label = QLabel("最大并发数")
+        concurrency_label.setObjectName("providerName")
+        concurrency_provider = QLabel("SiliconFlow 全部请求")
+        concurrency_provider.setObjectName("mutedText")
+        self.concurrency_input = QSpinBox()
+        self.concurrency_input.setRange(1, 8)
+        self.concurrency_input.setValue(self._get_siliconflow_concurrency())
+        self.concurrency_input.setToolTip("限制整个程序同时进行的 SiliconFlow 请求数")
+        self.concurrency_input.valueChanged.connect(self._concurrency_changed)
+        concurrency_layout.addWidget(concurrency_label)
+        concurrency_layout.addWidget(concurrency_provider)
+        concurrency_layout.addStretch(1)
+        concurrency_layout.addWidget(self.concurrency_input)
+        layout.addWidget(concurrency_row)
+
         mineru_row = QFrame()
         mineru_row.setObjectName("serviceRow")
         mineru_layout = QHBoxLayout(mineru_row)
@@ -196,6 +233,18 @@ class MainWindow(QMainWindow):
         layout.addWidget(mineru_row)
         layout.addStretch(1)
         return page
+
+    def _concurrency_changed(self, value: int) -> None:
+        """运行时应用并持久化统一并发上限。"""
+
+        if self._set_siliconflow_concurrency is None:
+            return
+        try:
+            self._set_siliconflow_concurrency(value)
+        except ValueError as exc:
+            self.statusBar().showMessage(str(exc), 5000)
+            return
+        self.statusBar().showMessage(f"SiliconFlow 最大并发数已设为 {value}", 4000)
 
     def _start_siliconflow_check(self) -> None:
         if self._check_task_id is not None:

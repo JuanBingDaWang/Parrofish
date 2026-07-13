@@ -7,6 +7,12 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from writing_factory.distill.academic import (
+    AcademicModelValidation,
+    AttributionScope,
+    Specificity,
+)
+
 UnitScore = Annotated[float, Field(ge=-1.0, le=1.0)]
 Confidence = Literal["high", "medium", "low", "inferred"]
 PersonaMode = Literal["person", "topic"]
@@ -195,19 +201,26 @@ class MentalModel(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
+    candidate_id: str | None = None
     name: str
     description: str
     cross_domain_evidence: list[PersonaEvidence] = Field(min_length=2)
     applicability: str
     limits: str
     validation: TripleValidation
+    specificity: Specificity = "author_distinctive"
+    attribution_scope: AttributionScope = "author_specific"
+    academic_validation: AcademicModelValidation | None = None
 
     @model_validator(mode="after")
-    def require_distinct_domains(self) -> MentalModel:
-        domains = {item.domain.strip().casefold() for item in self.cross_domain_evidence}
-        if len(domains) < 2:
-            raise ValueError("Mental model evidence must cover at least two domains")
-        if not self.validation.passed:
+    def require_distinct_documents(self) -> MentalModel:
+        documents = {item.doc_id for item in self.cross_domain_evidence}
+        if len(documents) < 2:
+            raise ValueError("Mental model evidence must cover at least two documents")
+        if self.academic_validation is not None:
+            if not self.academic_validation.eligible:
+                raise ValueError("Academic mental model did not pass recurrence validation")
+        elif not self.validation.passed:
             raise ValueError("Mental model must pass all three Nüwa validations")
         return self
 
@@ -300,6 +313,8 @@ class SourceInfo(BaseModel):
     title: str
     filename: str
     source_type: Literal["primary", "secondary", "unknown"] = "primary"
+    corpus_role: Literal["target", "control"] = "target"
+    domain: str = ""
     chunk_count: int = Field(ge=1)
 
 
@@ -308,6 +323,7 @@ class PersonaSpec(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
+    schema_version: int = Field(default=1, ge=1)
     id: str
     name: str
     mode: PersonaMode
@@ -315,6 +331,7 @@ class PersonaSpec(BaseModel):
         default="zh-CN", description="档案全部可读字段采用的输出语言"
     )
     mental_models: list[MentalModel] = Field(min_length=3, max_length=7)
+    academic_conventions: list[MentalModel] = Field(default_factory=list)
     decision_heuristics: list[DecisionHeuristic] = Field(default_factory=list)
     expression_dna: ExpressionDNA
     core_tensions: list[CoreTension] = Field(default_factory=list)
@@ -342,6 +359,7 @@ class ReduceMentalModel(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
+    candidate_id: str | None = Field(default=None, description="学术蒸馏 v2 中必须复制已选候选标识")
     name: str = Field(description="心智模型的简体中文名称")
     description: str = Field(description="该认知操作如何运行的简体中文描述")
     evidence_ids: list[str] = Field(min_length=2, description="至少跨两个领域的登记证据标识")
@@ -391,13 +409,56 @@ class ReduceInformationGap(BaseModel):
     confidence: Confidence = Field(description="全局缺口判断的置信度")
 
 
+class AcademicSupplementResult(BaseModel):
+    """学术 v2 在代码选模后仅需模型补充的档案组成部分。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    decision_heuristics: list[ReduceHeuristic] = Field(
+        default_factory=list, max_length=8, description="归并后的学术写作启发式"
+    )
+    style_tags: StyleTags = Field(description="七个量化表达风格轴")
+    taboo_words: list[LexicalMarker] = Field(
+        default_factory=list, max_length=8, description="有证据或明确推断标记的禁忌词"
+    )
+    tics: list[LexicalMarker] = Field(
+        default_factory=list, max_length=8, description="有证据或明确推断标记的口癖"
+    )
+    style_rules: list[str] = Field(
+        default_factory=list, max_length=10, description="简体中文的可执行表达规则"
+    )
+    core_tensions: list[ReduceTension] = Field(
+        default_factory=list, max_length=5, description="全语料仍不能调和的核心张力"
+    )
+    school_divergences: list[SchoolDivergence] = Field(
+        default_factory=list, max_length=5, description="主题模式中的流派分歧"
+    )
+    values: list[str] = Field(default_factory=list, max_length=10, description="简体中文的价值取向")
+    anti_patterns: list[str] = Field(
+        default_factory=list, max_length=10, description="简体中文的反模式"
+    )
+    declared_limits: list[str] = Field(
+        min_length=3, max_length=6, description="三至六条简体中文诚实边界"
+    )
+    information_gaps: list[ReduceInformationGap] = Field(
+        default_factory=list,
+        max_length=8,
+        description="经全语料复核后仍未解决的信息不足",
+    )
+
+
 class ReduceResult(BaseModel):
     """要求全局归并模型返回的受验证 JSON 结构。"""
 
     model_config = ConfigDict(frozen=True)
 
     mental_models: list[ReduceMentalModel] = Field(
-        min_length=3, max_length=7, description="通过三重验证的 3 至 7 个心智模型"
+        min_length=3, max_length=7, description="经代码或三重验证选定的 3 至 7 个心智模型"
+    )
+    academic_conventions: list[ReduceMentalModel] = Field(
+        default_factory=list,
+        max_length=7,
+        description="有证据但不进入核心列表的领域或通用学术惯例",
     )
     decision_heuristics: list[ReduceHeuristic] = Field(
         default_factory=list, description="降级或归并后的决策启发"

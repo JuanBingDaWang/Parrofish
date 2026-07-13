@@ -20,9 +20,12 @@ from PyQt6.QtWidgets import (
 )
 
 from writing_factory.distill.models import PersonaSpec
+from writing_factory.distill.runtime import RuntimePersonaSpec
 
 PersonaLoader = Callable[[str], tuple[PersonaSpec, str] | None]
 PersonaSaver = Callable[[str, PersonaSpec], tuple[PersonaSpec, str]]
+RuntimePersonaLoader = Callable[[str], RuntimePersonaSpec | None]
+PersonaVersionLoader = Callable[[str], list[dict[str, object]]]
 
 
 class PersonaEditorWindow(QMainWindow):
@@ -36,12 +39,16 @@ class PersonaEditorWindow(QMainWindow):
         *,
         load_persona: PersonaLoader,
         save_persona: PersonaSaver,
+        load_runtime_persona: RuntimePersonaLoader | None = None,
+        list_persona_versions: PersonaVersionLoader | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.persona_id = persona_id
         self._load_persona = load_persona
         self._save_persona = save_persona
+        self._load_runtime_persona = load_runtime_persona
+        self._list_persona_versions = list_persona_versions
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setWindowTitle("档案详情")
         self.setMinimumSize(760, 560)
@@ -82,8 +89,15 @@ class PersonaEditorWindow(QMainWindow):
         self.markdown_preview = QPlainTextEdit()
         self.markdown_preview.setReadOnly(True)
         self.markdown_preview.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.runtime_preview = QPlainTextEdit()
+        self.runtime_preview.setReadOnly(True)
+        self.runtime_preview.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.version_preview = QPlainTextEdit()
+        self.version_preview.setReadOnly(True)
         self.tabs.addTab(self.json_editor, "结构化档案")
         self.tabs.addTab(self.markdown_preview, "Markdown")
+        self.tabs.addTab(self.runtime_preview, "运行时档案")
+        self.tabs.addTab(self.version_preview, "版本历史")
         layout.addWidget(self.tabs, 1)
 
         self.status_label = QLabel()
@@ -99,6 +113,8 @@ class PersonaEditorWindow(QMainWindow):
         if loaded is None:
             self.json_editor.clear()
             self.markdown_preview.clear()
+            self.runtime_preview.clear()
+            self.version_preview.clear()
             self.json_editor.setEnabled(False)
             self.save_button.setEnabled(False)
             self.status_label.setText("档案不存在或尚未完成")
@@ -107,6 +123,7 @@ class PersonaEditorWindow(QMainWindow):
         payload = json.dumps(persona.model_dump(mode="json"), ensure_ascii=False, indent=2)
         self.json_editor.setPlainText(payload)
         self.markdown_preview.setPlainText(markdown)
+        self._reload_derived_tabs()
         self.json_editor.setEnabled(True)
         self.save_button.setEnabled(True)
         self.status_label.setText(f"{persona.name} · {len(persona.mental_models)} 个心智模型")
@@ -125,5 +142,31 @@ class PersonaEditorWindow(QMainWindow):
         payload = json.dumps(saved.model_dump(mode="json"), ensure_ascii=False, indent=2)
         self.json_editor.setPlainText(payload)
         self.markdown_preview.setPlainText(markdown)
+        self._reload_derived_tabs()
         self.status_label.setText("已保存；旧自检分数已失效")
         self.saved.emit(self.persona_id)
+
+    def _reload_derived_tabs(self) -> None:
+        runtime = (
+            self._load_runtime_persona(self.persona_id)
+            if self._load_runtime_persona is not None
+            else None
+        )
+        self.runtime_preview.setPlainText(
+            json.dumps(runtime.model_dump(mode="json"), ensure_ascii=False, indent=2)
+            if runtime is not None
+            else "尚无运行时安全投影"
+        )
+        versions = (
+            self._list_persona_versions(self.persona_id)
+            if self._list_persona_versions is not None
+            else []
+        )
+        self.version_preview.setPlainText(
+            "\n".join(
+                f"v{item.get('version_number')} · {item.get('status')} · "
+                f"{str(item.get('research_date') or item.get('updated_at'))[:19]}"
+                for item in versions
+            )
+            or "暂无版本历史"
+        )

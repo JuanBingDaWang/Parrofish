@@ -34,7 +34,7 @@ class Settings(BaseModel):
     rerank_model: str = "BAAI/bge-reranker-v2-m3"
     citation_style: Literal["gb-t-7714"] = "gb-t-7714"
     distillation_output_language: Literal["zh-CN"] = "zh-CN"
-    distillation_map_concurrency: int = Field(default=3, ge=1, le=4)
+    siliconflow_max_concurrency: int = Field(default=3, ge=1, le=8)
     connect_timeout_seconds: float = 10.0
     read_timeout_seconds: float = 180.0
     max_retries: int = 3
@@ -124,5 +124,10 @@ def load_settings(
         embedding_model=env.get("SILICONFLOW_EMBEDDING_MODEL", "BAAI/bge-m3"),
         rerank_model=env.get("SILICONFLOW_RERANK_MODEL", "BAAI/bge-reranker-v2-m3"),
         distillation_output_language=env.get("DISTILLATION_OUTPUT_LANGUAGE", "zh-CN"),
-        distillation_map_concurrency=int(env.get("DISTILLATION_MAP_CONCURRENCY", "3")),
+        siliconflow_max_concurrency=int(
+            env.get(
+                "SILICONFLOW_MAX_CONCURRENCY",
+                env.get("DISTILLATION_MAP_CONCURRENCY", "3"),
+            )
+        ),
     )

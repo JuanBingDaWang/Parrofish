@@ -52,14 +52,14 @@ def test_distillation_defaults_to_simplified_chinese_and_three_map_workers(
     settings = load_settings(tmp_path, environ={})
 
     assert settings.distillation_output_language == "zh-CN"
-    assert settings.distillation_map_concurrency == 3
+    assert settings.siliconflow_max_concurrency == 3
 
 
-def test_distillation_rejects_more_than_four_map_workers(tmp_path: Path) -> None:
+def test_siliconflow_rejects_more_than_eight_concurrent_requests(tmp_path: Path) -> None:
     (tmp_path / "key_test.txt").write_text("one\ntwo\n", encoding="utf-8")
 
-    with pytest.raises(ValidationError, match="less than or equal to 4"):
+    with pytest.raises(ValidationError, match="less than or equal to 8"):
         load_settings(
             tmp_path,
-            environ={"DISTILLATION_MAP_CONCURRENCY": "5"},
+            environ={"SILICONFLOW_MAX_CONCURRENCY": "9"},
         )

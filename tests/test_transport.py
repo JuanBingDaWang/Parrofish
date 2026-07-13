@@ -178,15 +178,17 @@ def test_protocol_disconnect_is_a_retryable_transport_failure(tmp_path: Path) ->
 def test_sse_response_is_collected_inside_unified_transport(tmp_path: Path) -> None:
     body = (
         'data: {"choices":[{"delta":{"content":"你"}}]}\n\n'
-        'data: {"choices":[{"delta":{"content":"好"},"finish_reason":"stop"}]}\n\n'
+        'data: {"choices":[{"delta":{"content":"好"},"finish_reason":"stop"}],'
+        '"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}\n\n'
         "data: [DONE]\n\n"
     )
+    database = _database(tmp_path)
 
     transport = ServiceTransport(
         provider="test",
         base_url="https://example.invalid/v1",
         credential=SecretStr("private-token"),
-        database=_database(tmp_path),
+        database=database,
         connect_timeout_seconds=1,
         read_timeout_seconds=1,
         max_retries=1,
@@ -208,6 +210,11 @@ def test_sse_response_is_collected_inside_unified_transport(tmp_path: Path) -> N
         "你",
         "好",
     ]
+    with database.connection() as connection:
+        call = connection.execute(
+            "SELECT input_tokens, output_tokens, total_tokens FROM api_calls"
+        ).fetchone()
+    assert dict(call) == {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5}
 
 
 def test_presigned_upload_never_sends_provider_authorization(tmp_path: Path) -> None:

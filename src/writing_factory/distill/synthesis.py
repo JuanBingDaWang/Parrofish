@@ -8,15 +8,18 @@ from datetime import date
 
 from pydantic import ValidationError
 
+from writing_factory.distill.academic import CandidateRecord, CandidateRegistry
 from writing_factory.distill.expression import ExpressionStatistics
 from writing_factory.distill.extraction import StructuredDistillationError
 from writing_factory.distill.language import (
     DEFAULT_OUTPUT_LANGUAGE,
     OutputLanguage,
     OutputLanguageError,
+    validate_academic_supplement_language,
     validate_reduce_language,
 )
 from writing_factory.distill.models import (
+    AcademicSupplementResult,
     CoreTension,
     DecisionHeuristic,
     ExpressionDNA,
@@ -26,14 +29,16 @@ from writing_factory.distill.models import (
     PersonaEvidence,
     PersonaMode,
     PersonaSpec,
+    ReduceHeuristic,
     ReduceInformationGap,
+    ReduceMentalModel,
     ReduceResult,
     SourceInfo,
     SourceUnit,
     StyleTags,
     TripleValidation,
 )
-from writing_factory.distill.prompts import reduce_messages
+from writing_factory.distill.prompts import academic_supplement_messages, reduce_messages
 from writing_factory.llm import SiliconFlowClient
 
 
@@ -86,11 +91,20 @@ class CandidateBundleBuilder:
         style_observations: list[str] = []
         for result in map_results:
             for candidate in result.mental_candidates:
+                evidence_ids = [register(item) for item in candidate.evidence]
+                candidate_digest = hashlib.sha256(
+                    (f"{result.unit_id}|{candidate.name}|{'|'.join(sorted(evidence_ids))}").encode()
+                ).hexdigest()[:24]
                 mental_candidates.append(
                     {
+                        "map_candidate_id": f"map_candidate_{candidate_digest}",
+                        "unit_id": result.unit_id,
                         "name": candidate.name,
                         "description": candidate.description,
-                        "evidence_ids": [register(item) for item in candidate.evidence],
+                        "evidence_ids": evidence_ids,
+                        "source_doc_ids": sorted(
+                            {registry[item_id].doc_id for item_id in evidence_ids}
+                        ),
                         "generative_rationale": candidate.generative_rationale,
                         "exclusivity_rationale": candidate.exclusivity_rationale,
                     }
@@ -179,10 +193,26 @@ class PersonaSynthesizer:
         source_info: tuple[SourceInfo, ...],
         expression: ExpressionStatistics,
         research_date: date,
+        academic_registry: CandidateRegistry | None = None,
+        control_source_info: tuple[SourceInfo, ...] = (),
     ) -> PersonaSpec:
         """Run reduce with one repair attempt and build the authoritative spec."""
 
         registry, gap_registry, bundle = CandidateBundleBuilder().build(map_results, units)
+        if academic_registry is not None:
+            return self._synthesize_academic(
+                persona_id=persona_id,
+                name=name,
+                mode=mode,
+                registry=registry,
+                gap_registry=gap_registry,
+                bundle=bundle,
+                source_info=source_info,
+                expression=expression,
+                research_date=research_date,
+                academic_registry=academic_registry,
+                control_source_info=control_source_info,
+            )
         messages = reduce_messages(
             name=name,
             mode=mode,
@@ -190,6 +220,7 @@ class PersonaSynthesizer:
             expression=expression,
             source_info=source_info,
             output_language=self.output_language,
+            academic_registry=academic_registry,
         )
         last_error = "未知校验错误"
         for attempt in range(self.max_attempts):
@@ -207,7 +238,7 @@ class PersonaSynthesizer:
                 ]
             result = self.siliconflow.chat(
                 active_messages,
-                thinking=True,
+                thinking=academic_registry is None,
                 reasoning_effort="high",
                 temperature=0.0,
                 max_tokens=8192,
@@ -231,6 +262,8 @@ class PersonaSynthesizer:
                     source_info=source_info,
                     expression=expression,
                     research_date=research_date,
+                    academic_registry=academic_registry,
+                    control_source_info=control_source_info,
                 )
             except (
                 json.JSONDecodeError,
@@ -241,6 +274,139 @@ class PersonaSynthesizer:
                 last_error = str(exc)[:3000]
         raise StructuredDistillationError(
             f"Persona 归并在 {self.max_attempts} 次尝试后失败：{last_error}"
+        )
+
+    def _synthesize_academic(
+        self,
+        *,
+        persona_id: str,
+        name: str,
+        mode: PersonaMode,
+        registry: dict[str, PersonaEvidence],
+        gap_registry: dict[str, dict[str, object]],
+        bundle: dict[str, object],
+        source_info: tuple[SourceInfo, ...],
+        expression: ExpressionStatistics,
+        research_date: date,
+        academic_registry: CandidateRegistry,
+        control_source_info: tuple[SourceInfo, ...],
+    ) -> PersonaSpec:
+        """代码装配模型，只让短 Reduce 补充非模型字段。"""
+
+        messages = academic_supplement_messages(
+            candidate_bundle=bundle,
+            expression=expression,
+            source_info=source_info,
+            output_language=self.output_language,
+            academic_registry=academic_registry,
+        )
+        last_error = "未知校验错误"
+        for attempt in range(self.max_attempts):
+            active_messages = messages
+            if attempt:
+                active_messages = [
+                    *messages,
+                    {
+                        "role": "user",
+                        "content": (
+                            "上一次补充结果违反契约。请返回修正后的完整 JSON，不要解释。"
+                            f"校验错误：{last_error}"
+                        ),
+                    },
+                ]
+            result = self.siliconflow.chat(
+                active_messages,
+                thinking=False,
+                temperature=0.0,
+                max_tokens=10000,
+                seed=19,
+                response_format="json_object",
+                use_cache=True,
+                request_timeout_seconds=600.0,
+                request_attempts=2,
+                stream=False,
+            )
+            try:
+                supplement = AcademicSupplementResult.model_validate(json.loads(result.content))
+                validate_academic_supplement_language(supplement)
+                reduced = self._merge_academic_selection(academic_registry, supplement)
+                return self._assemble(
+                    persona_id=persona_id,
+                    name=name,
+                    mode=mode,
+                    reduced=reduced,
+                    registry=registry,
+                    gap_registry=gap_registry,
+                    source_info=source_info,
+                    expression=expression,
+                    research_date=research_date,
+                    academic_registry=academic_registry,
+                    control_source_info=control_source_info,
+                )
+            except (
+                json.JSONDecodeError,
+                ValidationError,
+                StructuredDistillationError,
+                OutputLanguageError,
+            ) as exc:
+                last_error = str(exc)[:3000]
+        raise StructuredDistillationError(
+            f"学术档案补充在 {self.max_attempts} 次尝试后失败：{last_error}"
+        )
+
+    @staticmethod
+    def _merge_academic_selection(
+        academic_registry: CandidateRegistry,
+        supplement: AcademicSupplementResult,
+    ) -> ReduceResult:
+        records = academic_registry.records
+        core = sorted(
+            (record for record in records if record.selected_as == "core"),
+            key=lambda record: record.selection_rank or 99,
+        )
+        conventions = [record for record in records if record.selected_as == "convention"]
+        downgraded = [record for record in records if record.selected_as == "heuristic"]
+
+        def present(record: CandidateRecord) -> ReduceMentalModel:
+            candidate = record.candidate
+            validation = record.validation
+            return ReduceMentalModel(
+                candidate_id=candidate.candidate_id,
+                name=candidate.name,
+                description=candidate.description,
+                evidence_ids=candidate.evidence_ids,
+                applicability=candidate.applicability,
+                limits=candidate.limits,
+                generative=validation.generative_status != "failed",
+                exclusive=validation.specificity == "author_distinctive",
+                generative_rationale=validation.generative_rationale,
+                exclusivity_rationale=validation.exclusivity_rationale,
+            )
+
+        deterministic_heuristics = [
+            ReduceHeuristic(
+                rule=f"采用“{record.candidate.name}”：{record.candidate.description}",
+                trigger=record.candidate.applicability,
+                example=f"在适用条件下，以“{record.candidate.name}”组织当前任务的论证步骤。",
+                evidence_ids=record.candidate.evidence_ids,
+            )
+            for record in downgraded
+        ]
+        downgraded_evidence = {frozenset(record.candidate.evidence_ids) for record in downgraded}
+        supplemental_heuristics = [
+            item
+            for item in supplement.decision_heuristics
+            if frozenset(item.evidence_ids) not in downgraded_evidence
+        ]
+        supplement_payload = supplement.model_dump(mode="python")
+        supplement_payload["decision_heuristics"] = [
+            *deterministic_heuristics,
+            *supplemental_heuristics,
+        ]
+        return ReduceResult(
+            mental_models=[present(record) for record in core],
+            academic_conventions=[present(record) for record in conventions],
+            **supplement_payload,
         )
 
     def _assemble(
@@ -255,6 +421,8 @@ class PersonaSynthesizer:
         source_info: tuple[SourceInfo, ...],
         expression: ExpressionStatistics,
         research_date: date,
+        academic_registry: CandidateRegistry | None,
+        control_source_info: tuple[SourceInfo, ...],
     ) -> PersonaSpec:
         self._validate_all_references(
             reduced,
@@ -262,27 +430,22 @@ class PersonaSynthesizer:
             gap_registry,
             source_info,
         )
+        records = (
+            {record.candidate.candidate_id: record for record in academic_registry.records}
+            if academic_registry is not None
+            else {}
+        )
+        if academic_registry is not None:
+            self._validate_academic_selection(reduced, academic_registry)
         mental_models: list[MentalModel] = []
         for item in reduced.mental_models:
-            evidence = self._resolve(item.evidence_ids, registry)
-            domains = {entry.domain.strip().casefold() for entry in evidence}
-            validation = TripleValidation(
-                cross_domain=len(domains) >= 2,
-                generative=item.generative,
-                exclusive=item.exclusive,
-                generative_rationale=item.generative_rationale,
-                exclusivity_rationale=item.exclusivity_rationale,
-            )
             mental_models.append(
-                MentalModel(
-                    name=item.name,
-                    description=item.description,
-                    cross_domain_evidence=evidence,
-                    applicability=item.applicability,
-                    limits=item.limits,
-                    validation=validation,
-                )
+                self._assemble_model(item, registry, records.get(item.candidate_id or ""))
             )
+        academic_conventions = [
+            self._assemble_model(item, registry, records.get(item.candidate_id or ""))
+            for item in reduced.academic_conventions
+        ]
         heuristics = [
             DecisionHeuristic(
                 rule=item.rule,
@@ -315,11 +478,13 @@ class PersonaSynthesizer:
             taboo_words = []
             tics = []
         return PersonaSpec(
+            schema_version=2 if academic_registry is not None else 1,
             id=persona_id,
             name=name,
             mode=mode,
             output_language=self.output_language,
             mental_models=mental_models,
+            academic_conventions=academic_conventions,
             decision_heuristics=heuristics,
             expression_dna=ExpressionDNA(
                 sentence_fingerprint=expression.fingerprint,
@@ -333,11 +498,84 @@ class PersonaSynthesizer:
             values=reduced.values,
             anti_patterns=reduced.anti_patterns,
             evidence_registry=list(registry.values()),
-            source_info=list(source_info),
+            source_info=[*source_info, *control_source_info],
             research_date=research_date,
             declared_limits=limits,
             information_gaps=information_gaps,
         )
+
+    def _assemble_model(
+        self,
+        item,
+        registry: dict[str, PersonaEvidence],
+        record: CandidateRecord | None,
+    ) -> MentalModel:
+        """学术 v2 使用登记表证据和验证，旧档案继续使用 Reduce 字段。"""
+
+        evidence_ids = record.candidate.evidence_ids if record is not None else item.evidence_ids
+        evidence = self._resolve(evidence_ids, registry)
+        if record is None:
+            domains = {entry.domain.strip().casefold() for entry in evidence}
+            return MentalModel(
+                name=item.name,
+                description=item.description,
+                cross_domain_evidence=evidence,
+                applicability=item.applicability,
+                limits=item.limits,
+                validation=TripleValidation(
+                    cross_domain=len(domains) >= 2,
+                    generative=item.generative,
+                    exclusive=item.exclusive,
+                    generative_rationale=item.generative_rationale,
+                    exclusivity_rationale=item.exclusivity_rationale,
+                ),
+            )
+        academic = record.validation
+        return MentalModel(
+            candidate_id=record.candidate.candidate_id,
+            name=item.name,
+            description=item.description,
+            cross_domain_evidence=evidence,
+            applicability=item.applicability,
+            limits=item.limits,
+            validation=TripleValidation(
+                cross_domain=academic.recurrence_document_count >= 2,
+                generative=academic.generative_status != "failed",
+                exclusive=academic.specificity == "author_distinctive",
+                generative_rationale=academic.generative_rationale,
+                exclusivity_rationale=academic.exclusivity_rationale,
+            ),
+            specificity=academic.specificity,
+            attribution_scope=record.candidate.attribution_scope,
+            academic_validation=academic,
+        )
+
+    @staticmethod
+    def _validate_academic_selection(
+        reduced: ReduceResult,
+        academic_registry: CandidateRegistry,
+    ) -> None:
+        expected_core = {
+            record.candidate.candidate_id
+            for record in academic_registry.records
+            if record.selected_as == "core"
+        }
+        expected_conventions = {
+            record.candidate.candidate_id
+            for record in academic_registry.records
+            if record.selected_as == "convention"
+        }
+        actual_core = {item.candidate_id for item in reduced.mental_models}
+        actual_conventions = {item.candidate_id for item in reduced.academic_conventions}
+        if None in actual_core or actual_core != expected_core:
+            raise StructuredDistillationError("最终装配没有原样保留全部核心候选 ID")
+        if None in actual_conventions or actual_conventions != expected_conventions:
+            raise StructuredDistillationError("最终装配没有原样保留全部通用惯例候选 ID")
+        records = {record.candidate.candidate_id: record for record in academic_registry.records}
+        for item in [*reduced.mental_models, *reduced.academic_conventions]:
+            expected_evidence = set(records[str(item.candidate_id)].candidate.evidence_ids)
+            if set(item.evidence_ids) != expected_evidence:
+                raise StructuredDistillationError("最终装配改变了已验证候选的证据集合")
 
     @staticmethod
     def _resolve(
@@ -368,6 +606,8 @@ class PersonaSynthesizer:
     ) -> None:
         identifiers: list[str] = []
         for item in reduced.mental_models:
+            identifiers.extend(item.evidence_ids)
+        for item in reduced.academic_conventions:
             identifiers.extend(item.evidence_ids)
         for item in reduced.decision_heuristics:
             identifiers.extend(item.evidence_ids)

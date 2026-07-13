@@ -23,7 +23,13 @@ from PyQt6.QtWidgets import (
 )
 
 from writing_factory.distill.models import PersonaMode
-from writing_factory.ui.persona_editor import PersonaEditorWindow, PersonaLoader, PersonaSaver
+from writing_factory.ui.persona_editor import (
+    PersonaEditorWindow,
+    PersonaLoader,
+    PersonaSaver,
+    PersonaVersionLoader,
+    RuntimePersonaLoader,
+)
 from writing_factory.ui.workers import BackgroundTaskManager, TaskContext
 
 
@@ -34,7 +40,8 @@ class PersonaPage(QWidget):
         self,
         tasks: BackgroundTaskManager,
         *,
-        distill_persona: Callable[[str, PersonaMode, set[str], TaskContext], Any] | None,
+        distill_persona: Callable[[str, PersonaMode, set[str], set[str], str, TaskContext], Any]
+        | None,
         evaluate_persona: Callable[[str, TaskContext], Any] | None,
         list_sources: Callable[[], list[dict[str, object]]],
         list_personas: Callable[[], list[dict[str, object]]],
@@ -42,6 +49,8 @@ class PersonaPage(QWidget):
         load_persona: PersonaLoader | None,
         save_persona: PersonaSaver | None,
         show_message: Callable[[str, int], None],
+        load_runtime_persona: RuntimePersonaLoader | None = None,
+        list_persona_versions: PersonaVersionLoader | None = None,
     ) -> None:
         super().__init__()
         self._tasks = tasks
@@ -52,6 +61,8 @@ class PersonaPage(QWidget):
         self._delete_personas = delete_personas
         self._load_persona = load_persona
         self._save_persona = save_persona
+        self._load_runtime_persona = load_runtime_persona
+        self._list_persona_versions = list_persona_versions
         self._show_message = show_message
         self._task_id: str | None = None
         self._editor_windows: dict[str, PersonaEditorWindow] = {}
@@ -70,15 +81,23 @@ class PersonaPage(QWidget):
         self.name_input.setMaximumWidth(240)
         self.name_input.setMaxLength(80)
         self.name_input.textChanged.connect(self._update_button)
+        self.domain_input = QLineEdit()
+        self.domain_input.setMaximumWidth(160)
+        self.domain_input.setMaxLength(80)
+        self.domain_input.setPlaceholderText("研究领域")
+        self.domain_input.textChanged.connect(self._update_button)
         toolbar.addWidget(heading)
         toolbar.addStretch(1)
         toolbar.addWidget(name_label)
         toolbar.addWidget(self.name_input)
+        toolbar.addWidget(self.domain_input)
 
         self.mode_group = QButtonGroup(self)
         self.person_button = self._mode_button("人物", "person")
         self.topic_button = self._mode_button("主题", "topic")
         self.person_button.setChecked(True)
+        self.person_button.toggled.connect(lambda _checked: self._update_button())
+        self.topic_button.toggled.connect(lambda _checked: self._update_button())
         toolbar.addWidget(self.person_button)
         toolbar.addWidget(self.topic_button)
 
@@ -102,16 +121,17 @@ class PersonaPage(QWidget):
         source_label = QLabel("语料")
         source_label.setObjectName("sectionTitle")
         layout.addWidget(source_label)
-        self.source_table = QTableWidget(0, 3)
-        self.source_table.setHorizontalHeaderLabels(["使用", "文件", "切片"])
+        self.source_table = QTableWidget(0, 4)
+        self.source_table.setHorizontalHeaderLabels(["目标", "对照", "文件", "切片"])
         self.source_table.setMaximumHeight(210)
         self.source_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.source_table.verticalHeader().setVisible(False)
         source_header = self.source_table.horizontalHeader()
         source_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        source_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        source_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.source_table.itemChanged.connect(self._update_button)
+        source_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        source_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        source_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.source_table.itemChanged.connect(self._source_role_changed)
         layout.addWidget(self.source_table)
 
         profile_header_layout = QHBoxLayout()
@@ -128,9 +148,9 @@ class PersonaPage(QWidget):
         self.delete_button.setEnabled(False)
         profile_header_layout.addWidget(self.delete_button)
         layout.addLayout(profile_header_layout)
-        self.profile_table = QTableWidget(0, 7)
+        self.profile_table = QTableWidget(0, 8)
         self.profile_table.setHorizontalHeaderLabels(
-            ["选择", "名称", "模式", "状态", "心智模型", "自检", "调研日期"]
+            ["选择", "名称", "模式", "版本", "状态", "心智模型", "自检", "调研日期"]
         )
         self.profile_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.profile_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -143,7 +163,7 @@ class PersonaPage(QWidget):
         profile_header = self.profile_table.horizontalHeader()
         profile_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         profile_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        for column in (2, 3, 4, 5, 6):
+        for column in (2, 3, 4, 5, 6, 7):
             profile_header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(self.profile_table, 1)
         self.refresh()
@@ -164,13 +184,12 @@ class PersonaPage(QWidget):
         sources = [item for item in self._list_sources() if item.get("status") == "ready"]
         self.source_table.setRowCount(len(sources))
         for row, source in enumerate(sources):
-            use = QTableWidgetItem()
-            use.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
-            use.setCheckState(Qt.CheckState.Checked)
-            use.setData(Qt.ItemDataRole.UserRole, source.get("doc_id"))
-            self.source_table.setItem(row, 0, use)
-            self.source_table.setItem(row, 1, QTableWidgetItem(str(source.get("filename", ""))))
-            self.source_table.setItem(row, 2, QTableWidgetItem(str(source.get("chunk_count", 0))))
+            target = self._source_checkbox(source.get("doc_id"), checked=True)
+            control = self._source_checkbox(source.get("doc_id"), checked=False)
+            self.source_table.setItem(row, 0, target)
+            self.source_table.setItem(row, 1, control)
+            self.source_table.setItem(row, 2, QTableWidgetItem(str(source.get("filename", ""))))
+            self.source_table.setItem(row, 3, QTableWidgetItem(str(source.get("chunk_count", 0))))
         self.source_table.blockSignals(False)
 
         profiles = self._list_personas()
@@ -186,6 +205,7 @@ class PersonaPage(QWidget):
             values = (
                 str(profile.get("name", "")),
                 "人物" if profile.get("mode") == "person" else "主题",
+                f"v{profile.get('version_number', 1)} / {profile.get('version_count', 1)}",
                 self._status_label(str(profile.get("status", ""))),
                 str(profile.get("model_count", 0)),
                 self._score_label(profile.get("fidelity_score")),
@@ -207,11 +227,20 @@ class PersonaPage(QWidget):
         if not name or not doc_ids:
             return
         mode = self._selected_mode()
+        control_doc_ids = self._selected_control_doc_ids() if mode == "person" else set()
+        domain = self.domain_input.text().strip() if mode == "person" else ""
         self._set_running(True)
         self._show_message("准备蒸馏", 0)
 
         def task(context: TaskContext):
-            return self._distill_persona(name, mode, doc_ids, context)
+            return self._distill_persona(
+                name,
+                mode,
+                doc_ids,
+                control_doc_ids,
+                domain,
+                context,
+            )
 
         self._task_id = self._tasks.start(
             task,
@@ -263,14 +292,43 @@ class PersonaPage(QWidget):
         )
 
     def _selected_doc_ids(self) -> set[str]:
+        """返回目标作者语料。"""
+
+        return self._checked_source_ids(0)
+
+    def _selected_control_doc_ids(self) -> set[str]:
+        """返回本次可选的同领域对照语料。"""
+
+        return self._checked_source_ids(1)
+
+    def _checked_source_ids(self, column: int) -> set[str]:
         selected: set[str] = set()
         for row in range(self.source_table.rowCount()):
-            item = self.source_table.item(row, 0)
+            item = self.source_table.item(row, column)
             if item is not None and item.checkState() == Qt.CheckState.Checked:
                 value = item.data(Qt.ItemDataRole.UserRole)
                 if isinstance(value, str):
                     selected.add(value)
         return selected
+
+    @staticmethod
+    def _source_checkbox(doc_id: object, *, checked: bool) -> QTableWidgetItem:
+        item = QTableWidgetItem()
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        item.setData(Qt.ItemDataRole.UserRole, doc_id)
+        return item
+
+    def _source_role_changed(self, item: QTableWidgetItem) -> None:
+        """目标和对照角色互斥；主题模式会忽略对照列。"""
+
+        if item.column() in (0, 1) and item.checkState() == Qt.CheckState.Checked:
+            other = self.source_table.item(item.row(), 1 - item.column())
+            if other is not None and other.checkState() == Qt.CheckState.Checked:
+                self.source_table.blockSignals(True)
+                other.setCheckState(Qt.CheckState.Unchecked)
+                self.source_table.blockSignals(False)
+        self._update_button()
 
     def _selected_mode(self) -> PersonaMode:
         return "topic" if self.topic_button.isChecked() else "person"
@@ -319,6 +377,11 @@ class PersonaPage(QWidget):
             and self._task_id is None
             and bool(self.name_input.text().strip())
             and bool(self._selected_doc_ids())
+            and (
+                self._selected_mode() == "topic"
+                or not self._selected_control_doc_ids()
+                or bool(self.domain_input.text().strip())
+            )
         )
         self.distill_button.setEnabled(enabled)
         self.evaluate_button.setEnabled(
@@ -354,6 +417,8 @@ class PersonaPage(QWidget):
             persona_id,
             load_persona=self._load_persona,
             save_persona=self._save_persona,
+            load_runtime_persona=self._load_runtime_persona,
+            list_persona_versions=self._list_persona_versions,
             parent=self,
         )
         editor.saved.connect(lambda _persona_id: self.refresh())
@@ -398,6 +463,7 @@ class PersonaPage(QWidget):
         self.progress.setValue(0)
         self.progress.setVisible(running)
         self.name_input.setEnabled(not running)
+        self.domain_input.setEnabled(not running)
         self.person_button.setEnabled(not running)
         self.topic_button.setEnabled(not running)
         self.source_table.setEnabled(not running)

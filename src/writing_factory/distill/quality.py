@@ -9,6 +9,7 @@ from writing_factory.distill.language import (
     validate_persona_language,
 )
 from writing_factory.distill.models import PersonaSpec
+from writing_factory.distill.runtime import build_runtime_persona
 
 
 class StaticQualityReport(BaseModel):
@@ -31,7 +32,7 @@ def run_static_quality_check(spec: PersonaSpec) -> StaticQualityReport:
 
     registry_ids = {item.evidence_id for item in spec.evidence_registry}
     referenced_ids: set[str] = set()
-    for model in spec.mental_models:
+    for model in [*spec.mental_models, *spec.academic_conventions]:
         referenced_ids.update(item.evidence_id for item in model.cross_domain_evidence)
     for heuristic in spec.decision_heuristics:
         referenced_ids.update(item.evidence_id for item in heuristic.evidence)
@@ -45,15 +46,26 @@ def run_static_quality_check(spec: PersonaSpec) -> StaticQualityReport:
         output_language = True
     except OutputLanguageError:
         output_language = False
+    model_validation = all(
+        (
+            model.academic_validation.eligible
+            if model.academic_validation is not None
+            else model.validation.passed
+        )
+        and len({item.doc_id for item in model.cross_domain_evidence}) >= 2
+        for model in spec.mental_models
+    )
+    runtime = build_runtime_persona(spec).model_dump(mode="json")
+    runtime_text = str(runtime)
     checks = {
         "mental_model_count": 3 <= len(spec.mental_models) <= 7,
-        "triple_validation": all(
-            model.validation.passed
-            and len({item.domain.casefold() for item in model.cross_domain_evidence}) >= 2
-            for model in spec.mental_models
-        ),
+        "triple_validation": model_validation,
         "model_limits": all(bool(model.limits.strip()) for model in spec.mental_models),
         "evidence_traceability": referenced_ids.issubset(registry_ids),
+        "runtime_evidence_isolation": not any(
+            key in runtime_text
+            for key in ("evidence_id", "chunk_id", "source_info", "research_context")
+        ),
         "expression_fingerprint": spec.expression_dna.sentence_fingerprint.character_count > 0,
         "honest_boundaries": len(spec.declared_limits) >= 3,
         "source_transparency": bool(spec.source_info),

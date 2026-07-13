@@ -33,6 +33,8 @@ class SourceCorpusBuilder:
     def build(self, kb_id: str, *, doc_ids: set[str] | None = None) -> SourceCorpus:
         """Build deterministic map units from currently ready documents."""
 
+        if doc_ids is not None and not doc_ids:
+            raise ValueError("Distillation requires at least one selected source document")
         documents = self.repository.source_documents(kb_id, doc_ids=doc_ids)
         chunks = self.repository.ready_parent_chunks(kb_id, doc_ids=doc_ids)
         if not documents or not chunks:

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from writing_factory.distill.sources import SourceCorpusBuilder
 
 
@@ -41,3 +43,8 @@ def test_source_hash_includes_grouping_strategy() -> None:
     assert len(compact.units) == 2
     assert len(broad.units) == 1
     assert compact.source_hash != broad.source_hash
+
+
+def test_source_builder_rejects_an_explicit_empty_selection() -> None:
+    with pytest.raises(ValueError, match="at least one selected"):
+        SourceCorpusBuilder(FakeSourceRepository()).build("kb", doc_ids=set())

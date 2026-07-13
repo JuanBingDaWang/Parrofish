@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 from writing_factory.config import Settings
 from writing_factory.llm.base import ExternalServiceError, ServiceTransport
+from writing_factory.llm.common import DynamicConcurrencyGate
 from writing_factory.llm.models import (
     ChatResult,
     EmbeddingResult,
@@ -22,7 +23,12 @@ ReasoningEffort = Literal["high", "max"]
 class SiliconFlowClient:
     """The only SiliconFlow entry point exposed to business modules."""
 
-    def __init__(self, settings: Settings, database: Database) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        database: Database,
+        concurrency_gate: DynamicConcurrencyGate | None = None,
+    ) -> None:
         self.settings = settings
         self.transport = ServiceTransport(
             provider="siliconflow",
@@ -33,6 +39,7 @@ class SiliconFlowClient:
             read_timeout_seconds=settings.read_timeout_seconds,
             max_retries=settings.max_retries,
             minimum_interval_seconds=settings.min_request_interval_seconds,
+            concurrency_gate=concurrency_gate,
         )
 
     def close(self) -> None:
@@ -54,6 +61,7 @@ class SiliconFlowClient:
         request_timeout_seconds: float | None = None,
         request_attempts: int | None = None,
         stream: bool = False,
+        priority: int = 10,
     ) -> ChatResult:
         """Run a deterministic or creative chat request, optionally over SSE."""
 
@@ -88,6 +96,7 @@ class SiliconFlowClient:
             request_timeout_seconds=request_timeout_seconds,
             request_attempts=request_attempts,
             stream_response=stream,
+            priority=priority,
         )
         if stream:
             return self._streamed_chat_result(response)
@@ -146,6 +155,7 @@ class SiliconFlowClient:
         texts: Sequence[str],
         *,
         use_cache: bool = True,
+        priority: int = 10,
     ) -> EmbeddingResult:
         """Embed a batch while preserving input order."""
 
@@ -160,6 +170,7 @@ class SiliconFlowClient:
                 "character_count": sum(len(text) for text in texts),
             },
             use_cache=use_cache,
+            priority=priority,
         )
         try:
             ordered = sorted(response["data"], key=lambda item: item["index"])
@@ -182,6 +193,7 @@ class SiliconFlowClient:
         top_n: int | None = None,
         return_documents: bool = False,
         use_cache: bool = True,
+        priority: int = 10,
     ) -> RerankResult:
         """Rerank candidate documents through SiliconFlow's separate endpoint."""
 
@@ -205,6 +217,7 @@ class SiliconFlowClient:
                 "document_chars": sum(len(document) for document in documents),
             },
             use_cache=use_cache,
+            priority=priority,
         )
         try:
             items = [RerankItem.model_validate(item) for item in response["results"]]

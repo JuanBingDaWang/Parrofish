@@ -35,7 +35,15 @@ class PersonaMapExtractor:
         self.output_language = output_language
         self.max_attempts = max_attempts
 
-    def extract(self, name: str, mode: PersonaMode, unit: SourceUnit) -> MapResult:
+    def extract(
+        self,
+        name: str,
+        mode: PersonaMode,
+        unit: SourceUnit,
+        *,
+        corpus_role: str = "target",
+        domain: str = "",
+    ) -> MapResult:
         """Extract and validate one map result, repairing at most once."""
 
         messages = map_messages(
@@ -43,6 +51,8 @@ class PersonaMapExtractor:
             mode,
             unit,
             output_language=self.output_language,
+            corpus_role=corpus_role,
+            domain=domain,
         )
         last_error = "未知校验错误"
         for attempt in range(self.max_attempts):

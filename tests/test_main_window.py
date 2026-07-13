@@ -38,6 +38,21 @@ def test_connection_button_runs_check_in_background(qtbot) -> None:
     qtbot.waitUntil(lambda: window._tasks.active_count == 0, timeout=2000)
 
 
+def test_settings_page_applies_shared_siliconflow_concurrency(qtbot) -> None:
+    changed: list[int] = []
+    window = MainWindow(
+        lambda: ChatResult(content="OK", model="test"),
+        get_siliconflow_concurrency=lambda: 5,
+        set_siliconflow_concurrency=changed.append,
+    )
+    qtbot.addWidget(window)
+
+    assert window.concurrency_input.value() == 5
+    window.concurrency_input.setValue(6)
+
+    assert changed == [6]
+
+
 def test_document_import_updates_table_without_blocking(qtbot, tmp_path: Path) -> None:
     documents: list[dict[str, object]] = []
     source = tmp_path / "资料.txt"
@@ -158,15 +173,17 @@ def test_entering_persona_page_refreshes_external_document_changes(qtbot) -> Non
     window.navigation.setCurrentRow(2)
 
     assert window.persona_page.source_table.rowCount() == 1
-    assert window.persona_page.source_table.item(0, 1).text() == "新论文.pdf"
+    assert window.persona_page.source_table.item(0, 2).text() == "新论文.pdf"
 
 
 def test_persona_page_distills_checked_sources_in_background(qtbot) -> None:
     profiles: list[dict[str, object]] = []
     received: list[tuple[str, str, set[str]]] = []
 
-    def distill(name, mode, doc_ids, context):
+    def distill(name, mode, doc_ids, control_doc_ids, domain, context):
         received.append((name, mode, doc_ids))
+        assert control_doc_ids == set()
+        assert domain == ""
         context.report_progress(60, "归并")
         time.sleep(0.05)
         profiles.append(
@@ -205,7 +222,38 @@ def test_persona_page_distills_checked_sources_in_background(qtbot) -> None:
 
     assert received == [("叶芃", "person", {"doc_one"})]
     assert page.profile_table.item(0, 1).text() == "叶芃"
-    assert page.profile_table.item(0, 4).text() == "3"
+    assert page.profile_table.item(0, 5).text() == "3"
+    qtbot.waitUntil(lambda: window._tasks.active_count == 0, timeout=2000)
+
+
+def test_topic_mode_ignores_checked_control_sources_and_domain(qtbot) -> None:
+    received: list[tuple[set[str], set[str], str]] = []
+
+    def distill(_name, _mode, doc_ids, control_doc_ids, domain, _context):
+        received.append((doc_ids, control_doc_ids, domain))
+        return SimpleNamespace(persona=SimpleNamespace(mental_models=[1, 2, 3]))
+
+    documents = [
+        {"doc_id": "doc_1", "filename": "一.pdf", "status": "ready", "chunk_count": 1},
+        {"doc_id": "doc_2", "filename": "二.pdf", "status": "ready", "chunk_count": 1},
+    ]
+    window = MainWindow(
+        lambda: ChatResult(content="OK", model="test"),
+        distill_persona=distill,
+        list_documents=lambda: documents,
+    )
+    qtbot.addWidget(window)
+    page = window.persona_page
+    page.name_input.setText("测试主题")
+    page.domain_input.setText("不应传入")
+    page.source_table.item(0, 1).setCheckState(Qt.CheckState.Checked)
+    assert page.source_table.item(0, 0).checkState() == Qt.CheckState.Unchecked
+    page.topic_button.setChecked(True)
+
+    qtbot.mouseClick(page.distill_button, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: bool(received), timeout=2000)
+
+    assert received == [({"doc_2"}, set(), "")]
     qtbot.waitUntil(lambda: window._tasks.active_count == 0, timeout=2000)
 
 
@@ -243,7 +291,7 @@ def test_persona_fidelity_check_runs_in_background_and_refreshes_score(qtbot) ->
     assert page.evaluate_button.isEnabled()
     qtbot.mouseClick(page.evaluate_button, Qt.MouseButton.LeftButton)
     assert not page.evaluate_button.isEnabled()
-    qtbot.waitUntil(lambda: page.profile_table.item(0, 5).text() == "88/100", timeout=2000)
+    qtbot.waitUntil(lambda: page.profile_table.item(0, 6).text() == "88/100", timeout=2000)
 
     assert received == ["persona_one"]
     assert page.evaluate_button.isEnabled()

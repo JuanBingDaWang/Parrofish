@@ -36,6 +36,7 @@ def main() -> int:
             max_tokens=8,
             seed=7,
             use_cache=False,
+            priority=0,
         )
 
     def ingest_document(source_path: Path, task_context: TaskContext):
@@ -46,12 +47,21 @@ def main() -> int:
             check_cancelled=task_context.check_cancelled,
         )
 
-    def distill_persona(name, mode, doc_ids, task_context: TaskContext):
+    def distill_persona(
+        name,
+        mode,
+        doc_ids,
+        control_doc_ids,
+        domain,
+        task_context: TaskContext,
+    ):
         return context.distillation.distill(
             kb_id=context.default_kb_id,
             name=name,
             mode=mode,
             doc_ids=doc_ids,
+            control_doc_ids=control_doc_ids,
+            domain=domain,
             progress=task_context.report_progress,
             check_cancelled=task_context.check_cancelled,
         )
@@ -115,6 +125,10 @@ def main() -> int:
         delete_personas=delete_personas,
         load_persona=context.persona_repository.load_ready,
         save_persona=save_persona,
+        load_runtime_persona=context.persona_repository.load_runtime,
+        list_persona_versions=context.persona_repository.list_versions,
+        get_siliconflow_concurrency=lambda: context.siliconflow_gate.limit,
+        set_siliconflow_concurrency=context.set_siliconflow_concurrency,
     )
     application.aboutToQuit.connect(context.close)
     window.show()

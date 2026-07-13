@@ -8,6 +8,7 @@ import logging
 import time
 import uuid
 from collections.abc import Mapping
+from contextlib import contextmanager
 from typing import Any
 
 import httpx
@@ -16,6 +17,7 @@ from tenacity import Retrying, retry_if_exception_type, stop_after_attempt
 from tenacity.wait import wait_exponential_jitter
 
 from writing_factory.llm.common import (
+    DynamicConcurrencyGate,
     ExternalServiceError,
     RateLimiter,
     RetryableServiceError,
@@ -40,12 +42,14 @@ class ServiceTransport:
         max_retries: int,
         minimum_interval_seconds: float = 0.0,
         http_client: httpx.Client | None = None,
+        concurrency_gate: DynamicConcurrencyGate | None = None,
     ) -> None:
         self.provider = provider
         self.base_url = base_url.rstrip("/")
         self.database = database
         self.max_retries = max(1, max_retries)
         self.rate_limiter = RateLimiter(minimum_interval_seconds)
+        self.concurrency_gate = concurrency_gate
         self._owns_client = http_client is None
         timeout = httpx.Timeout(
             connect=connect_timeout_seconds,
@@ -82,6 +86,7 @@ class ServiceTransport:
         request_timeout_seconds: float | None = None,
         request_attempts: int | None = None,
         stream_response: bool = False,
+        priority: int = 10,
     ) -> dict[str, Any]:
         """Execute one JSON request and record only structural summaries."""
 
@@ -121,6 +126,7 @@ class ServiceTransport:
                 path,
                 normalized_payload,
                 request_timeout_seconds,
+                priority,
             )
         except Exception as exc:
             safe_error = (
@@ -171,6 +177,7 @@ class ServiceTransport:
         path: str,
         payload: Mapping[str, Any],
         request_timeout_seconds: float | None = None,
+        priority: int = 10,
     ) -> dict[str, Any]:
         """Collect one server-sent event response through the shared transport boundary."""
 
@@ -178,33 +185,44 @@ class ServiceTransport:
         timeout_kwargs = (
             {"timeout": request_timeout_seconds} if request_timeout_seconds is not None else {}
         )
+        wall_started = time.monotonic()
         chunks: list[dict[str, Any]] = []
+        gate = self.concurrency_gate
+        slot = gate.slot(priority=priority) if gate is not None else _null_slot()
         try:
-            with self._client.stream(
-                method,
-                path,
-                json=payload or None,
-                **timeout_kwargs,
-            ) as response:
-                self._raise_for_status(response)
-                for line in response.iter_lines():
-                    value = line.strip()
-                    if not value.startswith("data:"):
-                        continue
-                    data = value[5:].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        decoded = json.loads(data)
-                    except ValueError as exc:
-                        raise ExternalServiceError(
-                            f"{self.provider} returned invalid event JSON"
-                        ) from exc
-                    if not isinstance(decoded, dict):
-                        raise ExternalServiceError(
-                            f"{self.provider} returned an invalid event shape"
-                        )
-                    chunks.append(decoded)
+            with slot:
+                with self._client.stream(
+                    method,
+                    path,
+                    json=payload or None,
+                    **timeout_kwargs,
+                ) as response:
+                    self._raise_for_status(response)
+                    for line in response.iter_lines():
+                        if (
+                            request_timeout_seconds is not None
+                            and time.monotonic() - wall_started > request_timeout_seconds
+                        ):
+                            raise RetryableServiceError(
+                                f"{self.provider} stream exceeded wall-clock timeout"
+                            )
+                        value = line.strip()
+                        if not value.startswith("data:"):
+                            continue
+                        data = value[5:].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            decoded = json.loads(data)
+                        except ValueError as exc:
+                            raise ExternalServiceError(
+                                f"{self.provider} returned invalid event JSON"
+                            ) from exc
+                        if not isinstance(decoded, dict):
+                            raise ExternalServiceError(
+                                f"{self.provider} returned an invalid event shape"
+                            )
+                        chunks.append(decoded)
         except httpx.TransportError as exc:
             raise RetryableServiceError(f"{self.provider} network error") from exc
         if not chunks:
@@ -217,20 +235,24 @@ class ServiceTransport:
         path: str,
         payload: Mapping[str, Any],
         request_timeout_seconds: float | None = None,
+        priority: int = 10,
     ) -> dict[str, Any]:
         self.rate_limiter.wait()
         timeout_kwargs = (
             {"timeout": request_timeout_seconds} if request_timeout_seconds is not None else {}
         )
+        gate = self.concurrency_gate
+        slot = gate.slot(priority=priority) if gate is not None else _null_slot()
         try:
-            if method.upper() == "GET":
-                response = self._client.request(
-                    method, path, params=payload or None, **timeout_kwargs
-                )
-            else:
-                response = self._client.request(
-                    method, path, json=payload or None, **timeout_kwargs
-                )
+            with slot:
+                if method.upper() == "GET":
+                    response = self._client.request(
+                        method, path, params=payload or None, **timeout_kwargs
+                    )
+                else:
+                    response = self._client.request(
+                        method, path, json=payload or None, **timeout_kwargs
+                    )
         except httpx.TransportError as exc:
             raise RetryableServiceError(f"{self.provider} network error") from exc
 
@@ -247,6 +269,8 @@ class ServiceTransport:
         """Apply the same sanitized status policy to JSON and SSE responses."""
 
         if response.status_code == 429 or response.status_code >= 500:
+            if response.status_code == 429 and self.concurrency_gate is not None:
+                self.concurrency_gate.note_rate_limit()
             raise RetryableServiceError(
                 f"{self.provider} temporary error (HTTP {response.status_code})"
             )
@@ -270,7 +294,7 @@ class ServiceTransport:
         response: Mapping[str, Any] | None = None,
         error_type: str | None = None,
     ) -> None:
-        usage = response.get("usage", {}) if response else {}
+        usage = self._response_usage(response)
         input_tokens = self._int_or_none(usage.get("prompt_tokens", usage.get("input_tokens")))
         output_tokens = self._int_or_none(
             usage.get("completion_tokens", usage.get("output_tokens"))
@@ -335,9 +359,32 @@ class ServiceTransport:
         return json.dumps(summary, ensure_ascii=False, sort_keys=True)
 
     @staticmethod
+    def _response_usage(response: Mapping[str, Any] | None) -> Mapping[str, Any]:
+        """同时提取普通 JSON 和流式事件末尾的 token 用量。"""
+
+        if response is None:
+            return {}
+        usage = response.get("usage")
+        if isinstance(usage, Mapping):
+            return usage
+        chunks = response.get("chunks")
+        if isinstance(chunks, list):
+            for chunk in reversed(chunks):
+                if isinstance(chunk, Mapping) and isinstance(chunk.get("usage"), Mapping):
+                    return chunk["usage"]
+        return {}
+
+    @staticmethod
     def _elapsed_ms(started_at: float) -> int:
         return max(0, round((time.perf_counter() - started_at) * 1000))
 
     @staticmethod
     def _int_or_none(value: Any) -> int | None:
         return value if isinstance(value, int) else None
+
+
+@contextmanager
+def _null_slot():
+    """避免为未配置并发闸门的其他服务改变传输行为。"""
+
+    yield

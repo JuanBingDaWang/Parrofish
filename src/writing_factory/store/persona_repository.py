@@ -5,9 +5,15 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass
+from typing import TypeVar
+
+from pydantic import BaseModel
 
 from writing_factory.distill.models import MapResult, PersonaMode, PersonaSpec
+from writing_factory.distill.runtime import RuntimePersonaSpec, build_runtime_persona
 from writing_factory.store.database import Database, utc_now
+
+CheckpointModel = TypeVar("CheckpointModel", bound=BaseModel)
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,6 +24,8 @@ class DistillationRunRecord:
     persona_id: str
     map_total: int
     map_completed: int
+    profile_id: str = ""
+    version_number: int = 1
 
 
 class PersonaRepository:
@@ -64,31 +72,69 @@ class PersonaRepository:
         input_hash: str,
         source_doc_ids: list[str],
         map_total: int,
+        control_doc_ids: list[str] | None = None,
+        domain: str = "",
     ) -> DistillationRunRecord:
         """Resume the latest incomplete identical run or create a new checkpoint tree."""
 
         with self.database.connection() as connection:
+            now = utc_now()
+            name_key = name.strip().casefold()
+            profile = connection.execute(
+                """
+                SELECT profile_id FROM persona_profiles
+                WHERE kb_id = ? AND name_key = ? AND mode = ?
+                """,
+                (kb_id, name_key, mode),
+            ).fetchone()
+            if profile is None:
+                profile_id = f"profile_{uuid.uuid4().hex}"
+                connection.execute(
+                    """
+                    INSERT INTO persona_profiles(
+                        profile_id, kb_id, name, name_key, mode, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (profile_id, kb_id, name, name_key, mode, now, now),
+                )
+            else:
+                profile_id = str(profile["profile_id"])
+                connection.execute(
+                    """
+                    UPDATE persona_profiles SET name = ?, updated_at = ? WHERE profile_id = ?
+                    """,
+                    (name, now, profile_id),
+                )
             row = connection.execute(
                 """
-                SELECT r.run_id, r.persona_id, r.map_total, r.map_completed
+                SELECT r.run_id, r.persona_id, r.map_total, r.map_completed,
+                       p.version_number
                 FROM distillation_runs r
                 JOIN persona_specs p ON p.persona_id = r.persona_id
-                WHERE p.name = ? AND p.mode = ? AND p.kb_id = ?
+                WHERE p.profile_id = ?
                   AND p.source_hash = ? AND r.input_hash = ?
                   AND r.status != 'ready'
                 ORDER BY r.updated_at DESC LIMIT 1
                 """,
-                (name, mode, kb_id, source_hash, input_hash),
+                (profile_id, source_hash, input_hash),
             ).fetchone()
-            now = utc_now()
             if row is not None:
                 connection.execute(
                     """
                     UPDATE distillation_runs
-                    SET status = 'mapping', error_type = NULL, map_total = ?, updated_at = ?
+                    SET status = 'mapping', error_type = NULL, map_total = ?,
+                        target_doc_ids_json = ?, control_doc_ids_json = ?, domain = ?,
+                        updated_at = ?
                     WHERE run_id = ?
                     """,
-                    (map_total, now, row["run_id"]),
+                    (
+                        map_total,
+                        json.dumps(source_doc_ids, ensure_ascii=False),
+                        json.dumps(control_doc_ids or [], ensure_ascii=False),
+                        domain,
+                        now,
+                        row["run_id"],
+                    ),
                 )
                 connection.execute(
                     """
@@ -103,24 +149,45 @@ class PersonaRepository:
                     persona_id=row["persona_id"],
                     map_total=map_total,
                     map_completed=row["map_completed"],
+                    profile_id=profile_id,
+                    version_number=row["version_number"],
                 )
 
             persona_id = f"persona_{uuid.uuid4().hex}"
             run_id = f"distill_{uuid.uuid4().hex}"
+            version_number = connection.execute(
+                """
+                SELECT coalesce(max(version_number), 0) + 1
+                FROM persona_specs WHERE profile_id = ?
+                """,
+                (profile_id,),
+            ).fetchone()[0]
             connection.execute(
                 """
                 INSERT INTO persona_specs(
-                    persona_id, name, mode, kb_id, status, source_hash, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'mapping', ?, ?, ?)
+                    persona_id, name, mode, kb_id, status, source_hash,
+                    profile_id, version_number, schema_version, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'mapping', ?, ?, ?, 2, ?, ?)
                 """,
-                (persona_id, name, mode, kb_id, source_hash, now, now),
+                (
+                    persona_id,
+                    name,
+                    mode,
+                    kb_id,
+                    source_hash,
+                    profile_id,
+                    version_number,
+                    now,
+                    now,
+                ),
             )
             connection.execute(
                 """
                 INSERT INTO distillation_runs(
                     run_id, persona_id, input_hash, status, source_doc_ids_json,
-                    map_total, map_completed, created_at, updated_at
-                ) VALUES (?, ?, ?, 'mapping', ?, ?, 0, ?, ?)
+                    map_total, map_completed, target_doc_ids_json, control_doc_ids_json,
+                    domain, created_at, updated_at
+                ) VALUES (?, ?, ?, 'mapping', ?, ?, 0, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -128,11 +195,21 @@ class PersonaRepository:
                     input_hash,
                     json.dumps(source_doc_ids, ensure_ascii=False),
                     map_total,
+                    json.dumps(source_doc_ids, ensure_ascii=False),
+                    json.dumps(control_doc_ids or [], ensure_ascii=False),
+                    domain,
                     now,
                     now,
                 ),
             )
-        return DistillationRunRecord(run_id, persona_id, map_total, 0)
+        return DistillationRunRecord(
+            run_id,
+            persona_id,
+            map_total,
+            0,
+            profile_id,
+            version_number,
+        )
 
     def get_map_result(self, run_id: str, unit_id: str) -> MapResult | None:
         """Load one completed map checkpoint."""
@@ -238,17 +315,20 @@ class PersonaRepository:
         """Atomically publish final JSON and deterministic Markdown."""
 
         now = utc_now()
+        runtime = build_runtime_persona(persona)
         with self.database.connection() as connection:
             connection.execute(
                 """
                 UPDATE persona_specs
-                SET status = 'ready', spec_json = ?, markdown = ?, research_date = ?,
-                    error_type = NULL, updated_at = ?
+                SET status = 'ready', spec_json = ?, runtime_spec_json = ?, markdown = ?,
+                    schema_version = ?, research_date = ?, error_type = NULL, updated_at = ?
                 WHERE persona_id = ?
                 """,
                 (
                     persona.model_dump_json(),
+                    runtime.model_dump_json(),
                     markdown,
+                    persona.schema_version,
                     persona.research_date.isoformat(),
                     now,
                     persona.id,
@@ -261,6 +341,16 @@ class PersonaRepository:
                 WHERE run_id = ?
                 """,
                 (now, run_id),
+            )
+            connection.execute(
+                """
+                UPDATE persona_profiles
+                SET current_persona_id = ?, name = ?, updated_at = ?
+                WHERE profile_id = (
+                    SELECT profile_id FROM persona_specs WHERE persona_id = ?
+                )
+                """,
+                (persona.id, persona.name, now, persona.id),
             )
 
     def mark_failed(self, run_id: str, persona_id: str, error_type: str) -> None:
@@ -328,6 +418,23 @@ class PersonaRepository:
             return None
         return PersonaSpec.model_validate_json(row["spec_json"]), row["markdown"]
 
+    def load_runtime(self, persona_id: str) -> RuntimePersonaSpec | None:
+        """读取不包含蒸馏证据和旧论文事实的运行时档案。"""
+
+        with self.database.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT spec_json, runtime_spec_json FROM persona_specs
+                WHERE persona_id = ? AND status = 'ready'
+                """,
+                (persona_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        if row["runtime_spec_json"]:
+            return RuntimePersonaSpec.model_validate_json(row["runtime_spec_json"])
+        return build_runtime_persona(PersonaSpec.model_validate_json(row["spec_json"]))
+
     def update_ready(
         self,
         *,
@@ -339,19 +446,22 @@ class PersonaRepository:
 
         if persona.id != persona_id:
             raise ValueError("档案 id 不允许修改")
+        runtime = build_runtime_persona(persona)
         with self.database.connection() as connection:
             cursor = connection.execute(
                 """
                 UPDATE persona_specs
-                SET name = ?, mode = ?, spec_json = ?, markdown = ?, research_date = ?,
-                    error_type = NULL, updated_at = ?
+                SET name = ?, mode = ?, spec_json = ?, runtime_spec_json = ?, markdown = ?,
+                    schema_version = ?, research_date = ?, error_type = NULL, updated_at = ?
                 WHERE persona_id = ? AND status = 'ready'
                 """,
                 (
                     persona.name,
                     persona.mode,
                     persona.model_dump_json(),
+                    runtime.model_dump_json(),
                     markdown,
+                    persona.schema_version,
                     persona.research_date.isoformat(),
                     utc_now(),
                     persona_id,
@@ -360,42 +470,84 @@ class PersonaRepository:
             if cursor.rowcount != 1:
                 raise ValueError("只能编辑已经完成的档案")
             connection.execute(
+                """
+                UPDATE persona_profiles
+                SET name = ?, name_key = ?, mode = ?, updated_at = ?
+                WHERE profile_id = (
+                    SELECT profile_id FROM persona_specs WHERE persona_id = ?
+                )
+                """,
+                (
+                    persona.name,
+                    persona.name.strip().casefold(),
+                    persona.mode,
+                    utc_now(),
+                    persona_id,
+                ),
+            )
+            connection.execute(
                 "DELETE FROM persona_evaluations WHERE persona_id = ?",
                 (persona_id,),
             )
 
     def delete_personas(self, kb_id: str, persona_ids: set[str]) -> int:
-        """批量删除档案；运行断点、Map 结果和评估由外键级联清理。"""
+        """批量删除顶层档案及其全部版本、断点和评估。"""
 
         identifiers = sorted(persona_ids)
         if not identifiers:
             return 0
         placeholders = ",".join("?" for _ in identifiers)
         with self.database.connection() as connection:
-            cursor = connection.execute(
+            profiles = connection.execute(
                 f"""
-                DELETE FROM persona_specs
+                SELECT DISTINCT profile_id FROM persona_specs
                 WHERE kb_id = ? AND persona_id IN ({placeholders})
                 """,
                 [kb_id, *identifiers],
+            ).fetchall()
+            profile_ids = [str(row["profile_id"]) for row in profiles if row["profile_id"]]
+            if not profile_ids:
+                return 0
+            profile_placeholders = ",".join("?" for _ in profile_ids)
+            connection.execute(
+                f"DELETE FROM persona_specs WHERE profile_id IN ({profile_placeholders})",
+                profile_ids,
+            )
+            cursor = connection.execute(
+                f"DELETE FROM persona_profiles WHERE profile_id IN ({profile_placeholders})",
+                profile_ids,
             )
         return max(0, cursor.rowcount)
 
     def list_personas(self, kb_id: str) -> list[dict[str, object]]:
-        """Return compact profile metadata for the desktop table."""
+        """每个顶层档案只返回最新版本，历史版本在详情中查看。"""
 
         with self.database.connection() as connection:
             rows = connection.execute(
                 """
-                SELECT p.persona_id, p.name, p.mode, p.status, p.research_date,
-                       p.spec_json, p.updated_at,
+                WITH ranked AS (
+                    SELECT p.*,
+                           row_number() OVER (
+                               PARTITION BY p.profile_id
+                               ORDER BY p.version_number DESC, p.updated_at DESC
+                           ) AS version_rank
+                    FROM persona_specs p
+                    WHERE p.kb_id = ?
+                )
+                SELECT p.persona_id, p.profile_id, p.version_number, p.name, p.mode,
+                       p.status, p.research_date, p.spec_json, p.updated_at,
+                       (
+                           SELECT count(*) FROM persona_specs versions
+                           WHERE versions.profile_id = p.profile_id
+                       ) AS version_count,
                        (
                            SELECT e.score FROM persona_evaluations e
                            WHERE e.persona_id = p.persona_id
                              AND e.evaluation_type = 'nuwa_fidelity'
                            ORDER BY e.created_at DESC LIMIT 1
                        ) AS fidelity_score
-                FROM persona_specs p WHERE p.kb_id = ? ORDER BY p.updated_at DESC
+                FROM ranked p WHERE p.version_rank = 1
+                ORDER BY p.updated_at DESC
                 """,
                 (kb_id,),
             ).fetchall()
@@ -407,6 +559,9 @@ class PersonaRepository:
             profiles.append(
                 {
                     "persona_id": row["persona_id"],
+                    "profile_id": row["profile_id"],
+                    "version_number": row["version_number"],
+                    "version_count": row["version_count"],
                     "name": row["name"],
                     "mode": row["mode"],
                     "status": row["status"],
@@ -416,3 +571,88 @@ class PersonaRepository:
                 }
             )
         return profiles
+
+    def list_versions(self, persona_id: str) -> list[dict[str, object]]:
+        """返回与指定版本同属一个顶层档案的版本历史。"""
+
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT version.persona_id, version.version_number, version.status,
+                       version.research_date, version.source_hash, version.updated_at
+                FROM persona_specs version
+                WHERE version.profile_id = (
+                    SELECT profile_id FROM persona_specs WHERE persona_id = ?
+                )
+                ORDER BY version.version_number DESC
+                """,
+                (persona_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_stage_result(
+        self,
+        *,
+        run_id: str,
+        stage: str,
+        item_id: str,
+        input_hash: str,
+        result: BaseModel,
+    ) -> None:
+        """保存论文归并、候选登记或验证结果检查点。"""
+
+        now = utc_now()
+        with self.database.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO distillation_stage_results(
+                    run_id, stage, item_id, input_hash, result_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id, stage, item_id) DO UPDATE SET
+                    input_hash = excluded.input_hash,
+                    result_json = excluded.result_json,
+                    updated_at = excluded.updated_at
+                """,
+                (run_id, stage, item_id, input_hash, result.model_dump_json(), now, now),
+            )
+
+    def load_stage_result(
+        self,
+        *,
+        run_id: str,
+        stage: str,
+        item_id: str,
+        model: type[CheckpointModel],
+    ) -> CheckpointModel | None:
+        """读取当前运行的一个结构化阶段检查点。"""
+
+        with self.database.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT result_json FROM distillation_stage_results
+                WHERE run_id = ? AND stage = ? AND item_id = ?
+                """,
+                (run_id, stage, item_id),
+            ).fetchone()
+        return None if row is None else model.model_validate_json(row["result_json"])
+
+    def find_compatible_stage_result(
+        self,
+        *,
+        stage: str,
+        item_id: str,
+        input_hash: str,
+        model: type[CheckpointModel],
+    ) -> CheckpointModel | None:
+        """跨运行复用输入、Schema 和提示词版本完全相同的阶段结果。"""
+
+        with self.database.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT result_json FROM distillation_stage_results
+                WHERE stage = ? AND item_id = ? AND input_hash = ?
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                (stage, item_id, input_hash),
+            ).fetchone()
+        return None if row is None else model.model_validate_json(row["result_json"])

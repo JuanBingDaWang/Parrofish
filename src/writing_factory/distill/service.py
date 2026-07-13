@@ -8,6 +8,7 @@ from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import date
 
+from writing_factory.distill.academic_pipeline import AcademicDistillationEngine
 from writing_factory.distill.expression import ExpressionAnalyzer
 from writing_factory.distill.extraction import (
     PersonaMapExtractor,
@@ -23,7 +24,7 @@ from writing_factory.distill.models import (
 from writing_factory.distill.quality import run_static_quality_check
 from writing_factory.distill.serialization import render_persona_markdown
 from writing_factory.distill.sources import SourceCorpusBuilder
-from writing_factory.distill.synthesis import PersonaSynthesizer
+from writing_factory.distill.synthesis import CandidateBundleBuilder, PersonaSynthesizer
 from writing_factory.store.persona_repository import PersonaRepository
 
 logger = logging.getLogger(__name__)
@@ -43,8 +44,8 @@ def _no_cancellation() -> None:
 class DistillationService:
     """Persist each map result and publish only a fully validated PersonaSpec."""
 
-    MAP_PIPELINE_VERSION = "persona-map-v3-zh-structured-gaps"
-    REDUCE_PIPELINE_VERSION = "persona-reduce-v4-zh-global-gaps"
+    MAP_PIPELINE_VERSION = "persona-map-v4-academic-zh"
+    REDUCE_PIPELINE_VERSION = "persona-reduce-v6-downgraded-heuristics"
 
     def __init__(
         self,
@@ -56,14 +57,23 @@ class DistillationService:
         *,
         map_concurrency: int = 3,
         output_language: OutputLanguage = DEFAULT_OUTPUT_LANGUAGE,
+        academic_engine: AcademicDistillationEngine | None = None,
     ) -> None:
         self.repository = repository
         self.sources = sources
         self.extractor = extractor
         self.synthesizer = synthesizer
         self.expression = expression or ExpressionAnalyzer()
-        self.map_concurrency = max(1, min(4, map_concurrency))
+        self.map_concurrency = max(1, min(8, map_concurrency))
         self.output_language = output_language
+        self.academic_engine = academic_engine
+
+    def set_max_parallel_tasks(self, value: int) -> None:
+        """调整各独立蒸馏阶段的任务提交数；全局请求仍由客户端闸门兜底。"""
+
+        if not 1 <= value <= 8:
+            raise ValueError("SiliconFlow 最大并发数必须在 1 至 8 之间")
+        self.map_concurrency = value
 
     def distill(
         self,
@@ -72,6 +82,8 @@ class DistillationService:
         name: str,
         mode: PersonaMode,
         doc_ids: set[str] | None = None,
+        control_doc_ids: set[str] | None = None,
+        domain: str = "",
         progress: ProgressCallback = _no_progress,
         check_cancelled: CancellationCheck = _no_cancellation,
     ) -> DistillationOutcome:
@@ -82,13 +94,54 @@ class DistillationService:
             raise ValueError("Persona name cannot be empty")
         progress(2, "读取蒸馏语料")
         corpus = self.sources.build(kb_id, doc_ids=doc_ids)
+        target_source_info = tuple(
+            item.model_copy(update={"corpus_role": "target", "domain": domain.strip()})
+            for item in corpus.source_info
+        )
+        use_academic = self.academic_engine is not None and mode == "person"
+        control_corpus = None
+        if use_academic and control_doc_ids:
+            if not domain.strip():
+                raise ValueError("使用对照语料时必须填写研究领域")
+            overlap = set(doc_ids or ()) & set(control_doc_ids)
+            if overlap:
+                raise ValueError("同一文档不能同时作为目标语料和对照语料")
+            control_corpus = self.sources.build(kb_id, doc_ids=control_doc_ids)
+        control_source_info = (
+            tuple(
+                item.model_copy(update={"corpus_role": "control", "domain": domain.strip()})
+                for item in control_corpus.source_info
+            )
+            if control_corpus is not None
+            else ()
+        )
         map_input_hash = self._map_input_hash(
             label,
             mode,
             corpus.source_hash,
             self.output_language,
+            "target",
+            domain,
         )
-        input_hash = self._input_hash(label, mode, corpus.source_hash)
+        control_map_hash = (
+            self._map_input_hash(
+                "同领域对照语料",
+                mode,
+                control_corpus.source_hash,
+                self.output_language,
+                "control",
+                domain,
+            )
+            if control_corpus is not None
+            else None
+        )
+        input_hash = self._input_hash(
+            label,
+            mode,
+            corpus.source_hash,
+            control_source_hash=control_corpus.source_hash if control_corpus else "",
+            domain=domain,
+        )
         ready = self.repository.find_ready(
             name=label,
             mode=mode,
@@ -108,7 +161,9 @@ class DistillationService:
             source_hash=corpus.source_hash,
             input_hash=input_hash,
             source_doc_ids=[item.doc_id for item in corpus.source_info],
-            map_total=len(corpus.units),
+            map_total=len(corpus.units) + (len(control_corpus.units) if control_corpus else 0),
+            control_doc_ids=[item.doc_id for item in control_source_info],
+            domain=domain.strip(),
         )
         try:
             map_results = self._run_maps(
@@ -119,21 +174,68 @@ class DistillationService:
                 map_input_hash=map_input_hash,
                 progress=progress,
                 check_cancelled=check_cancelled,
+                corpus_role="target",
+                domain=domain,
+                progress_start=5,
+                progress_end=55 if control_corpus else 65,
             )
+            control_map_results: list[MapResult] = []
+            if control_corpus is not None and control_map_hash is not None:
+                control_map_results = self._run_maps(
+                    run_id=run.run_id,
+                    label="同领域对照语料",
+                    mode=mode,
+                    units=control_corpus.units,
+                    map_input_hash=control_map_hash,
+                    progress=progress,
+                    check_cancelled=check_cancelled,
+                    corpus_role="control",
+                    domain=domain,
+                    progress_start=55,
+                    progress_end=65,
+                )
             check_cancelled()
             self.repository.update_stage(run.run_id, run.persona_id, "reducing")
             texts = [segment.text for unit in corpus.units for segment in unit.segments]
             expression = self.expression.analyze(texts)
-            progress(70, "三重验证与归并")
+            academic_registry = None
+            if use_academic and self.academic_engine is not None:
+                _registry, _gaps, target_bundle = CandidateBundleBuilder().build(
+                    map_results, corpus.units
+                )
+                control_bundle = None
+                if control_corpus is not None:
+                    _control_registry, _control_gaps, control_bundle = (
+                        CandidateBundleBuilder().build(
+                            control_map_results,
+                            control_corpus.units,
+                        )
+                    )
+                academic_registry = self.academic_engine.build_registry(
+                    run_id=run.run_id,
+                    target_label=label,
+                    domain=domain.strip(),
+                    target_bundle=target_bundle,
+                    target_source_info=target_source_info,
+                    target_hash=corpus.source_hash,
+                    control_bundle=control_bundle,
+                    control_source_info=control_source_info,
+                    control_hash=control_corpus.source_hash if control_corpus else None,
+                    progress=progress,
+                    check_cancelled=check_cancelled,
+                )
+            progress(92 if use_academic else 70, "装配作者档案")
             persona = self.synthesizer.synthesize(
                 persona_id=run.persona_id,
                 name=label,
                 mode=mode,
                 map_results=map_results,
                 units=corpus.units,
-                source_info=corpus.source_info,
+                source_info=target_source_info,
                 expression=expression,
                 research_date=date.today(),
+                academic_registry=academic_registry,
+                control_source_info=control_source_info,
             )
             check_cancelled()
             self.repository.update_stage(run.run_id, run.persona_id, "validating")
@@ -170,18 +272,31 @@ class DistillationService:
         mode: PersonaMode,
         source_hash: str,
         output_language: OutputLanguage = DEFAULT_OUTPUT_LANGUAGE,
+        corpus_role: str = "target",
+        domain: str = "",
     ) -> str:
-        value = f"{cls.MAP_PIPELINE_VERSION}|{name}|{mode}|{source_hash}|{output_language}"
+        value = (
+            f"{cls.MAP_PIPELINE_VERSION}|{name}|{mode}|{source_hash}|"
+            f"{output_language}|{corpus_role}|{domain.strip()}"
+        )
         return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
-    def _input_hash(self, name: str, mode: PersonaMode, source_hash: str) -> str:
+    def _input_hash(
+        self,
+        name: str,
+        mode: PersonaMode,
+        source_hash: str,
+        *,
+        control_source_hash: str = "",
+        domain: str = "",
+    ) -> str:
         map_hash = self._map_input_hash(
             name,
             mode,
             source_hash,
             self.output_language,
         )
-        value = f"{self.REDUCE_PIPELINE_VERSION}|{map_hash}"
+        value = f"{self.REDUCE_PIPELINE_VERSION}|{map_hash}|{control_source_hash}|{domain.strip()}"
         return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
     def _run_maps(
@@ -194,6 +309,10 @@ class DistillationService:
         map_input_hash: str,
         progress: ProgressCallback,
         check_cancelled: CancellationCheck,
+        corpus_role: str = "target",
+        domain: str = "",
+        progress_start: int = 5,
+        progress_end: int = 65,
     ) -> list[MapResult]:
         results: dict[str, MapResult] = {}
         missing: list[SourceUnit] = []
@@ -214,7 +333,10 @@ class DistillationService:
 
         completed = len(results)
         if completed:
-            progress(5 + round(60 * completed / len(units)), "复用思维候选")
+            progress(
+                progress_start + round((progress_end - progress_start) * completed / len(units)),
+                "复用思维候选",
+            )
         if missing:
             completed = self._extract_maps_concurrently(
                 run_id=run_id,
@@ -227,6 +349,10 @@ class DistillationService:
                 results=results,
                 progress=progress,
                 check_cancelled=check_cancelled,
+                corpus_role=corpus_role,
+                domain=domain,
+                progress_start=progress_start,
+                progress_end=progress_end,
             )
         if completed != len(units):
             raise StructuredDistillationError("Map 结果数量与语料单元数量不一致")
@@ -245,6 +371,10 @@ class DistillationService:
         results: dict[str, MapResult],
         progress: ProgressCallback,
         check_cancelled: CancellationCheck,
+        corpus_role: str,
+        domain: str,
+        progress_start: int,
+        progress_end: int,
     ) -> int:
         executor = ThreadPoolExecutor(
             max_workers=min(self.map_concurrency, len(missing)),
@@ -258,7 +388,17 @@ class DistillationService:
                 unit = next(pending)
             except StopIteration:
                 return False
-            future = executor.submit(self.extractor.extract, label, mode, unit)
+            if corpus_role == "target" and not domain.strip():
+                future = executor.submit(self.extractor.extract, label, mode, unit)
+            else:
+                future = executor.submit(
+                    self.extractor.extract,
+                    label,
+                    mode,
+                    unit,
+                    corpus_role=corpus_role,
+                    domain=domain.strip(),
+                )
             futures[future] = unit
             return True
 
@@ -297,7 +437,7 @@ class DistillationService:
                     results[unit.unit_id] = mapped
                     completed += 1
                     progress(
-                        5 + round(60 * completed / total),
+                        progress_start + round((progress_end - progress_start) * completed / total),
                         f"并发提取思维候选（{completed}/{total}）",
                     )
                 if first_error is None:

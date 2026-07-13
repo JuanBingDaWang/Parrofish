@@ -41,10 +41,13 @@ def test_initializes_expected_stage_zero_tables(tmp_path: Path) -> None:
         "persona_specs",
         "distillation_runs",
         "distillation_map_results",
+        "persona_profiles",
+        "distillation_stage_results",
+        "app_settings",
     }.issubset(tables)
     assert journal_mode.lower() == "wal"
     assert {"status", "last_job_id"}.issubset(kb_document_columns)
-    assert migration_versions == [1, 2, 3]
+    assert migration_versions == [1, 2, 3, 4]
 
 
 def test_cache_round_trip_and_api_record_have_no_payload(tmp_path: Path) -> None:

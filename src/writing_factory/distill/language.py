@@ -5,7 +5,18 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Literal
 
-from writing_factory.distill.models import MapResult, PersonaSpec, ReduceResult
+from writing_factory.distill.academic import (
+    CandidateClusterResult,
+    ExclusivityBatchResult,
+    PaperProfile,
+    ValidationBatchResult,
+)
+from writing_factory.distill.models import (
+    AcademicSupplementResult,
+    MapResult,
+    PersonaSpec,
+    ReduceResult,
+)
 
 OutputLanguage = Literal["zh-CN"]
 DEFAULT_OUTPUT_LANGUAGE: OutputLanguage = "zh-CN"
@@ -50,7 +61,7 @@ def validate_reduce_language(result: ReduceResult, language: OutputLanguage) -> 
         return
     primary: list[str] = []
     supporting: list[str] = []
-    for model in result.mental_models:
+    for model in [*result.mental_models, *result.academic_conventions]:
         primary.extend(
             (
                 model.name,
@@ -78,6 +89,24 @@ def validate_reduce_language(result: ReduceResult, language: OutputLanguage) -> 
     _validate_chinese(primary, supporting, context="Reduce")
 
 
+def validate_academic_supplement_language(result: AcademicSupplementResult) -> None:
+    """检查学术 v2 短 Reduce 的全部可读字段。"""
+
+    primary: list[str] = []
+    supporting: list[str] = []
+    for heuristic in result.decision_heuristics:
+        primary.extend((heuristic.rule, heuristic.trigger, heuristic.example))
+    for tension in result.core_tensions:
+        primary.extend((tension.side_a, tension.side_b, tension.interpretation))
+    for gap in result.information_gaps:
+        primary.extend((gap.dimension, gap.description, gap.unresolved_reason))
+    supporting.extend(result.style_rules)
+    supporting.extend(result.values)
+    supporting.extend(result.anti_patterns)
+    supporting.extend(result.declared_limits)
+    _validate_chinese(primary, supporting, context="学术档案补充")
+
+
 def validate_persona_language(spec: PersonaSpec) -> None:
     """发布前再次检查 PersonaSpec 的全部主要可读字段。"""
 
@@ -85,7 +114,7 @@ def validate_persona_language(spec: PersonaSpec) -> None:
         return
     primary: list[str] = []
     supporting: list[str] = []
-    for model in spec.mental_models:
+    for model in [*spec.mental_models, *spec.academic_conventions]:
         primary.extend((model.name, model.description, model.applicability, model.limits))
         for evidence in model.cross_domain_evidence:
             primary.extend((evidence.domain, evidence.summary))
@@ -100,6 +129,26 @@ def validate_persona_language(spec: PersonaSpec) -> None:
     supporting.extend(spec.anti_patterns)
     supporting.extend(spec.declared_limits)
     _validate_chinese(primary, supporting, context="PersonaSpec")
+
+
+def validate_academic_language(result: object) -> None:
+    """检查论文归并、聚类和中性验证新增阶段的中文可读字段。"""
+
+    primary: list[str] = []
+    supporting: list[str] = []
+    if isinstance(result, PaperProfile):
+        for item in result.candidates:
+            primary.extend((item.name, item.description, item.applicability, item.limits))
+            supporting.append(item.research_context)
+    elif isinstance(result, CandidateClusterResult):
+        for item in result.candidates:
+            primary.extend((item.name, item.description, item.applicability, item.limits))
+            supporting.append(item.attribution_rationale)
+    elif isinstance(result, (ValidationBatchResult, ExclusivityBatchResult)):
+        primary.extend(item.rationale for item in result.assessments)
+    else:
+        return
+    _validate_chinese(primary, supporting, context="学术蒸馏中间结果")
 
 
 def _validate_chinese(

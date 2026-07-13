@@ -178,6 +178,95 @@ MIGRATIONS: tuple[str, ...] = (
         created_at TEXT NOT NULL
     );
     """,
+    """
+    CREATE TABLE IF NOT EXISTS persona_profiles (
+        profile_id TEXT PRIMARY KEY,
+        kb_id TEXT NOT NULL REFERENCES knowledge_bases(kb_id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        name_key TEXT NOT NULL,
+        mode TEXT NOT NULL CHECK (mode IN ('person', 'topic')),
+        current_persona_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (kb_id, name_key, mode)
+    );
+
+    ALTER TABLE persona_specs ADD COLUMN profile_id TEXT;
+    ALTER TABLE persona_specs ADD COLUMN version_number INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE persona_specs ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE persona_specs ADD COLUMN runtime_spec_json TEXT;
+
+    ALTER TABLE distillation_runs ADD COLUMN target_doc_ids_json TEXT NOT NULL DEFAULT '[]';
+    ALTER TABLE distillation_runs ADD COLUMN control_doc_ids_json TEXT NOT NULL DEFAULT '[]';
+    ALTER TABLE distillation_runs ADD COLUMN domain TEXT NOT NULL DEFAULT '';
+
+    CREATE TABLE IF NOT EXISTS distillation_stage_results (
+        run_id TEXT NOT NULL REFERENCES distillation_runs(run_id) ON DELETE CASCADE,
+        stage TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        input_hash TEXT NOT NULL,
+        result_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (run_id, stage, item_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_distillation_stage_compatible
+        ON distillation_stage_results(stage, input_hash, item_id, updated_at);
+
+    CREATE TABLE IF NOT EXISTS app_settings (
+        setting_key TEXT PRIMARY KEY,
+        value_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+
+    INSERT OR IGNORE INTO persona_profiles(
+        profile_id, kb_id, name, name_key, mode, current_persona_id, created_at, updated_at
+    )
+    SELECT
+        'profile_' || lower(hex(randomblob(16))),
+        kb_id,
+        name,
+        lower(trim(name)),
+        mode,
+        NULL,
+        min(created_at),
+        max(updated_at)
+    FROM persona_specs
+    GROUP BY kb_id, lower(trim(name)), mode;
+
+    UPDATE persona_specs
+    SET profile_id = (
+        SELECT profile_id FROM persona_profiles f
+        WHERE f.kb_id = persona_specs.kb_id
+          AND f.name_key = lower(trim(persona_specs.name))
+          AND f.mode = persona_specs.mode
+    )
+    WHERE profile_id IS NULL;
+
+    UPDATE persona_specs AS target
+    SET version_number = (
+        SELECT count(*) FROM persona_specs AS earlier
+        WHERE earlier.profile_id = target.profile_id
+          AND (
+              earlier.created_at < target.created_at
+              OR (
+                  earlier.created_at = target.created_at
+                  AND earlier.persona_id <= target.persona_id
+              )
+          )
+    );
+
+    UPDATE persona_profiles
+    SET current_persona_id = (
+        SELECT persona_id FROM persona_specs p
+        WHERE p.profile_id = persona_profiles.profile_id AND p.status = 'ready'
+        ORDER BY p.version_number DESC LIMIT 1
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_persona_specs_profile_version
+        ON persona_specs(profile_id, version_number DESC);
+    """,
 )
 
 

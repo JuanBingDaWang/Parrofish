@@ -50,8 +50,8 @@ def _mental_model(name: str) -> MentalModel:
     )
 
 
-def test_mental_model_requires_two_domains_and_all_validations() -> None:
-    with pytest.raises(ValidationError, match="at least two domains"):
+def test_mental_model_requires_two_documents_and_all_validations() -> None:
+    with pytest.raises(ValidationError, match="at least two documents"):
         _mental_model("model").model_copy(
             update={
                 "cross_domain_evidence": [

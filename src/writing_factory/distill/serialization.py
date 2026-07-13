@@ -1,4 +1,4 @@
-"""Deterministic PersonaSpec Markdown rendering for prompt consumption."""
+"""完整审计档案的确定性 Markdown 渲染；生成阶段使用安全运行时投影。"""
 
 from __future__ import annotations
 
@@ -25,10 +25,17 @@ def render_persona_markdown(spec: PersonaSpec) -> str:
         lines.append("- 使用下列认知操作和表达约束，但不伪造本人经历或新立场。")
     lines.extend(["", "## 核心心智模型", ""])
     for index, model in enumerate(spec.mental_models, start=1):
+        scope = {
+            "author_distinctive": "作者个性化",
+            "field_conventional": "领域通用",
+            "general_academic": "通用学术规范",
+            "unverified": "排他性未验证",
+        }[model.specificity]
         lines.extend(
             [
                 f"### {index}. {model.name}",
                 "",
+                f"**性质**：{scope}",
                 model.description,
                 "",
                 f"**应用**：{model.applicability}",
@@ -42,6 +49,26 @@ def render_persona_markdown(spec: PersonaSpec) -> str:
                 f"- `{evidence.chunk_id}` · {evidence.domain}{locator}：{evidence.summary}"
             )
         lines.append("")
+    if spec.academic_conventions:
+        lines.extend(["## 通用学术惯例", ""])
+        for model in spec.academic_conventions:
+            lines.extend(
+                [
+                    f"### {model.name}",
+                    "",
+                    model.description,
+                    "",
+                    f"**应用**：{model.applicability}",
+                    f"**局限**：{model.limits}",
+                    "**证据锚点**：",
+                ]
+            )
+            for evidence in model.cross_domain_evidence:
+                locator = _locator(evidence.page_start, evidence.page_end)
+                lines.append(
+                    f"- `{evidence.chunk_id}` · {evidence.domain}{locator}：{evidence.summary}"
+                )
+            lines.append("")
     lines.extend(["## 决策启发式", ""])
     for index, heuristic in enumerate(spec.decision_heuristics, start=1):
         lines.extend(
@@ -88,7 +115,8 @@ def render_persona_markdown(spec: PersonaSpec) -> str:
         )
     lines.extend(["", "## 来源范围", ""])
     for source in spec.source_info:
-        lines.append(f"- `{source.doc_id}` · {source.title}（{source.filename}）")
+        role = "目标" if source.corpus_role == "target" else "对照"
+        lines.append(f"- [{role}] `{source.doc_id}` · {source.title}（{source.filename}）")
     lines.extend(["", f"调研日期：{spec.research_date.isoformat()}", ""])
     return "\n".join(lines)
 
