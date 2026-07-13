@@ -147,6 +147,25 @@ class PersonaRepository:
             ).fetchone()
         return None if row is None else MapResult.model_validate_json(row["result_json"])
 
+    def find_compatible_map_result(
+        self,
+        *,
+        input_hash: str,
+        unit_id: str,
+    ) -> MapResult | None:
+        """复用其他运行中语言、版本和语料单元完全一致的 Map 结果。"""
+
+        with self.database.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT result_json FROM distillation_map_results
+                WHERE input_hash = ? AND unit_id = ?
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                (input_hash, unit_id),
+            ).fetchone()
+        return None if row is None else MapResult.model_validate_json(row["result_json"])
+
     def save_map_result(
         self,
         *,

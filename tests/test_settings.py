@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from writing_factory.config import load_settings
 
@@ -41,3 +42,24 @@ def test_requires_both_credentials(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="MINERU_API_TOKEN"):
         load_settings(tmp_path, environ={})
+
+
+def test_distillation_defaults_to_simplified_chinese_and_three_map_workers(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "key_test.txt").write_text("one\ntwo\n", encoding="utf-8")
+
+    settings = load_settings(tmp_path, environ={})
+
+    assert settings.distillation_output_language == "zh-CN"
+    assert settings.distillation_map_concurrency == 3
+
+
+def test_distillation_rejects_more_than_four_map_workers(tmp_path: Path) -> None:
+    (tmp_path / "key_test.txt").write_text("one\ntwo\n", encoding="utf-8")
+
+    with pytest.raises(ValidationError, match="less than or equal to 4"):
+        load_settings(
+            tmp_path,
+            environ={"DISTILLATION_MAP_CONCURRENCY": "5"},
+        )

@@ -92,8 +92,16 @@ def build_application(settings: Settings | None = None) -> ApplicationContext:
         distillation=DistillationService(
             persona_repository,
             SourceCorpusBuilder(repository),
-            PersonaMapExtractor(siliconflow),
-            PersonaSynthesizer(siliconflow),
+            PersonaMapExtractor(
+                siliconflow,
+                output_language=resolved.distillation_output_language,
+            ),
+            PersonaSynthesizer(
+                siliconflow,
+                output_language=resolved.distillation_output_language,
+            ),
+            map_concurrency=resolved.distillation_map_concurrency,
+            output_language=resolved.distillation_output_language,
         ),
         fidelity=FidelityService(
             persona_repository,

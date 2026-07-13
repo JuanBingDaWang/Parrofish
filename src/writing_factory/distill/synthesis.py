@@ -10,15 +10,23 @@ from pydantic import ValidationError
 
 from writing_factory.distill.expression import ExpressionStatistics
 from writing_factory.distill.extraction import StructuredDistillationError
+from writing_factory.distill.language import (
+    DEFAULT_OUTPUT_LANGUAGE,
+    OutputLanguage,
+    OutputLanguageError,
+    validate_reduce_language,
+)
 from writing_factory.distill.models import (
     CoreTension,
     DecisionHeuristic,
     ExpressionDNA,
+    InformationGap,
     MapResult,
     MentalModel,
     PersonaEvidence,
     PersonaMode,
     PersonaSpec,
+    ReduceInformationGap,
     ReduceResult,
     SourceInfo,
     SourceUnit,
@@ -34,13 +42,19 @@ class CandidateBundleBuilder:
 
     def build(
         self, map_results: list[MapResult], units: tuple[SourceUnit, ...]
-    ) -> tuple[dict[str, PersonaEvidence], dict[str, object]]:
+    ) -> tuple[
+        dict[str, PersonaEvidence],
+        dict[str, dict[str, object]],
+        dict[str, object],
+    ]:
         """Return a final evidence registry and compact reducer candidate bundle."""
 
         segment_by_chunk = {
             segment.chunk_id: segment for unit in units for segment in unit.segments
         }
+        unit_by_id = {unit.unit_id: unit for unit in units}
         registry: dict[str, PersonaEvidence] = {}
+        gap_registry: dict[str, dict[str, object]] = {}
 
         def register(item) -> str:
             segment = segment_by_chunk[item.chunk_id]
@@ -70,7 +84,6 @@ class CandidateBundleBuilder:
         values: list[str] = []
         anti_patterns: list[str] = []
         style_observations: list[str] = []
-        gaps: list[str] = []
         for result in map_results:
             for candidate in result.mental_candidates:
                 mental_candidates.append(
@@ -103,7 +116,21 @@ class CandidateBundleBuilder:
             values.extend(result.value_signals)
             anti_patterns.extend(result.anti_pattern_signals)
             style_observations.extend(result.style_observations)
-            gaps.extend(result.insufficient_dimensions)
+            source_doc_ids = sorted(
+                {segment.doc_id for segment in unit_by_id[result.unit_id].segments}
+            )
+            for gap in result.information_gaps:
+                digest = hashlib.sha256(
+                    (f"{result.unit_id}|{gap.dimension}|{gap.description}|{gap.reason}").encode()
+                ).hexdigest()[:24]
+                gap_id = f"gap_{digest}"
+                record: dict[str, object] = {
+                    "gap_id": gap_id,
+                    "unit_id": result.unit_id,
+                    "source_doc_ids": source_doc_ids,
+                    **gap.model_dump(mode="json"),
+                }
+                gap_registry.setdefault(gap_id, record)
         bundle: dict[str, object] = {
             "evidence_registry": [item.model_dump(mode="json") for item in registry.values()],
             "mental_candidates": mental_candidates,
@@ -112,9 +139,9 @@ class CandidateBundleBuilder:
             "value_signals": self._unique(values),
             "anti_pattern_signals": self._unique(anti_patterns),
             "style_observations": self._unique(style_observations),
-            "information_gaps": self._unique(gaps),
+            "local_information_gaps": list(gap_registry.values()),
         }
-        return registry, bundle
+        return registry, gap_registry, bundle
 
     @staticmethod
     def _unique(values: list[str]) -> list[str]:
@@ -130,8 +157,15 @@ class PersonaSynthesizer:
         "公开表达不等于作者的真实想法",
     )
 
-    def __init__(self, siliconflow: SiliconFlowClient, *, max_attempts: int = 2) -> None:
+    def __init__(
+        self,
+        siliconflow: SiliconFlowClient,
+        *,
+        output_language: OutputLanguage = DEFAULT_OUTPUT_LANGUAGE,
+        max_attempts: int = 4,
+    ) -> None:
         self.siliconflow = siliconflow
+        self.output_language = output_language
         self.max_attempts = max_attempts
 
     def synthesize(
@@ -148,14 +182,16 @@ class PersonaSynthesizer:
     ) -> PersonaSpec:
         """Run reduce with one repair attempt and build the authoritative spec."""
 
-        registry, bundle = CandidateBundleBuilder().build(map_results, units)
+        registry, gap_registry, bundle = CandidateBundleBuilder().build(map_results, units)
         messages = reduce_messages(
             name=name,
             mode=mode,
             candidate_bundle=bundle,
             expression=expression,
+            source_info=source_info,
+            output_language=self.output_language,
         )
-        last_error = "unknown validation error"
+        last_error = "未知校验错误"
         for attempt in range(self.max_attempts):
             active_messages = messages
             if attempt:
@@ -164,8 +200,8 @@ class PersonaSynthesizer:
                     {
                         "role": "user",
                         "content": (
-                            "The previous proposal violated the contract. Return a corrected full "
-                            f"JSON object. Validation error: {last_error}"
+                            "上一次提案违反了契约。请返回修正后的完整 JSON 对象，不要解释。"
+                            f"校验错误：{last_error}"
                         ),
                     },
                 ]
@@ -178,18 +214,20 @@ class PersonaSynthesizer:
                 seed=17,
                 response_format="json_object",
                 use_cache=True,
-                request_timeout_seconds=600.0,
-                request_attempts=1,
+                request_timeout_seconds=1200.0,
+                request_attempts=2,
                 stream=True,
             )
             try:
                 reduced = ReduceResult.model_validate(json.loads(result.content))
+                validate_reduce_language(reduced, self.output_language)
                 return self._assemble(
                     persona_id=persona_id,
                     name=name,
                     mode=mode,
                     reduced=reduced,
                     registry=registry,
+                    gap_registry=gap_registry,
                     source_info=source_info,
                     expression=expression,
                     research_date=research_date,
@@ -198,10 +236,11 @@ class PersonaSynthesizer:
                 json.JSONDecodeError,
                 ValidationError,
                 StructuredDistillationError,
+                OutputLanguageError,
             ) as exc:
-                last_error = str(exc)[:500]
+                last_error = str(exc)[:3000]
         raise StructuredDistillationError(
-            f"Persona reduction failed after {self.max_attempts} attempts: {last_error}"
+            f"Persona 归并在 {self.max_attempts} 次尝试后失败：{last_error}"
         )
 
     def _assemble(
@@ -212,11 +251,17 @@ class PersonaSynthesizer:
         mode: PersonaMode,
         reduced: ReduceResult,
         registry: dict[str, PersonaEvidence],
+        gap_registry: dict[str, dict[str, object]],
         source_info: tuple[SourceInfo, ...],
         expression: ExpressionStatistics,
         research_date: date,
     ) -> PersonaSpec:
-        self._validate_all_references(reduced, registry)
+        self._validate_all_references(
+            reduced,
+            registry,
+            gap_registry,
+            source_info,
+        )
         mental_models: list[MentalModel] = []
         for item in reduced.mental_models:
             evidence = self._resolve(item.evidence_ids, registry)
@@ -257,7 +302,10 @@ class PersonaSynthesizer:
             )
             for item in reduced.core_tensions
         ]
-        limits = list(dict.fromkeys([*reduced.declared_limits, *self.REQUIRED_LIMITS]))
+        information_gaps = [
+            self._assemble_gap(item, gap_registry) for item in reduced.information_gaps
+        ]
+        limits = self._unique_readable_text([*reduced.declared_limits, *self.REQUIRED_LIMITS])
         style_tags = reduced.style_tags if mode == "person" else StyleTags()
         style_rules = list(reduced.style_rules)
         taboo_words = reduced.taboo_words
@@ -270,6 +318,7 @@ class PersonaSynthesizer:
             id=persona_id,
             name=name,
             mode=mode,
+            output_language=self.output_language,
             mental_models=mental_models,
             decision_heuristics=heuristics,
             expression_dna=ExpressionDNA(
@@ -287,7 +336,7 @@ class PersonaSynthesizer:
             source_info=list(source_info),
             research_date=research_date,
             declared_limits=limits,
-            information_gaps=reduced.information_gaps,
+            information_gaps=information_gaps,
         )
 
     @staticmethod
@@ -297,8 +346,25 @@ class PersonaSynthesizer:
         return list(dict.fromkeys(registry[identifier] for identifier in identifiers))
 
     @staticmethod
+    def _unique_readable_text(values: list[str]) -> list[str]:
+        """按忽略空白和句末标点的形式去重，同时保留首个原始表述。"""
+
+        unique: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            normalized = value.strip()
+            key = normalized.rstrip("。.!！?？").casefold()
+            if key and key not in seen:
+                seen.add(key)
+                unique.append(normalized)
+        return unique
+
+    @staticmethod
     def _validate_all_references(
-        reduced: ReduceResult, registry: dict[str, PersonaEvidence]
+        reduced: ReduceResult,
+        registry: dict[str, PersonaEvidence],
+        gap_registry: dict[str, dict[str, object]],
+        source_info: tuple[SourceInfo, ...],
     ) -> None:
         identifiers: list[str] = []
         for item in reduced.mental_models:
@@ -310,11 +376,59 @@ class PersonaSynthesizer:
         for divergence in reduced.school_divergences:
             for position in divergence.positions:
                 identifiers.extend(position.evidence_ids)
+        ungrounded_markers: list[str] = []
         for marker in [*reduced.taboo_words, *reduced.tics]:
             identifiers.extend(marker.evidence_ids)
             if not marker.evidence_ids and marker.confidence != "inferred":
-                raise StructuredDistillationError(
-                    "Lexical markers without evidence must be marked inferred"
-                )
-        if set(identifiers) - registry.keys():
-            raise StructuredDistillationError("Reducer cited unknown evidence_id values")
+                ungrounded_markers.append(marker.text)
+        if ungrounded_markers:
+            marker_values = "、".join(ungrounded_markers)
+            raise StructuredDistillationError(
+                f"以下词汇标记没有 evidence_ids：{marker_values}。"
+                "没有证据的词汇标记必须把 confidence 设为 inferred，"
+                "否则必须逐字复制有效 evidence_id"
+            )
+        unknown_evidence_ids = set(identifiers) - registry.keys()
+        if unknown_evidence_ids:
+            unknown_values = ", ".join(sorted(unknown_evidence_ids))
+            raise StructuredDistillationError(
+                f"归并结果引用了未知 evidence_id：{unknown_values}。"
+                "只能逐字复制候选包 evidence_registry 中已有的 evidence_id"
+            )
+        gap_ids = {gap_id for gap in reduced.information_gaps for gap_id in gap.supporting_gap_ids}
+        unknown_gap_ids = gap_ids - gap_registry.keys()
+        if unknown_gap_ids:
+            unknown_values = ", ".join(sorted(unknown_gap_ids))
+            allowed_values = ", ".join(sorted(gap_registry))
+            raise StructuredDistillationError(
+                f"归并结果引用了未知 gap_id：{unknown_values}。"
+                f"只能从以下合法值中逐字复制：{allowed_values}"
+            )
+        if any(gap.reviewed_document_count != len(source_info) for gap in reduced.information_gaps):
+            raise StructuredDistillationError("信息不足没有基于完整语料清单重新判定")
+
+    @staticmethod
+    def _assemble_gap(
+        item: ReduceInformationGap,
+        gap_registry: dict[str, dict[str, object]],
+    ) -> InformationGap:
+        source_doc_ids = sorted(
+            {
+                str(doc_id)
+                for gap_id in item.supporting_gap_ids
+                for doc_id in gap_registry[gap_id]["source_doc_ids"]
+            }
+        )
+        digest = hashlib.sha256(
+            "|".join(sorted(item.supporting_gap_ids)).encode("utf-8")
+        ).hexdigest()[:24]
+        return InformationGap(
+            gap_id=f"corpus_gap_{digest}",
+            dimension=item.dimension,
+            description=item.description,
+            supporting_gap_ids=item.supporting_gap_ids,
+            source_doc_ids=source_doc_ids,
+            reviewed_document_count=item.reviewed_document_count,
+            unresolved_reason=item.unresolved_reason,
+            confidence=item.confidence,
+        )

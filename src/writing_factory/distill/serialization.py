@@ -82,7 +82,10 @@ def render_persona_markdown(spec: PersonaSpec) -> str:
     lines.extend(f"- {item}" for item in spec.declared_limits)
     if spec.information_gaps:
         lines.extend(["", "## 信息不足", ""])
-        lines.extend(f"- {item}" for item in spec.information_gaps)
+        lines.extend(
+            f"- **{item.dimension}**：{item.description}（{item.unresolved_reason}）"
+            for item in spec.information_gaps
+        )
     lines.extend(["", "## 来源范围", ""])
     for source in spec.source_info:
         lines.append(f"- `{source.doc_id}` · {source.title}（{source.filename}）")

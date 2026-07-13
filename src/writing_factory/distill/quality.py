@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from writing_factory.distill.language import (
+    OutputLanguageError,
+    validate_persona_language,
+)
 from writing_factory.distill.models import PersonaSpec
 
 
@@ -36,6 +40,11 @@ def run_static_quality_check(spec: PersonaSpec) -> StaticQualityReport:
     for divergence in spec.school_divergences:
         for position in divergence.positions:
             referenced_ids.update(position.evidence_ids)
+    try:
+        validate_persona_language(spec)
+        output_language = True
+    except OutputLanguageError:
+        output_language = False
     checks = {
         "mental_model_count": 3 <= len(spec.mental_models) <= 7,
         "triple_validation": all(
@@ -49,6 +58,7 @@ def run_static_quality_check(spec: PersonaSpec) -> StaticQualityReport:
         "honest_boundaries": len(spec.declared_limits) >= 3,
         "source_transparency": bool(spec.source_info),
         "topic_divergence": spec.mode != "topic" or bool(spec.school_divergences),
+        "output_language": output_language,
     }
     warnings: list[str] = []
     if len(spec.core_tensions) < 2:
@@ -59,5 +69,8 @@ def run_static_quality_check(spec: PersonaSpec) -> StaticQualityReport:
         warnings.append("人物模式来源文档少于 2 份，跨文档稳定性有限")
     if not spec.expression_dna.style_rules:
         warnings.append("表达风格规则为空，后续 Voice Check 风险较高")
-    warnings.extend(f"信息不足：{gap}" for gap in spec.information_gaps)
+    warnings.extend(
+        f"信息不足（{gap.dimension}）：{gap.description}；{gap.unresolved_reason}"
+        for gap in spec.information_gaps
+    )
     return StaticQualityReport(checks=checks, warnings=warnings)
