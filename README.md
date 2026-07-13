@@ -1,6 +1,6 @@
 # 写作工厂 2.0
 
-面向人文社科论文写作的本地桌面应用。当前完成阶段 0–2：项目骨架、统一外部服务客户端、SQLite 状态与调用记录、非阻塞 PyQt6 外壳、可追溯的双索引知识库入库链，以及人物 / 主题两模式的 PersonaSpec 蒸馏链。
+面向人文社科论文写作的本地桌面应用。当前完成阶段 0–3：项目骨架、统一外部服务客户端、SQLite 状态与调用记录、非阻塞 PyQt6 外壳、可追溯的双索引知识库入库链、人物 / 主题两模式的 PersonaSpec 蒸馏链，以及完整的混合检索层。
 
 ## 开发环境
 
@@ -30,6 +30,8 @@ uv run writing-factory
 
 运行数据位于被 Git 忽略的 `data/`：SQLite 保存规范文本、精确字符区间、蒸馏断点和 PersonaSpec，LanceDB 保存 bge-m3 向量，BM25 在启动或语料变化后通过 SQLite 文本和 jieba 分词确定性重建。长推理调用通过统一客户端读取 SSE 流，并在每个 Map 单元完成后立即提交断点。
 
+知识库页底部提供非阻塞的检索测试面板。阶段 3 默认并发执行查询改写与 HyDE，将原查询、去重后的子查询和 HyDE 文本合并成一次 embedding 批请求；随后对 bge-m3 与 BM25/jieba 的多路结果累计 RRF，扩展父级上下文，再用 bge-reranker-v2-m3 重排。元数据过滤在 SQLite 先解析成统一的允许范围，同时约束稠密与稀疏检索。返回父块时始终保留精确的 `matched_child_ids`，供后续事实核对和引用拼装回到原始小块。知识库内容变化会改变检索缓存指纹，不会复用旧结果。查询改写与 HyDE 可在设置页分别关闭，所有 SiliconFlow 调用仍受同一个全局并发数约束。
+
 ## 测试
 
 ```powershell
@@ -51,3 +53,14 @@ $env:LIVE_INGEST_FILE="C:\path\paper.pdf"
 $env:LIVE_INGEST_QUERY="文档中的关键词"
 uv run pytest tests/integration/test_stage1_live.py
 ```
+
+阶段 3 的真实语料回归只调用 SiliconFlow，不调用 MinerU。查询必填，预期文件名可选：
+
+```powershell
+$env:RUN_LIVE_RETRIEVAL_TESTS="1"
+$env:LIVE_RETRIEVAL_QUERY="你的检索问题"
+$env:LIVE_RETRIEVAL_EXPECTED_FILENAME="应命中的文件名片段"
+uv run pytest tests/integration/test_stage3_live.py
+```
+
+上述集成测试默认跳过，因为它们需要本地语料、外部服务或付费额度；普通 `pytest` 始终运行全部离线测试。

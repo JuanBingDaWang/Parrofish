@@ -67,18 +67,35 @@ class LanceVectorIndex:
         self,
         query_vector: Sequence[float],
         *,
-        allowed_doc_ids: set[str],
+        allowed_doc_ids: set[str] | None = None,
+        allowed_chunk_ids: set[str] | None = None,
         limit: int,
     ) -> list[SearchHit]:
-        """Search only documents SQLite has published as ready for this KB."""
+        """Search only the published document/chunk scope resolved by SQLite."""
 
         table = self._open_table()
-        if table is None or not allowed_doc_ids or limit <= 0:
+        if (
+            table is None
+            or limit <= 0
+            or allowed_doc_ids == set()
+            or allowed_chunk_ids == set()
+            or (allowed_doc_ids is None and allowed_chunk_ids is None)
+        ):
             return []
-        allowed = ",".join(f"'{self._sql_string(doc_id)}'" for doc_id in sorted(allowed_doc_ids))
+        predicates: list[str] = []
+        if allowed_doc_ids is not None:
+            allowed = ",".join(
+                f"'{self._sql_string(doc_id)}'" for doc_id in sorted(allowed_doc_ids)
+            )
+            predicates.append(f"doc_id IN ({allowed})")
+        if allowed_chunk_ids is not None:
+            allowed = ",".join(
+                f"'{self._sql_string(chunk_id)}'" for chunk_id in sorted(allowed_chunk_ids)
+            )
+            predicates.append(f"chunk_id IN ({allowed})")
         rows = (
             table.search(list(query_vector), vector_column_name="vector")
-            .where(f"doc_id IN ({allowed})", prefilter=True)
+            .where(" AND ".join(predicates), prefilter=True)
             .limit(limit)
             .to_list()
         )

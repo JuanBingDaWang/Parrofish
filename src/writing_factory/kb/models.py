@@ -101,6 +101,19 @@ class ChunkedDocument(BaseModel):
     chunks: list[Chunk]
 
 
+class MetadataFilter(BaseModel):
+    """Optional document-scoped constraints applied before retrieval."""
+
+    model_config = ConfigDict(frozen=True)
+
+    doc_ids: set[str] | None = None
+    authors: set[str] | None = None
+    years: set[int] | None = None
+    formats: set[str] | None = None
+    section_headings: set[str] | None = None
+    chunk_kinds: set[Literal["parent", "child"]] | None = None
+
+
 class SearchHit(BaseModel):
     """One traceable result from a dense or sparse index."""
 
@@ -116,6 +129,55 @@ class SearchHit(BaseModel):
     page_end: int | None = None
     section_heading: str | None = None
     parent_id: str | None = None
+
+
+class FusedHit(BaseModel):
+    """A retrieval result after hybrid fusion, optional parent expansion and rerank."""
+
+    model_config = ConfigDict(frozen=True)
+
+    chunk_id: str
+    doc_id: str
+    text: str
+    source: Literal["dense", "bm25", "hybrid"]
+    dense_rank: int | None = None
+    sparse_rank: int | None = None
+    rrf_score: float = 0.0
+    rerank_score: float | None = None
+    final_rank: int
+    page_start: int | None = None
+    page_end: int | None = None
+    section_heading: str | None = None
+    parent_id: str | None = None
+    expanded_from_child: bool = False
+    matched_child_ids: tuple[str, ...] = ()
+
+
+class RetrievalRequest(BaseModel):
+    """A single hybrid retrieval call with all stage-3 options."""
+
+    model_config = ConfigDict(frozen=True)
+
+    kb_id: str = Field(min_length=1)
+    query: str
+    top_k: int = Field(default=8, ge=1, le=50)
+    filters: MetadataFilter | None = None
+    use_rewrite: bool = True
+    use_hyde: bool = True
+    use_rerank: bool = True
+    parent_expand: bool = True
+    dense_limit: int = Field(default=40, ge=1, le=100)
+    sparse_limit: int = Field(default=40, ge=1, le=100)
+
+
+class RetrievalResult(BaseModel):
+    """The full output of one hybrid retrieval, including the queries used."""
+
+    model_config = ConfigDict(frozen=True)
+
+    query: str
+    expanded_queries: tuple[str, ...] = ()
+    hits: tuple[FusedHit, ...] = ()
 
 
 class IngestResult(BaseModel):

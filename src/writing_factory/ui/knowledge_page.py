@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from writing_factory.ui.retrieval_panel import RetrievalPanel
 from writing_factory.ui.workers import (
     BackgroundTaskManager,
     TaskCancelled,
@@ -54,6 +55,8 @@ class KnowledgeBasePage(QWidget):
         ingest_document: Callable[[Path, TaskContext], Any] | None,
         list_documents: Callable[[], list[dict[str, object]]],
         delete_documents: Callable[[set[str], TaskContext], Any] | None,
+        retrieve: Callable[..., Any] | None,
+        get_retrieval_option: Callable[[str, bool], bool] | None,
         show_message: Callable[[str, int], None],
     ) -> None:
         super().__init__()
@@ -63,6 +66,17 @@ class KnowledgeBasePage(QWidget):
         self._delete_documents = delete_documents
         self._show_message = show_message
         self._ingest_task_id: str | None = None
+        self.retrieval_panel = RetrievalPanel(
+            tasks,
+            retrieve=retrieve,
+            get_option=get_retrieval_option,
+            show_message=show_message,
+        )
+        # Preserve concise accessors used by keyboard workflows and UI automation.
+        self.query_input = self.retrieval_panel.query_input
+        self.retrieve_button = self.retrieval_panel.retrieve_button
+        self.retrieve_progress = self.retrieval_panel.progress
+        self.retrieval_table = self.retrieval_panel.result_table
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -114,6 +128,8 @@ class KnowledgeBasePage(QWidget):
         for column in (2, 3, 4):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(self.document_table, 1)
+
+        layout.addWidget(self.retrieval_panel)
         self.refresh_documents()
 
     def start_deletion(self) -> None:
@@ -279,6 +295,12 @@ class KnowledgeBasePage(QWidget):
         """Reload the table from SQLite after every terminal task state."""
 
         documents = self._list_documents()
+        self.retrieval_panel.set_document_names(
+            {
+                str(document.get("doc_id", "")): str(document.get("filename", ""))
+                for document in documents
+            }
+        )
         self.document_table.blockSignals(True)
         self.document_table.setRowCount(len(documents))
         for row, document in enumerate(documents):
@@ -323,3 +345,8 @@ class KnowledgeBasePage(QWidget):
             "indexing": "索引中",
             "failed": "失败",
         }.get(status, status)
+
+    def start_retrieval(self) -> None:
+        """Forward the page action to the dedicated retrieval component."""
+
+        self.retrieval_panel.start_retrieval()

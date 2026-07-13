@@ -16,7 +16,11 @@ from writing_factory.kb.chunking import StructureChunker
 from writing_factory.kb.files import ManagedFileStore
 from writing_factory.kb.ingestion import IngestionService
 from writing_factory.kb.mineru_parser import DocumentParserRouter, MinerUDocumentParser
-from writing_factory.kb.retrieval import DenseRetriever, SparseRetriever
+from writing_factory.kb.retrieval import (
+    DenseRetriever,
+    HybridRetriever,
+    SparseRetriever,
+)
 from writing_factory.llm import MinerUClient, SiliconFlowClient
 from writing_factory.llm.common import DynamicConcurrencyGate
 from writing_factory.store import Database, RuntimeSettingsRepository
@@ -40,6 +44,7 @@ class ApplicationContext:
     ingestion: IngestionService
     dense_retriever: DenseRetriever
     sparse_retriever: SparseRetriever
+    hybrid_retriever: HybridRetriever
     persona_repository: PersonaRepository
     distillation: DistillationService
     fidelity: FidelityService
@@ -57,6 +62,17 @@ class ApplicationContext:
         self.siliconflow_gate.set_limit(value)
         self.runtime_settings.set("siliconflow_max_concurrency", value)
         self.distillation.set_max_parallel_tasks(value)
+
+    def get_retrieval_option(self, key: str, default: bool = True) -> bool:
+        """读取检索增强开关（HyDE / 查询改写），默认开启以优先写作质量。"""
+
+        value = self.runtime_settings.get(f"retrieval_{key}", default)
+        return bool(value)
+
+    def set_retrieval_option(self, key: str, enabled: bool) -> None:
+        """持久化一个检索增强开关。"""
+
+        self.runtime_settings.set(f"retrieval_{key}", bool(enabled))
 
 
 def build_application(settings: Settings | None = None) -> ApplicationContext:
@@ -131,6 +147,7 @@ def build_application(settings: Settings | None = None) -> ApplicationContext:
         ingestion=ingestion,
         dense_retriever=DenseRetriever(repository, vectors, siliconflow),
         sparse_retriever=SparseRetriever(bm25),
+        hybrid_retriever=HybridRetriever(repository, vectors, bm25, siliconflow),
         persona_repository=persona_repository,
         distillation=distillation,
         fidelity=FidelityService(

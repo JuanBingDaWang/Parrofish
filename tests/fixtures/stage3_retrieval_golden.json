@@ -1,0 +1,31 @@
+{
+  "documents": [
+    {
+      "chunk_id": "fieldwork",
+      "text": "田野调查通过参与式观察和深度访谈获得经验材料，并记录研究者与现场的互动。"
+    },
+    {
+      "chunk_id": "publishing",
+      "text": "出版融合推动编辑流程、内容产品与数字平台协同转型，重构出版产业链。"
+    },
+    {
+      "chunk_id": "digital_humanities",
+      "text": "数字人文使用文本挖掘、知识图谱与可视化方法研究大规模文化资料。"
+    },
+    {
+      "chunk_id": "knowledge_system",
+      "text": "自主知识体系建设强调理论概括必须回应中国实践，并在实践检验中形成解释力。"
+    },
+    {
+      "chunk_id": "discourse",
+      "text": "话语分析关注概念分类、权力关系和知识生产之间的历史联系。"
+    }
+  ],
+  "cases": [
+    {"query": "田野调查 参与式观察", "expected_chunk_ids": ["fieldwork"]},
+    {"query": "出版融合 数字平台", "expected_chunk_ids": ["publishing"]},
+    {"query": "数字人文 知识图谱", "expected_chunk_ids": ["digital_humanities"]},
+    {"query": "自主知识体系 中国实践", "expected_chunk_ids": ["knowledge_system"]},
+    {"query": "话语分析 权力关系", "expected_chunk_ids": ["discourse"]}
+  ]
+}

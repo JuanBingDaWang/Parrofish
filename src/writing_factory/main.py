@@ -23,10 +23,10 @@ def main() -> int:
     application.setApplicationName("写作工厂")
     application.setOrganizationName("WritingFactory")
     configure_application_font(application)
-    context = build_application()
+    app_context = build_application()
 
     def check_siliconflow():
-        return context.siliconflow.chat(
+        return app_context.siliconflow.chat(
             [
                 {"role": "system", "content": "Reply with only OK."},
                 {"role": "user", "content": "Connection check."},
@@ -40,8 +40,8 @@ def main() -> int:
         )
 
     def ingest_document(source_path: Path, task_context: TaskContext):
-        return context.ingestion.ingest(
-            context.default_kb_id,
+        return app_context.ingestion.ingest(
+            app_context.default_kb_id,
             source_path,
             progress=task_context.report_progress,
             check_cancelled=task_context.check_cancelled,
@@ -55,8 +55,8 @@ def main() -> int:
         domain,
         task_context: TaskContext,
     ):
-        return context.distillation.distill(
-            kb_id=context.default_kb_id,
+        return app_context.distillation.distill(
+            kb_id=app_context.default_kb_id,
             name=name,
             mode=mode,
             doc_ids=doc_ids,
@@ -67,18 +67,40 @@ def main() -> int:
         )
 
     def delete_documents(doc_ids: set[str], task_context: TaskContext):
-        return context.ingestion.delete_documents(
-            context.default_kb_id,
+        return app_context.ingestion.delete_documents(
+            app_context.default_kb_id,
             doc_ids,
             progress=task_context.report_progress,
             check_cancelled=task_context.check_cancelled,
         )
 
+    def retrieve(
+        query: str,
+        *,
+        use_rewrite: bool,
+        use_hyde: bool,
+        context: TaskContext | None = None,
+        **_extra: object,
+    ):
+        from writing_factory.kb.models import RetrievalRequest
+
+        request = RetrievalRequest(
+            kb_id=app_context.default_kb_id,
+            query=query,
+            use_rewrite=use_rewrite,
+            use_hyde=use_hyde,
+        )
+        return app_context.hybrid_retriever.search(
+            request,
+            progress=context.report_progress if context is not None else lambda _p, _m: None,
+            check_cancelled=context.check_cancelled if context is not None else lambda: None,
+        )
+
     def delete_personas(persona_ids: set[str], task_context: TaskContext) -> int:
         task_context.check_cancelled()
         task_context.report_progress(20, "删除档案")
-        removed = context.persona_repository.delete_personas(
-            context.default_kb_id,
+        removed = app_context.persona_repository.delete_personas(
+            app_context.default_kb_id,
             persona_ids,
         )
         task_context.report_progress(100, "删除完成")
@@ -95,12 +117,12 @@ def main() -> int:
         if failed:
             raise ValueError(f"档案未通过质量检查：{', '.join(failed)}")
         markdown = render_persona_markdown(persona)
-        context.persona_repository.update_ready(
+        app_context.persona_repository.update_ready(
             persona_id=persona_id,
             persona=persona,
             markdown=markdown,
         )
-        context.persona_repository.save_evaluation(
+        app_context.persona_repository.save_evaluation(
             persona_id=persona_id,
             evaluation_type="nuwa_static",
             result_json=report.model_dump_json(),
@@ -110,26 +132,31 @@ def main() -> int:
     def evaluate_persona(persona_id: str, task_context: TaskContext):
         task_context.check_cancelled()
         task_context.report_progress(10, "设计自检问题")
-        result = context.fidelity.evaluate(persona_id)
+        result = app_context.fidelity.evaluate(persona_id)
         task_context.report_progress(100, "自检完成")
         return result
 
     window = MainWindow(
         check_siliconflow,
         ingest_document=ingest_document,
-        list_documents=lambda: context.repository.list_documents(context.default_kb_id),
+        list_documents=lambda: app_context.repository.list_documents(app_context.default_kb_id),
         delete_documents=delete_documents,
         distill_persona=distill_persona,
         evaluate_persona=evaluate_persona,
-        list_personas=lambda: context.persona_repository.list_personas(context.default_kb_id),
+        list_personas=lambda: app_context.persona_repository.list_personas(
+            app_context.default_kb_id
+        ),
         delete_personas=delete_personas,
-        load_persona=context.persona_repository.load_ready,
+        load_persona=app_context.persona_repository.load_ready,
         save_persona=save_persona,
-        load_runtime_persona=context.persona_repository.load_runtime,
-        list_persona_versions=context.persona_repository.list_versions,
-        get_siliconflow_concurrency=lambda: context.siliconflow_gate.limit,
-        set_siliconflow_concurrency=context.set_siliconflow_concurrency,
+        load_runtime_persona=app_context.persona_repository.load_runtime,
+        list_persona_versions=app_context.persona_repository.list_versions,
+        get_siliconflow_concurrency=lambda: app_context.siliconflow_gate.limit,
+        set_siliconflow_concurrency=app_context.set_siliconflow_concurrency,
+        get_retrieval_option=app_context.get_retrieval_option,
+        set_retrieval_option=app_context.set_retrieval_option,
+        retrieve=retrieve,
     )
-    application.aboutToQuit.connect(context.close)
+    application.aboutToQuit.connect(app_context.close)
     window.show()
     return application.exec()

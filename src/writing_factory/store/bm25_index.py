@@ -9,7 +9,7 @@ from dataclasses import dataclass
 import jieba
 from rank_bm25 import BM25Okapi
 
-from writing_factory.kb.models import Chunk, SearchHit
+from writing_factory.kb.models import Chunk, MetadataFilter, SearchHit
 from writing_factory.store.kb_repository import KnowledgeBaseRepository
 
 jieba.setLogLevel(logging.ERROR)
@@ -44,10 +44,18 @@ class BM25Index:
             self._states[kb_id] = self._build_state(chunks)
         return len(chunks)
 
-    def search(self, kb_id: str, query: str, *, limit: int) -> list[SearchHit]:
+    def search(
+        self,
+        kb_id: str,
+        query: str,
+        *,
+        limit: int,
+        filters: MetadataFilter | None = None,
+        allowed_chunk_ids: set[str] | None = None,
+    ) -> list[SearchHit]:
         """Return ranked sparse hits with complete source metadata."""
 
-        if limit <= 0 or not query.strip():
+        if limit <= 0 or not query.strip() or allowed_chunk_ids == set():
             return []
         chunks = self.repository.ready_child_chunks(kb_id)
         if not chunks:
@@ -58,14 +66,30 @@ class BM25Index:
         if state is None or state.fingerprint != fingerprint:
             state = self._build_state(chunks)
             self._states[kb_id] = state
+        if allowed_chunk_ids is None and filters is not None:
+            allowed_chunk_ids = {
+                chunk.chunk_id
+                for chunk in self.repository.ready_child_chunks(kb_id, filters=filters)
+            }
+            if not allowed_chunk_ids:
+                return []
         query_tokens = self._tokenize(query)
         scores = state.index.get_scores(query_tokens)
         adjusted_scores = [
             float(score) + 1e-6 * len(set(query_tokens).intersection(state.tokenized_corpus[index]))
             for index, score in enumerate(scores)
         ]
+        eligible = (
+            range(len(adjusted_scores))
+            if allowed_chunk_ids is None
+            else (
+                index
+                for index, chunk in enumerate(state.chunks)
+                if chunk.chunk_id in allowed_chunk_ids
+            )
+        )
         ranked = sorted(
-            range(len(adjusted_scores)),
+            eligible,
             key=lambda index: (-adjusted_scores[index], index),
         )[:limit]
         return [

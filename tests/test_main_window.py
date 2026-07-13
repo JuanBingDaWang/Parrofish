@@ -11,7 +11,7 @@ from PyQt6.QtCore import QItemSelectionModel, Qt
 
 from tests.test_distill_pipeline import _persona
 from writing_factory.distill.serialization import render_persona_markdown
-from writing_factory.kb.models import IngestResult
+from writing_factory.kb.models import FusedHit, IngestResult, RetrievalResult
 from writing_factory.llm.models import ChatResult, TokenUsage
 from writing_factory.ui.main_window import MainWindow
 
@@ -51,6 +51,24 @@ def test_settings_page_applies_shared_siliconflow_concurrency(qtbot) -> None:
     window.concurrency_input.setValue(6)
 
     assert changed == [6]
+
+
+def test_settings_page_persists_retrieval_enhancement_switches(qtbot) -> None:
+    stored = {"use_hyde": False, "use_rewrite": True}
+    changed: list[tuple[str, bool]] = []
+    window = MainWindow(
+        lambda: ChatResult(content="OK", model="test"),
+        get_retrieval_option=lambda key, default: stored.get(key, default),
+        set_retrieval_option=lambda key, value: changed.append((key, value)),
+    )
+    qtbot.addWidget(window)
+
+    assert not window.hyde_checkbox.isChecked()
+    assert window.rewrite_checkbox.isChecked()
+    window.hyde_checkbox.click()
+    window.rewrite_checkbox.click()
+
+    assert changed == [("use_hyde", True), ("use_rewrite", False)]
 
 
 def test_document_import_updates_table_without_blocking(qtbot, tmp_path: Path) -> None:
@@ -150,6 +168,86 @@ def test_batch_document_import_runs_sequentially(qtbot, tmp_path: Path) -> None:
     assert window.persona_page.source_table.rowCount() == 2
     assert "2 个文件" in window.statusBar().currentMessage()
     qtbot.waitUntil(lambda: window._tasks.active_count == 0, timeout=2000)
+
+
+def test_hybrid_retrieval_runs_in_background_and_displays_filename(qtbot) -> None:
+    received: list[tuple[str, bool, bool]] = []
+
+    def retrieve(*, query, use_rewrite, use_hyde, context):
+        received.append((query, use_rewrite, use_hyde))
+        context.report_progress(50, "重排中")
+        time.sleep(0.05)
+        return RetrievalResult(
+            query=query,
+            hits=(
+                FusedHit(
+                    chunk_id="parent_one",
+                    doc_id="doc_long_identifier",
+                    text="这是可追溯的完整父级上下文。",
+                    source="hybrid",
+                    rrf_score=0.1,
+                    rerank_score=0.9,
+                    final_rank=1,
+                    section_heading="引言",
+                    page_start=2,
+                    expanded_from_child=True,
+                    matched_child_ids=("child_one",),
+                ),
+            ),
+        )
+
+    window = MainWindow(
+        lambda: ChatResult(content="OK", model="test"),
+        list_documents=lambda: [
+            {
+                "doc_id": "doc_long_identifier",
+                "filename": "叶芃论文.pdf",
+                "status": "ready",
+                "chunk_count": 1,
+            }
+        ],
+        retrieve=retrieve,
+    )
+    qtbot.addWidget(window)
+    window.show()
+    page = window.knowledge_page
+    page.query_input.setText("自主知识体系的实践性")
+
+    qtbot.mouseClick(page.retrieve_button, Qt.MouseButton.LeftButton)
+    assert not page.retrieve_button.isEnabled()
+    qtbot.waitUntil(lambda: page.retrieval_table.rowCount() == 1, timeout=2000)
+
+    assert received == [("自主知识体系的实践性", True, True)]
+    assert page.retrieval_table.item(0, 2).text() == "叶芃论文.pdf"
+    assert page.retrieval_table.item(0, 2).toolTip() == "doc_long_identifier"
+    assert page.retrieval_table.item(0, 3).text() == "引言 · 2"
+    qtbot.waitUntil(lambda: window._tasks.active_count == 0, timeout=2000)
+
+
+def test_hybrid_retrieval_can_be_cancelled(qtbot) -> None:
+    def retrieve(*, context, **_kwargs):
+        for _index in range(100):
+            time.sleep(0.01)
+            context.check_cancelled()
+        return RetrievalResult(query="不会完成")
+
+    window = MainWindow(
+        lambda: ChatResult(content="OK", model="test"),
+        retrieve=retrieve,
+    )
+    qtbot.addWidget(window)
+    window.show()
+    panel = window.knowledge_page.retrieval_panel
+    panel.query_input.setText("待取消的问题")
+
+    qtbot.mouseClick(panel.retrieve_button, Qt.MouseButton.LeftButton)
+    assert panel.cancel_button.isVisible()
+    qtbot.mouseClick(panel.cancel_button, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: window._tasks.active_count == 0, timeout=2000)
+
+    assert panel.retrieve_button.isEnabled()
+    assert not panel.cancel_button.isVisible()
+    assert "任务已取消" in window.statusBar().currentMessage()
 
 
 def test_entering_persona_page_refreshes_external_document_changes(qtbot) -> None:

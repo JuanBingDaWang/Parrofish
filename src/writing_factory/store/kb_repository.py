@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from writing_factory.kb.models import (
     Chunk,
     ChunkedDocument,
     ManagedDocument,
+    MetadataFilter,
     ParsedDocument,
 )
 from writing_factory.store.database import Database, utc_now
@@ -240,20 +242,124 @@ class KnowledgeBaseRepository:
                 )
         self.update_job(job_id, "failed", error_message=error_type)
 
-    def ready_child_chunks(self, kb_id: str) -> list[Chunk]:
-        """Load the authoritative sparse-index corpus for one KB."""
+    def ready_child_chunks(
+        self, kb_id: str, *, filters: MetadataFilter | None = None
+    ) -> list[Chunk]:
+        """Load the authoritative child corpus after applying every metadata filter."""
+
+        if filters is not None:
+            constrained_sets = (
+                filters.doc_ids,
+                filters.authors,
+                filters.years,
+                filters.formats,
+                filters.section_headings,
+                filters.chunk_kinds,
+            )
+            if any(values == set() for values in constrained_sets):
+                return []
+            if filters.chunk_kinds is not None and "child" not in filters.chunk_kinds:
+                return []
+
+        parameters: list[object] = [kb_id]
+        extra: list[str] = []
+        if filters is not None:
+            if filters.doc_ids:
+                placeholders = ",".join("?" for _ in filters.doc_ids)
+                extra.append(f"AND c.doc_id IN ({placeholders})")
+                parameters.extend(sorted(filters.doc_ids))
+            if filters.formats:
+                placeholders = ",".join("?" for _ in filters.formats)
+                extra.append(f"AND d.format IN ({placeholders})")
+                parameters.extend(sorted(filters.formats))
+            if filters.section_headings:
+                placeholders = ",".join("?" for _ in filters.section_headings)
+                extra.append(f"AND c.section_heading IN ({placeholders})")
+                parameters.extend(sorted(filters.section_headings))
+            if filters.authors:
+                placeholders = ",".join("?" for _ in filters.authors)
+                extra.append(f"AND json_extract(d.bib_json, '$.author') IN ({placeholders})")
+                parameters.extend(sorted(filters.authors))
+            if filters.years:
+                placeholders = ",".join("?" for _ in filters.years)
+                extra.append(
+                    f"AND CAST(json_extract(d.bib_json, '$.year') AS INTEGER) IN ({placeholders})"
+                )
+                parameters.extend(sorted(filters.years))
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT c.* FROM chunks c
+                JOIN knowledge_base_documents kbd ON kbd.doc_id = c.doc_id
+                JOIN documents d ON d.doc_id = c.doc_id
+                WHERE kbd.kb_id = ? AND kbd.status = 'ready' AND c.chunk_kind = 'child'
+                {" ".join(extra)}
+                ORDER BY c.doc_id, c.chunk_index
+                """,
+                parameters,
+            ).fetchall()
+        return [self._chunk_from_row(row) for row in rows]
+
+    def retrieval_fingerprint(self, kb_id: str) -> str:
+        """Hash the published corpus and filterable metadata for cache versioning."""
 
         with self.database.connection() as connection:
             rows = connection.execute(
                 """
-                SELECT c.* FROM chunks c
+                SELECT c.chunk_id, c.parent_id, c.section_heading,
+                       d.doc_id, d.format, d.bib_json, d.ingest_date
+                FROM chunks c
                 JOIN knowledge_base_documents kbd ON kbd.doc_id = c.doc_id
+                JOIN documents d ON d.doc_id = c.doc_id
                 WHERE kbd.kb_id = ? AND kbd.status = 'ready' AND c.chunk_kind = 'child'
                 ORDER BY c.doc_id, c.chunk_index
                 """,
                 (kb_id,),
             ).fetchall()
+        digest = hashlib.sha256()
+        for row in rows:
+            for key in (
+                "chunk_id",
+                "parent_id",
+                "section_heading",
+                "doc_id",
+                "format",
+                "bib_json",
+                "ingest_date",
+            ):
+                digest.update(str(row[key] or "").encode("utf-8"))
+                digest.update(b"\x00")
+        return digest.hexdigest()
+
+    def ready_child_chunks_by_ids(self, kb_id: str, chunk_ids: set[str]) -> list[Chunk]:
+        """Resolve evidence anchors only within one published knowledge base."""
+
+        identifiers = sorted(chunk_ids)
+        if not identifiers:
+            return []
+        placeholders = ",".join("?" for _identifier in identifiers)
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT c.* FROM chunks c
+                JOIN knowledge_base_documents kbd ON kbd.doc_id = c.doc_id
+                WHERE kbd.kb_id = ? AND kbd.status = 'ready'
+                  AND c.chunk_kind = 'child' AND c.chunk_id IN ({placeholders})
+                ORDER BY c.doc_id, c.chunk_index
+                """,
+                [kb_id, *identifiers],
+            ).fetchall()
         return [self._chunk_from_row(row) for row in rows]
+
+    def parent_chunk(self, parent_id: str) -> Chunk | None:
+        """Return one parent chunk by identifier for parent-document expansion."""
+
+        with self.database.connection() as connection:
+            row = connection.execute(
+                "SELECT c.* FROM chunks c WHERE c.chunk_id = ? AND c.chunk_kind = 'parent'",
+                (parent_id,),
+            ).fetchone()
+        return None if row is None else self._chunk_from_row(row)
 
     def ready_parent_chunks(self, kb_id: str, *, doc_ids: set[str] | None = None) -> list[Chunk]:
         """Load non-overlapping parent chunks used as distillation source units."""

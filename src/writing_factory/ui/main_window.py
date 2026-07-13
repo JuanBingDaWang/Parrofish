@@ -9,6 +9,7 @@ from typing import Any
 from PyQt6.QtCore import QSize
 from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -56,6 +57,9 @@ class MainWindow(QMainWindow):
         list_persona_versions: PersonaVersionLoader | None = None,
         get_siliconflow_concurrency: Callable[[], int] | None = None,
         set_siliconflow_concurrency: Callable[[int], None] | None = None,
+        get_retrieval_option: Callable[[str, bool], bool] | None = None,
+        set_retrieval_option: Callable[[str, bool], None] | None = None,
+        retrieve: Callable[..., Any] | None = None,
     ) -> None:
         super().__init__()
         self._siliconflow_check = siliconflow_check
@@ -72,6 +76,9 @@ class MainWindow(QMainWindow):
         self._list_persona_versions = list_persona_versions
         self._get_siliconflow_concurrency = get_siliconflow_concurrency or (lambda: 3)
         self._set_siliconflow_concurrency = set_siliconflow_concurrency
+        self._get_retrieval_option = get_retrieval_option or (lambda _k, d=True: d)
+        self._set_retrieval_option = set_retrieval_option
+        self._retrieve = retrieve
         self._tasks = BackgroundTaskManager(self)
         self._check_task_id: str | None = None
         self._close_pending = False
@@ -112,6 +119,8 @@ class MainWindow(QMainWindow):
             ingest_document=self._ingest_document,
             list_documents=self._list_documents,
             delete_documents=self._delete_documents,
+            retrieve=self._retrieve,
+            get_retrieval_option=self._get_retrieval_option,
             show_message=self.statusBar().showMessage,
         )
         self.pages.addWidget(self.knowledge_page)
@@ -231,8 +240,40 @@ class MainWindow(QMainWindow):
         mineru_layout.addStretch(1)
         mineru_layout.addWidget(mineru_status)
         layout.addWidget(mineru_row)
+
+        retrieval_title = QLabel("检索增强")
+        retrieval_title.setObjectName("sectionTitle")
+        layout.addWidget(retrieval_title)
+
+        self.hyde_checkbox = QCheckBox("HyDE 检索")
+        self.hyde_checkbox.setChecked(self._get_retrieval_option("use_hyde", True))
+        self.hyde_checkbox.setToolTip(
+            "先让模型写一段假设性答案，用其向量检索，通常显著提升学术查询召回"
+        )
+        self.hyde_checkbox.stateChanged.connect(
+            lambda state: self._retrieval_option_changed("use_hyde", state)
+        )
+        layout.addWidget(self.hyde_checkbox)
+
+        self.rewrite_checkbox = QCheckBox("查询改写")
+        self.rewrite_checkbox.setChecked(self._get_retrieval_option("use_rewrite", True))
+        self.rewrite_checkbox.setToolTip("把一个抽象问题扩展为 3-5 个具体子查询分别检索后融合")
+        self.rewrite_checkbox.stateChanged.connect(
+            lambda state: self._retrieval_option_changed("use_rewrite", state)
+        )
+        layout.addWidget(self.rewrite_checkbox)
+
         layout.addStretch(1)
         return page
+
+    def _retrieval_option_changed(self, key: str, state: int) -> None:
+        """持久化检索增强开关。"""
+
+        if self._set_retrieval_option is None:
+            return
+        enabled = bool(state)
+        self._set_retrieval_option(key, enabled)
+        self.statusBar().showMessage(f"检索选项「{key}」已{'开启' if enabled else '关闭'}", 4000)
 
     def _concurrency_changed(self, value: int) -> None:
         """运行时应用并持久化统一并发上限。"""
