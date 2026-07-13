@@ -76,8 +76,8 @@ def test_document_import_updates_table_without_blocking(qtbot, tmp_path: Path) -
     assert not page.import_button.isEnabled()
     qtbot.waitUntil(lambda: page.document_table.rowCount() == 1, timeout=2000)
 
-    assert page.document_table.item(0, 0).text() == "资料.txt"
-    assert page.document_table.item(0, 1).text() == "可检索"
+    assert page.document_table.item(0, 1).text() == "资料.txt"
+    assert page.document_table.item(0, 2).text() == "可检索"
     assert window.persona_page.source_table.rowCount() == 1
     assert page.import_button.isEnabled()
     qtbot.waitUntil(lambda: window._tasks.active_count == 0, timeout=2000)
@@ -204,8 +204,8 @@ def test_persona_page_distills_checked_sources_in_background(qtbot) -> None:
     qtbot.waitUntil(lambda: page.profile_table.rowCount() == 1, timeout=2000)
 
     assert received == [("叶芃", "person", {"doc_one"})]
-    assert page.profile_table.item(0, 0).text() == "叶芃"
-    assert page.profile_table.item(0, 3).text() == "3"
+    assert page.profile_table.item(0, 1).text() == "叶芃"
+    assert page.profile_table.item(0, 4).text() == "3"
     qtbot.waitUntil(lambda: window._tasks.active_count == 0, timeout=2000)
 
 
@@ -243,7 +243,7 @@ def test_persona_fidelity_check_runs_in_background_and_refreshes_score(qtbot) ->
     assert page.evaluate_button.isEnabled()
     qtbot.mouseClick(page.evaluate_button, Qt.MouseButton.LeftButton)
     assert not page.evaluate_button.isEnabled()
-    qtbot.waitUntil(lambda: page.profile_table.item(0, 4).text() == "88/100", timeout=2000)
+    qtbot.waitUntil(lambda: page.profile_table.item(0, 5).text() == "88/100", timeout=2000)
 
     assert received == ["persona_one"]
     assert page.evaluate_button.isEnabled()
@@ -254,7 +254,7 @@ def _select_additional_row(table, row: int) -> None:
     selection = table.selectionModel()
     assert selection is not None
     selection.select(
-        table.model().index(row, 0),
+        table.model().index(row, 1),
         QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows,
     )
 
@@ -323,6 +323,72 @@ def test_persona_page_batch_deletes_selected_profiles(qtbot) -> None:
     qtbot.waitUntil(lambda: window._tasks.active_count == 0, timeout=2000)
 
 
+def test_knowledge_checkboxes_take_precedence_over_highlighted_rows(qtbot) -> None:
+    documents = [
+        {"doc_id": "doc_a", "filename": "甲.pdf", "status": "ready"},
+        {"doc_id": "doc_b", "filename": "乙.pdf", "status": "ready"},
+        {"doc_id": "doc_c", "filename": "丙.pdf", "status": "ready"},
+    ]
+    received: list[set[str]] = []
+
+    def delete(doc_ids, _context):
+        received.append(set(doc_ids))
+        documents[:] = [item for item in documents if item["doc_id"] not in doc_ids]
+        return SimpleNamespace(removed_count=len(doc_ids), cleanup_failures=0)
+
+    window = MainWindow(
+        lambda: ChatResult(content="OK", model="test"),
+        list_documents=lambda: documents,
+        delete_documents=delete,
+    )
+    qtbot.addWidget(window)
+    window.show()
+    page = window.knowledge_page
+    page.document_table.selectRow(0)
+    page.document_table.item(1, 0).setCheckState(Qt.CheckState.Checked)
+    page.document_table.item(2, 0).setCheckState(Qt.CheckState.Checked)
+
+    qtbot.mouseClick(page.delete_button, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: page.document_table.rowCount() == 1, timeout=2000)
+
+    assert received == [{"doc_b", "doc_c"}]
+    assert page.document_table.item(0, 1).text() == "甲.pdf"
+    qtbot.waitUntil(lambda: window._tasks.active_count == 0, timeout=2000)
+
+
+def test_persona_checkboxes_take_precedence_over_highlighted_rows(qtbot) -> None:
+    profiles = [
+        {"persona_id": "one", "name": "甲", "mode": "person", "status": "ready"},
+        {"persona_id": "two", "name": "乙", "mode": "person", "status": "ready"},
+        {"persona_id": "three", "name": "丙", "mode": "person", "status": "ready"},
+    ]
+    received: list[set[str]] = []
+
+    def delete(persona_ids, _context):
+        received.append(set(persona_ids))
+        profiles[:] = [item for item in profiles if item["persona_id"] not in persona_ids]
+        return len(persona_ids)
+
+    window = MainWindow(
+        lambda: ChatResult(content="OK", model="test"),
+        list_personas=lambda: profiles,
+        delete_personas=delete,
+    )
+    qtbot.addWidget(window)
+    window.show()
+    page = window.persona_page
+    page.profile_table.selectRow(0)
+    page.profile_table.item(1, 0).setCheckState(Qt.CheckState.Checked)
+    page.profile_table.item(2, 0).setCheckState(Qt.CheckState.Checked)
+
+    qtbot.mouseClick(page.delete_button, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: page.profile_table.rowCount() == 1, timeout=2000)
+
+    assert received == [{"two", "three"}]
+    assert page.profile_table.item(0, 1).text() == "甲"
+    qtbot.waitUntil(lambda: window._tasks.active_count == 0, timeout=2000)
+
+
 def test_double_click_opens_persona_editor_and_saves_valid_json(qtbot) -> None:
     persona = _persona("persona_one")
     markdown = render_persona_markdown(persona)
@@ -367,4 +433,4 @@ def test_double_click_opens_persona_editor_and_saves_valid_json(qtbot) -> None:
     assert saved[0].name == "编辑后的叶芃"
     assert saved[0].mental_models[0].description == "这是经过人工校订的中文模型描述。"
     assert "编辑后的叶芃" in editor.markdown_preview.toPlainText()
-    assert page.profile_table.item(0, 0).text() == "编辑后的叶芃"
+    assert page.profile_table.item(0, 1).text() == "编辑后的叶芃"

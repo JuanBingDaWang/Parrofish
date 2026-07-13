@@ -128,20 +128,22 @@ class PersonaPage(QWidget):
         self.delete_button.setEnabled(False)
         profile_header_layout.addWidget(self.delete_button)
         layout.addLayout(profile_header_layout)
-        self.profile_table = QTableWidget(0, 6)
+        self.profile_table = QTableWidget(0, 7)
         self.profile_table.setHorizontalHeaderLabels(
-            ["名称", "模式", "状态", "心智模型", "自检", "调研日期"]
+            ["选择", "名称", "模式", "状态", "心智模型", "自检", "调研日期"]
         )
         self.profile_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.profile_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.profile_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.profile_table.setAlternatingRowColors(True)
         self.profile_table.itemSelectionChanged.connect(self._update_button)
+        self.profile_table.itemChanged.connect(self._update_button)
         self.profile_table.cellDoubleClicked.connect(self._open_profile)
         self.profile_table.verticalHeader().setVisible(False)
         profile_header = self.profile_table.horizontalHeader()
-        profile_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for column in (1, 2, 3, 4, 5):
+        profile_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        profile_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for column in (2, 3, 4, 5, 6):
             profile_header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(self.profile_table, 1)
         self.refresh()
@@ -172,8 +174,15 @@ class PersonaPage(QWidget):
         self.source_table.blockSignals(False)
 
         profiles = self._list_personas()
+        self.profile_table.blockSignals(True)
         self.profile_table.setRowCount(len(profiles))
         for row, profile in enumerate(profiles):
+            select = QTableWidgetItem()
+            select.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+            select.setCheckState(Qt.CheckState.Unchecked)
+            select.setData(Qt.ItemDataRole.UserRole, profile.get("persona_id"))
+            select.setData(Qt.ItemDataRole.UserRole + 1, profile.get("status"))
+            self.profile_table.setItem(row, 0, select)
             values = (
                 str(profile.get("name", "")),
                 "人物" if profile.get("mode") == "person" else "主题",
@@ -184,10 +193,8 @@ class PersonaPage(QWidget):
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                if column == 0:
-                    item.setData(Qt.ItemDataRole.UserRole, profile.get("persona_id"))
-                    item.setData(Qt.ItemDataRole.UserRole + 1, profile.get("status"))
-                self.profile_table.setItem(row, column, item)
+                self.profile_table.setItem(row, column + 1, item)
+        self.profile_table.blockSignals(False)
         self._update_button()
 
     def start_distillation(self) -> None:
@@ -282,15 +289,28 @@ class PersonaPage(QWidget):
         selection = self.profile_table.selectionModel()
         if selection is None:
             return []
-        return sorted(index.row() for index in selection.selectedRows(0))
+        return sorted(index.row() for index in selection.selectedRows(1))
 
     def _selected_persona_ids(self) -> set[str]:
+        checked = self._checked_persona_ids()
+        if checked:
+            return checked
         identifiers: set[str] = set()
         for row in self._selected_persona_rows():
             item = self.profile_table.item(row, 0)
             value = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
             if isinstance(value, str):
                 identifiers.add(value)
+        return identifiers
+
+    def _checked_persona_ids(self) -> set[str]:
+        identifiers: set[str] = set()
+        for row in range(self.profile_table.rowCount()):
+            item = self.profile_table.item(row, 0)
+            if item is not None and item.checkState() == Qt.CheckState.Checked:
+                value = item.data(Qt.ItemDataRole.UserRole)
+                if isinstance(value, str):
+                    identifiers.add(value)
         return identifiers
 
     def _update_button(self) -> None:

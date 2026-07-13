@@ -99,17 +99,19 @@ class KnowledgeBasePage(QWidget):
         self.ingest_progress.hide()
         layout.addWidget(self.ingest_progress)
 
-        self.document_table = QTableWidget(0, 4)
-        self.document_table.setHorizontalHeaderLabels(["文件", "状态", "切片", "入库时间"])
+        self.document_table = QTableWidget(0, 5)
+        self.document_table.setHorizontalHeaderLabels(["选择", "文件", "状态", "切片", "入库时间"])
         self.document_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.document_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.document_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.document_table.setAlternatingRowColors(True)
         self.document_table.itemSelectionChanged.connect(self._update_buttons)
+        self.document_table.itemChanged.connect(self._update_buttons)
         self.document_table.verticalHeader().setVisible(False)
         header = self.document_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for column in (1, 2, 3):
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for column in (2, 3, 4):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(self.document_table, 1)
         self.refresh_documents()
@@ -136,16 +138,29 @@ class KnowledgeBasePage(QWidget):
         )
 
     def _selected_document_ids(self) -> set[str]:
+        checked = self._checked_document_ids()
+        if checked:
+            return checked
         selected: set[str] = set()
         selection = self.document_table.selectionModel()
         if selection is None:
             return selected
-        for index in selection.selectedRows(0):
+        for index in selection.selectedRows(1):
             item = self.document_table.item(index.row(), 0)
             value = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
             if isinstance(value, str):
                 selected.add(value)
         return selected
+
+    def _checked_document_ids(self) -> set[str]:
+        checked: set[str] = set()
+        for row in range(self.document_table.rowCount()):
+            item = self.document_table.item(row, 0)
+            if item is not None and item.checkState() == Qt.CheckState.Checked:
+                value = item.data(Qt.ItemDataRole.UserRole)
+                if isinstance(value, str):
+                    checked.add(value)
+        return checked
 
     def _deletion_succeeded(self, result: Any) -> None:
         removed = int(getattr(result, "removed_count", 0))
@@ -264,8 +279,14 @@ class KnowledgeBasePage(QWidget):
         """Reload the table from SQLite after every terminal task state."""
 
         documents = self._list_documents()
+        self.document_table.blockSignals(True)
         self.document_table.setRowCount(len(documents))
         for row, document in enumerate(documents):
+            select = QTableWidgetItem()
+            select.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable)
+            select.setCheckState(Qt.CheckState.Unchecked)
+            select.setData(Qt.ItemDataRole.UserRole, document.get("doc_id"))
+            self.document_table.setItem(row, 0, select)
             values = (
                 str(document.get("filename", "")),
                 self._status_label(str(document.get("status", ""))),
@@ -275,9 +296,8 @@ class KnowledgeBasePage(QWidget):
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setToolTip(value)
-                if column == 0:
-                    item.setData(Qt.ItemDataRole.UserRole, document.get("doc_id"))
-                self.document_table.setItem(row, column, item)
+                self.document_table.setItem(row, column + 1, item)
+        self.document_table.blockSignals(False)
         self._update_buttons()
 
     def _set_running(self, running: bool) -> None:
