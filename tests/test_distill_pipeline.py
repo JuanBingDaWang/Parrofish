@@ -34,6 +34,7 @@ from writing_factory.distill.models import (
     StyleTags,
     TripleValidation,
 )
+from writing_factory.distill.serialization import render_persona_markdown
 from writing_factory.distill.service import DistillationService
 from writing_factory.distill.sources import SourceCorpus
 from writing_factory.distill.synthesis import CandidateBundleBuilder, PersonaSynthesizer
@@ -845,3 +846,58 @@ def test_reduce_version_change_reuses_compatible_maps_across_runs(tmp_path) -> N
     assert first_extractor.calls == ["unit_0", "unit_1"]
     assert second_extractor.calls == []
     assert "复用思维候选" in progress_messages
+
+
+def test_repository_updates_and_deletes_ready_persona_with_dependents(tmp_path) -> None:
+    database = Database(tmp_path / "persona_edit.db")
+    database.initialize()
+    kb_id = KnowledgeBaseRepository(database).ensure_default()
+    repository = PersonaRepository(database)
+    persona = _persona("persona_edit")
+    run = repository.begin_or_resume(
+        name=persona.name,
+        mode=persona.mode,
+        kb_id=kb_id,
+        source_hash="source",
+        input_hash="input",
+        source_doc_ids=["doc_a"],
+        map_total=1,
+    )
+    persona = persona.model_copy(update={"id": run.persona_id})
+    repository.save_map_result(
+        run_id=run.run_id,
+        unit_id="unit_one",
+        input_hash="map_input",
+        chunk_ids=["chunk_a"],
+        result=MapResult(unit_id="unit_one"),
+    )
+    repository.save_ready(
+        run_id=run.run_id,
+        persona=persona,
+        markdown=render_persona_markdown(persona),
+    )
+    repository.save_evaluation(
+        persona_id=persona.id,
+        evaluation_type="nuwa_fidelity",
+        result_json="{}",
+        score=88,
+    )
+    edited = persona.model_copy(update={"name": "编辑后的作者"})
+
+    repository.update_ready(
+        persona_id=persona.id,
+        persona=edited,
+        markdown=render_persona_markdown(edited),
+    )
+
+    loaded = repository.load_ready(persona.id)
+    assert loaded is not None
+    assert loaded[0].name == "编辑后的作者"
+    assert repository.list_personas(kb_id)[0]["fidelity_score"] is None
+    assert repository.delete_personas(kb_id, {persona.id}) == 1
+    assert repository.load_ready(persona.id) is None
+    with database.connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM distillation_runs").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT COUNT(*) FROM distillation_map_results").fetchone()[0] == 0
+        )

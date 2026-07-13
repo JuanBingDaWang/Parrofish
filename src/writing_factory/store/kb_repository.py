@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 from writing_factory.kb.models import (
@@ -14,6 +15,16 @@ from writing_factory.kb.models import (
     ParsedDocument,
 )
 from writing_factory.store.database import Database, utc_now
+
+
+@dataclass(frozen=True, slots=True)
+class RemovedDocument:
+    """本次从知识库移除的文档及其本地清理信息。"""
+
+    doc_id: str
+    sha256: str
+    managed_path: Path
+    orphaned: bool
 
 
 class KnowledgeBaseRepository:
@@ -323,6 +334,66 @@ class KnowledgeBaseRepository:
                 (kb_id,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def remove_documents(self, kb_id: str, doc_ids: set[str]) -> list[RemovedDocument]:
+        """移除知识库成员；没有其他知识库引用时一并删除规范文档和切片。"""
+
+        identifiers = sorted(doc_ids)
+        if not identifiers:
+            return []
+        placeholders = ",".join("?" for _ in identifiers)
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT d.doc_id, d.sha256, d.managed_path
+                FROM documents d
+                JOIN knowledge_base_documents kbd ON kbd.doc_id = d.doc_id
+                WHERE kbd.kb_id = ? AND d.doc_id IN ({placeholders})
+                ORDER BY d.doc_id
+                """,
+                [kb_id, *identifiers],
+            ).fetchall()
+            if not rows:
+                return []
+            removed_ids = [str(row["doc_id"]) for row in rows]
+            removed_placeholders = ",".join("?" for _ in removed_ids)
+            connection.execute(
+                f"""
+                DELETE FROM knowledge_base_documents
+                WHERE kb_id = ? AND doc_id IN ({removed_placeholders})
+                """,
+                [kb_id, *removed_ids],
+            )
+            remaining = {
+                str(row["doc_id"])
+                for row in connection.execute(
+                    f"""
+                    SELECT DISTINCT doc_id FROM knowledge_base_documents
+                    WHERE doc_id IN ({removed_placeholders})
+                    """,
+                    removed_ids,
+                ).fetchall()
+            }
+            orphaned_ids = [doc_id for doc_id in removed_ids if doc_id not in remaining]
+            if orphaned_ids:
+                orphaned_placeholders = ",".join("?" for _ in orphaned_ids)
+                connection.execute(
+                    f"DELETE FROM documents WHERE doc_id IN ({orphaned_placeholders})",
+                    orphaned_ids,
+                )
+            connection.execute(
+                "UPDATE knowledge_bases SET updated_at = ? WHERE kb_id = ?",
+                (utc_now(), kb_id),
+            )
+        return [
+            RemovedDocument(
+                doc_id=str(row["doc_id"]),
+                sha256=str(row["sha256"]),
+                managed_path=Path(str(row["managed_path"])),
+                orphaned=str(row["doc_id"]) not in remaining,
+            )
+            for row in rows
+        ]
 
     @staticmethod
     def _chunk_from_row(row) -> Chunk:

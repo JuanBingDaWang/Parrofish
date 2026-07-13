@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
 
 from writing_factory.llm.models import ChatResult
 from writing_factory.ui.knowledge_page import KnowledgeBasePage
+from writing_factory.ui.persona_editor import PersonaLoader, PersonaSaver
 from writing_factory.ui.persona_page import PersonaPage
 from writing_factory.ui.workers import BackgroundTaskManager, TaskContext
 
@@ -37,17 +38,25 @@ class MainWindow(QMainWindow):
         *,
         ingest_document: Callable[[Path, TaskContext], Any] | None = None,
         list_documents: Callable[[], list[dict[str, object]]] | None = None,
+        delete_documents: Callable[[set[str], TaskContext], Any] | None = None,
         distill_persona: Callable[[str, str, set[str], TaskContext], Any] | None = None,
         evaluate_persona: Callable[[str, TaskContext], Any] | None = None,
         list_personas: Callable[[], list[dict[str, object]]] | None = None,
+        delete_personas: Callable[[set[str], TaskContext], Any] | None = None,
+        load_persona: PersonaLoader | None = None,
+        save_persona: PersonaSaver | None = None,
     ) -> None:
         super().__init__()
         self._siliconflow_check = siliconflow_check
         self._ingest_document = ingest_document
         self._list_documents = list_documents or (lambda: [])
+        self._delete_documents = delete_documents
         self._distill_persona = distill_persona
         self._evaluate_persona = evaluate_persona
         self._list_personas = list_personas or (lambda: [])
+        self._delete_personas = delete_personas
+        self._load_persona = load_persona
+        self._save_persona = save_persona
         self._tasks = BackgroundTaskManager(self)
         self._check_task_id: str | None = None
         self._close_pending = False
@@ -87,6 +96,7 @@ class MainWindow(QMainWindow):
             self._tasks,
             ingest_document=self._ingest_document,
             list_documents=self._list_documents,
+            delete_documents=self._delete_documents,
             show_message=self.statusBar().showMessage,
         )
         self.pages.addWidget(self.knowledge_page)
@@ -96,6 +106,9 @@ class MainWindow(QMainWindow):
             evaluate_persona=self._evaluate_persona,
             list_sources=self._list_documents,
             list_personas=self._list_personas,
+            delete_personas=self._delete_personas,
+            load_persona=self._load_persona,
+            save_persona=self._save_persona,
             show_message=self.statusBar().showMessage,
         )
         self.pages.addWidget(self.persona_page)

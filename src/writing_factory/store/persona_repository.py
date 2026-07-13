@@ -328,6 +328,59 @@ class PersonaRepository:
             return None
         return PersonaSpec.model_validate_json(row["spec_json"]), row["markdown"]
 
+    def update_ready(
+        self,
+        *,
+        persona_id: str,
+        persona: PersonaSpec,
+        markdown: str,
+    ) -> None:
+        """保存人工编辑后的有效档案，并使基于旧内容的评估失效。"""
+
+        if persona.id != persona_id:
+            raise ValueError("档案 id 不允许修改")
+        with self.database.connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE persona_specs
+                SET name = ?, mode = ?, spec_json = ?, markdown = ?, research_date = ?,
+                    error_type = NULL, updated_at = ?
+                WHERE persona_id = ? AND status = 'ready'
+                """,
+                (
+                    persona.name,
+                    persona.mode,
+                    persona.model_dump_json(),
+                    markdown,
+                    persona.research_date.isoformat(),
+                    utc_now(),
+                    persona_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("只能编辑已经完成的档案")
+            connection.execute(
+                "DELETE FROM persona_evaluations WHERE persona_id = ?",
+                (persona_id,),
+            )
+
+    def delete_personas(self, kb_id: str, persona_ids: set[str]) -> int:
+        """批量删除档案；运行断点、Map 结果和评估由外键级联清理。"""
+
+        identifiers = sorted(persona_ids)
+        if not identifiers:
+            return 0
+        placeholders = ",".join("?" for _ in identifiers)
+        with self.database.connection() as connection:
+            cursor = connection.execute(
+                f"""
+                DELETE FROM persona_specs
+                WHERE kb_id = ? AND persona_id IN ({placeholders})
+                """,
+                [kb_id, *identifiers],
+            )
+        return max(0, cursor.rowcount)
+
     def list_personas(self, kb_id: str) -> list[dict[str, object]]:
         """Return compact profile metadata for the desktop table."""
 

@@ -112,3 +112,26 @@ def test_embedding_failure_is_not_retrievable(settings, tmp_path: Path) -> None:
         row = connection.execute("SELECT status, error_message FROM ingest_jobs").fetchone()
     assert row["status"] == "failed"
     assert row["error_message"] == "RuntimeError"
+
+
+def test_deletes_document_from_both_indexes_and_keeps_original(settings, tmp_path: Path) -> None:
+    _database, repository, kb_id, vectors, bm25, service = _service(settings, FakeEmbeddings())
+    source = tmp_path / "保留原件.txt"
+    source.write_text("数字出版研究。\n\n公共文化服务。", encoding="utf-8")
+    ingested = service.ingest(kb_id, source)
+    managed = next(settings.managed_documents_dir.iterdir())
+    artifact_dir = settings.mineru_artifacts_dir / managed.stem
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / "result.zip").write_bytes(b"cached")
+
+    result = service.delete_documents(kb_id, {ingested.doc_id})
+
+    assert result.removed_count == 1
+    assert result.orphaned_count == 1
+    assert result.cleanup_failures == 0
+    assert source.is_file()
+    assert not managed.exists()
+    assert not artifact_dir.exists()
+    assert repository.list_documents(kb_id) == []
+    assert not vectors.has_document(ingested.doc_id)
+    assert bm25.search(kb_id, "数字出版", limit=3) == []

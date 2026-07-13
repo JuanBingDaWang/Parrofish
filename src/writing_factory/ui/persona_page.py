@@ -7,6 +7,7 @@ from typing import Any
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QButtonGroup,
     QHBoxLayout,
     QHeaderView,
@@ -14,6 +15,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QProgressBar,
     QPushButton,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -21,6 +23,7 @@ from PyQt6.QtWidgets import (
 )
 
 from writing_factory.distill.models import PersonaMode
+from writing_factory.ui.persona_editor import PersonaEditorWindow, PersonaLoader, PersonaSaver
 from writing_factory.ui.workers import BackgroundTaskManager, TaskContext
 
 
@@ -35,6 +38,9 @@ class PersonaPage(QWidget):
         evaluate_persona: Callable[[str, TaskContext], Any] | None,
         list_sources: Callable[[], list[dict[str, object]]],
         list_personas: Callable[[], list[dict[str, object]]],
+        delete_personas: Callable[[set[str], TaskContext], Any] | None,
+        load_persona: PersonaLoader | None,
+        save_persona: PersonaSaver | None,
         show_message: Callable[[str, int], None],
     ) -> None:
         super().__init__()
@@ -43,8 +49,12 @@ class PersonaPage(QWidget):
         self._evaluate_persona = evaluate_persona
         self._list_sources = list_sources
         self._list_personas = list_personas
+        self._delete_personas = delete_personas
+        self._load_persona = load_persona
+        self._save_persona = save_persona
         self._show_message = show_message
         self._task_id: str | None = None
+        self._editor_windows: dict[str, PersonaEditorWindow] = {}
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -104,17 +114,30 @@ class PersonaPage(QWidget):
         self.source_table.itemChanged.connect(self._update_button)
         layout.addWidget(self.source_table)
 
+        profile_header_layout = QHBoxLayout()
         profile_label = QLabel("档案")
         profile_label.setObjectName("sectionTitle")
-        layout.addWidget(profile_label)
+        profile_header_layout.addWidget(profile_label)
+        profile_header_layout.addStretch(1)
+        self.delete_button = QPushButton(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon),
+            "删除",
+        )
+        self.delete_button.setToolTip("删除选中的作者档案")
+        self.delete_button.clicked.connect(self.start_deletion)
+        self.delete_button.setEnabled(False)
+        profile_header_layout.addWidget(self.delete_button)
+        layout.addLayout(profile_header_layout)
         self.profile_table = QTableWidget(0, 6)
         self.profile_table.setHorizontalHeaderLabels(
             ["名称", "模式", "状态", "心智模型", "自检", "调研日期"]
         )
         self.profile_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.profile_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.profile_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.profile_table.setAlternatingRowColors(True)
         self.profile_table.itemSelectionChanged.connect(self._update_button)
+        self.profile_table.cellDoubleClicked.connect(self._open_profile)
         self.profile_table.verticalHeader().setVisible(False)
         profile_header = self.profile_table.horizontalHeader()
         profile_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
@@ -211,6 +234,27 @@ class PersonaPage(QWidget):
             on_progress=self._progressed,
         )
 
+    def start_deletion(self) -> None:
+        """在后台删除单个或多个选中档案，不弹确认框。"""
+
+        if self._task_id is not None or self._delete_personas is None:
+            return
+        persona_ids = self._selected_persona_ids()
+        if not persona_ids:
+            return
+        self._set_running(True)
+        self._show_message(f"准备删除 · {len(persona_ids)} 个档案", 0)
+
+        def task(context: TaskContext):
+            return self._delete_personas(persona_ids, context)
+
+        self._task_id = self._tasks.start(
+            task,
+            on_success=lambda result: self._deletion_succeeded(persona_ids, result),
+            on_error=self._failed,
+            on_progress=self._progressed,
+        )
+
     def _selected_doc_ids(self) -> set[str]:
         selected: set[str] = set()
         for row in range(self.source_table.rowCount()):
@@ -225,14 +269,29 @@ class PersonaPage(QWidget):
         return "topic" if self.topic_button.isChecked() else "person"
 
     def _selected_persona_id(self) -> str | None:
-        row = self.profile_table.currentRow()
-        if row < 0:
+        selected = self._selected_persona_rows()
+        if len(selected) != 1:
             return None
-        item = self.profile_table.item(row, 0)
+        item = self.profile_table.item(selected[0], 0)
         if item is None or item.data(Qt.ItemDataRole.UserRole + 1) != "ready":
             return None
         value = item.data(Qt.ItemDataRole.UserRole)
         return value if isinstance(value, str) else None
+
+    def _selected_persona_rows(self) -> list[int]:
+        selection = self.profile_table.selectionModel()
+        if selection is None:
+            return []
+        return sorted(index.row() for index in selection.selectedRows(0))
+
+    def _selected_persona_ids(self) -> set[str]:
+        identifiers: set[str] = set()
+        for row in self._selected_persona_rows():
+            item = self.profile_table.item(row, 0)
+            value = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+            if isinstance(value, str):
+                identifiers.add(value)
+        return identifiers
 
     def _update_button(self) -> None:
         enabled = (
@@ -247,6 +306,50 @@ class PersonaPage(QWidget):
             and self._task_id is None
             and self._selected_persona_id() is not None
         )
+        self.delete_button.setEnabled(
+            self._delete_personas is not None
+            and self._task_id is None
+            and bool(self._selected_persona_ids())
+        )
+
+    def _open_profile(self, row: int, _column: int) -> None:
+        """双击可用档案时打开或激活对应的独立编辑窗口。"""
+
+        if self._load_persona is None or self._save_persona is None:
+            return
+        item = self.profile_table.item(row, 0)
+        if item is None or item.data(Qt.ItemDataRole.UserRole + 1) != "ready":
+            self._show_message("只能查看已经完成的档案", 5000)
+            return
+        persona_id = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(persona_id, str):
+            return
+        existing = self._editor_windows.get(persona_id)
+        if existing is not None:
+            existing.show()
+            existing.raise_()
+            existing.activateWindow()
+            return
+        editor = PersonaEditorWindow(
+            persona_id,
+            load_persona=self._load_persona,
+            save_persona=self._save_persona,
+            parent=self,
+        )
+        editor.saved.connect(lambda _persona_id: self.refresh())
+        editor.destroyed.connect(lambda: self._editor_windows.pop(persona_id, None))
+        self._editor_windows[persona_id] = editor
+        editor.show()
+
+    def _deletion_succeeded(self, persona_ids: set[str], result: Any) -> None:
+        removed = int(result) if isinstance(result, int) else 0
+        for persona_id in persona_ids:
+            editor = self._editor_windows.pop(persona_id, None)
+            if editor is not None:
+                editor.close()
+        self._show_message(f"已删除 · {removed} 个档案", 6000)
+        self._set_running(False)
+        self.refresh()
 
     def _progressed(self, percent: int, message: str) -> None:
         self.progress.setValue(percent)
@@ -278,8 +381,10 @@ class PersonaPage(QWidget):
         self.person_button.setEnabled(not running)
         self.topic_button.setEnabled(not running)
         self.source_table.setEnabled(not running)
+        self.profile_table.setEnabled(not running)
         self.distill_button.setEnabled(not running)
         self.evaluate_button.setEnabled(not running)
+        self.delete_button.setEnabled(False)
         if not running:
             self._task_id = None
             self._update_button()

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import shutil
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from writing_factory.config import Settings
@@ -28,6 +30,15 @@ def _no_progress(_percent: int, _message: str) -> None:
 
 def _no_cancellation() -> None:
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentDeletionResult:
+    """知识库批量删除结果；清理警告不影响文档已经下线。"""
+
+    removed_count: int
+    orphaned_count: int
+    cleanup_failures: int = 0
 
 
 class IngestionService:
@@ -135,3 +146,41 @@ class IngestionService:
             logger.exception("Ingestion failed: %s", type(exc).__name__)
             self.repository.mark_failed(job_id, type(exc).__name__)
             raise
+
+    def delete_documents(
+        self,
+        kb_id: str,
+        doc_ids: set[str],
+        *,
+        progress: ProgressCallback = _no_progress,
+        check_cancelled: CancellationCheck = _no_cancellation,
+    ) -> DocumentDeletionResult:
+        """先让文档退出检索，再尽力清理只属于它的本地派生文件。"""
+
+        check_cancelled()
+        progress(10, "从知识库移除")
+        removed = self.repository.remove_documents(kb_id, doc_ids)
+        orphaned = [item for item in removed if item.orphaned]
+        cleanup_failures = 0
+        total = max(1, len(orphaned))
+        for index, item in enumerate(orphaned, start=1):
+            try:
+                self.vectors.delete_document(item.doc_id)
+                self.files.delete_file(item.managed_path)
+                artifact_dir = (self.settings.mineru_artifacts_dir / item.sha256).resolve()
+                if artifact_dir.parent != self.settings.mineru_artifacts_dir.resolve():
+                    raise ValueError("MinerU artifact path escaped its configured directory")
+                if artifact_dir.exists():
+                    shutil.rmtree(artifact_dir)
+            except Exception:
+                cleanup_failures += 1
+                logger.exception("Document derivative cleanup failed for %s", item.doc_id)
+            progress(15 + round(70 * index / total), "清理本地索引与缓存")
+        progress(90, "重建稀疏索引")
+        self.bm25.rebuild(kb_id)
+        progress(100, "删除完成")
+        return DocumentDeletionResult(
+            removed_count=len(removed),
+            orphaned_count=len(orphaned),
+            cleanup_failures=cleanup_failures,
+        )

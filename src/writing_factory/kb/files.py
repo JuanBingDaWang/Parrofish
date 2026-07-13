@@ -43,6 +43,15 @@ class ManagedFileStore:
             managed_path=destination,
         )
 
+    def delete_file(self, path: Path) -> None:
+        """删除托管目录中的副本，绝不触碰用户提供的原始文件。"""
+
+        root = self.root.resolve()
+        target = path.resolve()
+        if target.parent != root:
+            raise ValueError("Managed document path is outside the managed file store")
+        target.unlink(missing_ok=True)
+
     @staticmethod
     def _sha256(path: Path) -> str:
         digest = hashlib.sha256()

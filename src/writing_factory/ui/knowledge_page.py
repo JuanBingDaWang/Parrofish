@@ -8,8 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -52,12 +53,14 @@ class KnowledgeBasePage(QWidget):
         *,
         ingest_document: Callable[[Path, TaskContext], Any] | None,
         list_documents: Callable[[], list[dict[str, object]]],
+        delete_documents: Callable[[set[str], TaskContext], Any] | None,
         show_message: Callable[[str, int], None],
     ) -> None:
         super().__init__()
         self._tasks = tasks
         self._ingest_document = ingest_document
         self._list_documents = list_documents
+        self._delete_documents = delete_documents
         self._show_message = show_message
         self._ingest_task_id: str | None = None
         self._build_ui()
@@ -76,8 +79,16 @@ class KnowledgeBasePage(QWidget):
         )
         self.import_button.setEnabled(self._ingest_document is not None)
         self.import_button.clicked.connect(self._select_documents)
+        self.delete_button = QPushButton(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon),
+            "删除",
+        )
+        self.delete_button.setToolTip("删除选中的知识库文档")
+        self.delete_button.clicked.connect(self.start_deletion)
+        self.delete_button.setEnabled(False)
         toolbar.addWidget(heading)
         toolbar.addStretch(1)
+        toolbar.addWidget(self.delete_button)
         toolbar.addWidget(self.import_button)
         layout.addLayout(toolbar)
 
@@ -92,7 +103,9 @@ class KnowledgeBasePage(QWidget):
         self.document_table.setHorizontalHeaderLabels(["文件", "状态", "切片", "入库时间"])
         self.document_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.document_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.document_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.document_table.setAlternatingRowColors(True)
+        self.document_table.itemSelectionChanged.connect(self._update_buttons)
         self.document_table.verticalHeader().setVisible(False)
         header = self.document_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
@@ -100,6 +113,56 @@ class KnowledgeBasePage(QWidget):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(self.document_table, 1)
         self.refresh_documents()
+
+    def start_deletion(self) -> None:
+        """在后台删除单个或多个选中文档，不弹确认框。"""
+
+        if self._ingest_task_id is not None or self._delete_documents is None:
+            return
+        doc_ids = self._selected_document_ids()
+        if not doc_ids:
+            return
+        self._set_running(True)
+        self._show_message(f"准备删除 · {len(doc_ids)} 个文档", 0)
+
+        def task(context: TaskContext):
+            return self._delete_documents(doc_ids, context)
+
+        self._ingest_task_id = self._tasks.start(
+            task,
+            on_success=self._deletion_succeeded,
+            on_error=self._deletion_failed,
+            on_progress=self._ingest_progressed,
+        )
+
+    def _selected_document_ids(self) -> set[str]:
+        selected: set[str] = set()
+        selection = self.document_table.selectionModel()
+        if selection is None:
+            return selected
+        for index in selection.selectedRows(0):
+            item = self.document_table.item(index.row(), 0)
+            value = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+            if isinstance(value, str):
+                selected.add(value)
+        return selected
+
+    def _deletion_succeeded(self, result: Any) -> None:
+        removed = int(getattr(result, "removed_count", 0))
+        failures = int(getattr(result, "cleanup_failures", 0))
+        message = f"已删除 · {removed} 个文档"
+        if failures:
+            message += f" · {failures} 个派生文件待清理"
+        self._show_message(message, 7000)
+        self.refresh_documents()
+        self.documents_changed.emit()
+        self._finish_ingestion()
+
+    def _deletion_failed(self, message: str) -> None:
+        self._show_message(message, 8000)
+        self.refresh_documents()
+        self.documents_changed.emit()
+        self._finish_ingestion()
 
     def _select_documents(self) -> None:
         filenames, _selected_filter = QFileDialog.getOpenFileNames(
@@ -124,9 +187,8 @@ class KnowledgeBasePage(QWidget):
         paths = tuple(Path(path) for path in source_paths)
         if not paths:
             return
-        self.import_button.setEnabled(False)
+        self._set_running(True)
         self.ingest_progress.setValue(0)
-        self.ingest_progress.show()
         self._show_message(f"准备入库 · {len(paths)} 个文件", 0)
 
         def task(context: TaskContext) -> BatchIngestionResult:
@@ -195,9 +257,8 @@ class KnowledgeBasePage(QWidget):
             self._show_message(f"{message} · {percent}%", 0)
 
     def _finish_ingestion(self) -> None:
-        self.import_button.setEnabled(self._ingest_document is not None)
-        self.ingest_progress.hide()
         self._ingest_task_id = None
+        self._set_running(False)
 
     def refresh_documents(self) -> None:
         """Reload the table from SQLite after every terminal task state."""
@@ -214,7 +275,26 @@ class KnowledgeBasePage(QWidget):
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setToolTip(value)
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, document.get("doc_id"))
                 self.document_table.setItem(row, column, item)
+        self._update_buttons()
+
+    def _set_running(self, running: bool) -> None:
+        self.import_button.setEnabled(not running and self._ingest_document is not None)
+        self.document_table.setEnabled(not running)
+        self.ingest_progress.setVisible(running)
+        if not running:
+            self._update_buttons()
+        else:
+            self.delete_button.setEnabled(False)
+
+    def _update_buttons(self) -> None:
+        self.delete_button.setEnabled(
+            self._ingest_task_id is None
+            and self._delete_documents is not None
+            and bool(self._selected_document_ids())
+        )
 
     @staticmethod
     def _status_label(status: str) -> str:

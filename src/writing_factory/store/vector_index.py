@@ -55,6 +55,14 @@ class LanceVectorIndex:
         rows = table.search().where(f"doc_id = '{self._sql_string(doc_id)}'").limit(1).to_list()
         return bool(rows)
 
+    def delete_document(self, doc_id: str) -> None:
+        """删除一个文档的全部稠密向量；表不存在时视为已经清理。"""
+
+        with self._lock:
+            table = self._open_table()
+            if table is not None:
+                table.delete(f"doc_id = '{self._sql_string(doc_id)}'")
+
     def search(
         self,
         query_vector: Sequence[float],
