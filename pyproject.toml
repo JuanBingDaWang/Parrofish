@@ -8,9 +8,13 @@ version = "0.1.0"
 description = "A traceable humanities and social-sciences writing desktop application."
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "citeproc-py>=0.9.0,<1",
+    "citeproc-py-styles>=0.1.5,<1",
     "httpx>=0.28.1,<1",
     "jieba>=0.42.1,<1",
     "lancedb>=0.20,<1",
+    "langgraph>=1.2.9",
+    "langgraph-checkpoint-sqlite>=3.1.0",
     "pydantic>=2.11,<3",
     "PyQt6>=6.8,<7",
     "rank-bm25>=0.2.2,<1",

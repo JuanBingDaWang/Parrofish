@@ -68,3 +68,12 @@ def configure_logging(log_dir: Path, secrets: tuple[str, ...]) -> None:
     handler.setFormatter(JsonFormatter(secrets))
     handler.addFilter(RedactingFilter(secrets))
     root.addHandler(handler)
+
+
+def shutdown_logging() -> None:
+    """Close application-owned handlers so Windows can release the log file."""
+
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+        handler.close()

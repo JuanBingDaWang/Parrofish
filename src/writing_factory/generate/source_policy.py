@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from hashlib import sha256
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from writing_factory.distill.models import PersonaSpec
+from writing_factory.eval.injection import InjectionDetector
+from writing_factory.generate.models import GenerationContext
+from writing_factory.kb.models import MetadataFilter
 
 
 class GenerationSourcePolicy(BaseModel):
@@ -15,6 +19,7 @@ class GenerationSourcePolicy(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
+    policy_id: str
     allowed_task_doc_ids: set[str] = Field(default_factory=set)
     excluded_persona_doc_ids: set[str] = Field(default_factory=set)
 
@@ -22,6 +27,12 @@ class GenerationSourcePolicy(BaseModel):
         """只有当前任务白名单中的文档才能支持事实和引用。"""
 
         return doc_id in self.allowed_task_doc_ids
+
+    def require_nonempty(self) -> None:
+        """Reject a task that has no explicitly selected factual corpus."""
+
+        if not self.allowed_task_doc_ids:
+            raise ValueError("写作任务至少需要选择一篇可作为事实来源的知识库文档")
 
 
 def build_generation_source_policy(
@@ -36,8 +47,11 @@ def build_generation_source_policy(
     explicit = set(explicitly_allowed_persona_doc_ids) & persona_ids
     selected = set(selected_task_doc_ids)
     excluded = persona_ids - explicit
+    allowed = (selected - excluded) | (selected & explicit)
+    digest_input = "\n".join([*sorted(allowed), "--", *sorted(excluded)])
     return GenerationSourcePolicy(
-        allowed_task_doc_ids=(selected - excluded) | (selected & explicit),
+        policy_id=f"source_policy_{sha256(digest_input.encode('utf-8')).hexdigest()[:16]}",
+        allowed_task_doc_ids=allowed,
         excluded_persona_doc_ids=excluded,
     )
 
@@ -68,6 +82,26 @@ def find_suspicious_source_overlap(
                 matches.append(window)
                 break
     return list(dict.fromkeys(matches))
+
+
+def task_document_filter(context: GenerationContext) -> MetadataFilter:
+    """Build the mandatory retrieval filter from the persisted task policy."""
+
+    allowed = set(context.allowed_doc_ids)
+    if not allowed:
+        raise ValueError("写作任务没有可用的事实来源白名单")
+    excluded = set(context.excluded_persona_doc_ids)
+    overlap = allowed & excluded
+    if overlap:
+        raise ValueError(f"事实来源白名单包含被隔离的作者语料: {sorted(overlap)}")
+    return MetadataFilter(doc_ids=allowed)
+
+
+def enforce_retrieval_safety(retrieval_result, siliconflow) -> None:
+    """Scan untrusted retrieved text before placing it in a prompt data zone."""
+
+    content = "\n\n".join(hit.text for hit in retrieval_result.hits)
+    InjectionDetector().enforce(siliconflow, content)
 
 
 def _normalize(value: str) -> str:

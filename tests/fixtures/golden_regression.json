@@ -1,0 +1,68 @@
+{
+  "suite_name": "academic_writing_baseline",
+  "cases": [
+    {
+      "case_id": "thesis_clarity_001",
+      "task_description": "论述数字人文方法论对传统人文学科的影响",
+      "expected_min_scores": {
+        "faithfulness": 0.7,
+        "论点清晰度": 3,
+        "论证质量": 3,
+        "结构与组织": 3,
+        "文风与表达": 3
+      }
+    },
+    {
+      "case_id": "argument_quality_001",
+      "task_description": "分析出版融合对中国学术期刊编辑流程的重构",
+      "expected_min_scores": {
+        "faithfulness": 0.7,
+        "论证质量": 3,
+        "事实整合": 3
+      }
+    },
+    {
+      "case_id": "structure_baseline_001",
+      "task_description": "讨论田野调查方法在传播学研究中的适用性边界",
+      "expected_min_scores": {
+        "结构与组织": 3,
+        "faithfulness": 0.6
+      }
+    },
+    {
+      "case_id": "evidence_boundary_001",
+      "task_description": "分析平台算法对出版内容分发机制的影响",
+      "expected_min_scores": {"faithfulness": 0.8, "事实整合": 3}
+    },
+    {
+      "case_id": "concept_consistency_001",
+      "task_description": "讨论媒介化理论在数字出版研究中的解释边界",
+      "expected_min_scores": {"faithfulness": 0.7, "结构与组织": 3}
+    },
+    {
+      "case_id": "counterargument_001",
+      "task_description": "评析生成式人工智能提升学术出版效率的观点",
+      "expected_min_scores": {"faithfulness": 0.8, "论证质量": 3}
+    },
+    {
+      "case_id": "historical_comparison_001",
+      "task_description": "比较纸媒转型与移动出版转型的制度差异",
+      "expected_min_scores": {"faithfulness": 0.8, "论点清晰度": 3}
+    },
+    {
+      "case_id": "methodology_001",
+      "task_description": "说明内容分析法研究学术期刊议题演化的适用条件",
+      "expected_min_scores": {"faithfulness": 0.8, "论证质量": 3}
+    },
+    {
+      "case_id": "policy_analysis_001",
+      "task_description": "分析全民阅读政策中的公共文化服务逻辑",
+      "expected_min_scores": {"faithfulness": 0.8, "事实整合": 3}
+    },
+    {
+      "case_id": "interdisciplinary_001",
+      "task_description": "讨论社会网络分析用于出版史研究的方法价值",
+      "expected_min_scores": {"faithfulness": 0.7, "文风与表达": 3}
+    }
+  ]
+}

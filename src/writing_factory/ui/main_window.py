@@ -33,7 +33,9 @@ from writing_factory.ui.persona_editor import (
     RuntimePersonaLoader,
 )
 from writing_factory.ui.persona_page import PersonaPage
+from writing_factory.ui.project_page import ProjectPage
 from writing_factory.ui.workers import BackgroundTaskManager, TaskContext
+from writing_factory.ui.writing_task_page import WritingTaskPage
 
 
 class MainWindow(QMainWindow):
@@ -60,6 +62,17 @@ class MainWindow(QMainWindow):
         get_retrieval_option: Callable[[str, bool], bool] | None = None,
         set_retrieval_option: Callable[[str, bool], None] | None = None,
         retrieve: Callable[..., Any] | None = None,
+        run_writing_pipeline: Callable[..., Any] | None = None,
+        evaluate_generation: Callable[..., Any] | None = None,
+        list_projects: Callable[[], list[dict[str, object]]] | None = None,
+        create_project: Callable[[str, str], str] | None = None,
+        update_project: Callable[[str, str, str], None] | None = None,
+        delete_projects: Callable[[set[str]], int] | None = None,
+        create_writing_task: Callable[..., str] | None = None,
+        list_writing_tasks: Callable[[str], list[dict[str, object]]] | None = None,
+        load_writing_task: Callable[[str], dict[str, object] | None] | None = None,
+        save_edited_draft: Callable[..., None] | None = None,
+        delete_writing_tasks: Callable[[set[str]], int] | None = None,
     ) -> None:
         super().__init__()
         self._siliconflow_check = siliconflow_check
@@ -79,6 +92,17 @@ class MainWindow(QMainWindow):
         self._get_retrieval_option = get_retrieval_option or (lambda _k, d=True: d)
         self._set_retrieval_option = set_retrieval_option
         self._retrieve = retrieve
+        self._run_writing_pipeline = run_writing_pipeline
+        self._evaluate_generation = evaluate_generation
+        self._list_projects = list_projects or (lambda: [])
+        self._create_project = create_project
+        self._update_project = update_project
+        self._delete_projects = delete_projects
+        self._create_writing_task = create_writing_task
+        self._list_writing_tasks = list_writing_tasks or (lambda _project_id: [])
+        self._load_writing_task = load_writing_task
+        self._save_edited_draft = save_edited_draft
+        self._delete_writing_tasks = delete_writing_tasks
         self._tasks = BackgroundTaskManager(self)
         self._check_task_id: str | None = None
         self._close_pending = False
@@ -113,7 +137,14 @@ class MainWindow(QMainWindow):
             self.navigation.addItem(item)
 
         self.pages = QStackedWidget()
-        self.pages.addWidget(self._empty_page("项目"))
+        self.project_page = ProjectPage(
+            list_projects=self._list_projects,
+            create_project=self._create_project or (lambda _title, _description: ""),
+            update_project=self._update_project or (lambda _project_id, _title, _description: None),
+            delete_projects=self._delete_projects or (lambda _identifiers: 0),
+            show_message=self.statusBar().showMessage,
+        )
+        self.pages.addWidget(self.project_page)
         self.knowledge_page = KnowledgeBasePage(
             self._tasks,
             ingest_document=self._ingest_document,
@@ -139,7 +170,22 @@ class MainWindow(QMainWindow):
         )
         self.pages.addWidget(self.persona_page)
         self.knowledge_page.documents_changed.connect(self.persona_page.refresh)
-        self.pages.addWidget(self._empty_page("写作任务"))
+        self.writing_task_page = WritingTaskPage(
+            self._tasks,
+            list_personas=self._list_personas,
+            list_projects=self._list_projects,
+            list_documents=self._list_documents,
+            run_writing_pipeline=self._run_writing_pipeline,
+            evaluate_generation=self._evaluate_generation,
+            create_writing_task=self._create_writing_task,
+            list_writing_tasks=self._list_writing_tasks,
+            load_writing_task=self._load_writing_task,
+            save_edited_draft=self._save_edited_draft,
+            delete_writing_tasks=self._delete_writing_tasks,
+            show_message=self.statusBar().showMessage,
+        )
+        self.pages.addWidget(self.writing_task_page)
+        self.project_page.projects_changed.connect(self.writing_task_page.refresh_projects)
         self.pages.addWidget(self._settings_page())
         self.navigation.currentRowChanged.connect(self._switch_page)
         self.navigation.setCurrentRow(1)
@@ -153,10 +199,14 @@ class MainWindow(QMainWindow):
         """Switch pages and refresh views backed by mutable local storage."""
 
         self.pages.setCurrentIndex(index)
-        if index == 1:
+        if index == 0:
+            self.project_page.refresh()
+        elif index == 1:
             self.knowledge_page.refresh_documents()
         elif index == 2:
             self.persona_page.refresh()
+        elif index == 3:
+            self.writing_task_page.refresh()
 
     def _empty_page(self, title: str) -> QWidget:
         page = QWidget()

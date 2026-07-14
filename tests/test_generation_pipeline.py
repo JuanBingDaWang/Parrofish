@@ -1,0 +1,330 @@
+"""Offline end-to-end coverage for the Stage 4-6 writing graph."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from writing_factory.generate.models import (
+    Claim,
+    EvidenceItem,
+    ReferenceList,
+    SectionDraft,
+    VerifiedDraft,
+)
+from writing_factory.kb.models import Bibliography, FusedHit, RetrievalResult
+from writing_factory.llm.models import ChatResult
+from writing_factory.orchestration.nodes import should_continue_after_verify
+from writing_factory.orchestration.pipeline_runner import run_writing_pipeline_with_progress
+from writing_factory.orchestration.reference_assembler import assemble_reference_list
+
+
+class FakeTaskContext:
+    def __init__(self) -> None:
+        self.progress: list[tuple[int, str]] = []
+
+    def report_progress(self, percent: int, message: str) -> None:
+        self.progress.append((percent, message))
+
+    def check_cancelled(self) -> None:
+        return None
+
+
+class FakePersonaRepository:
+    def load_ready(self, _persona_id: str):
+        return SimpleNamespace(source_info=[]), ""
+
+    def load_runtime(self, persona_id: str):
+        return SimpleNamespace(
+            name="测试作者",
+            model_dump=lambda **_kwargs: {
+                "persona_id": persona_id,
+                "name": "测试作者",
+                "mental_models": [],
+                "expression_dna": {},
+            },
+        )
+
+
+class FakeKnowledgeRepository:
+    def ready_child_chunks_by_ids(self, _kb_id: str, _chunk_ids: set[str]):
+        return []
+
+    def get_bibliographies(self, _kb_id: str, doc_ids: set[str]):
+        return {
+            doc_id: Bibliography(
+                author="张三",
+                title="数字人文研究",
+                year=2024,
+                publisher_or_journal="出版研究",
+                document_type="article",
+                extra={"issue": "2", "pages": "10-20"},
+            )
+            for doc_id in doc_ids
+        }
+
+
+class FakeRetriever:
+    def __init__(self, repository: FakeKnowledgeRepository) -> None:
+        self.repository = repository
+        self.requests = []
+
+    def search(self, request, **_kwargs):
+        self.requests.append(request)
+        return RetrievalResult(
+            query=request.query,
+            hits=(
+                FusedHit(
+                    chunk_id="chunk_1",
+                    doc_id="doc_task",
+                    text="数字人文方法能够扩展传统文献研究的证据处理能力。",
+                    source="hybrid",
+                    final_rank=1,
+                    rrf_score=0.9,
+                    page_start=3,
+                    page_end=3,
+                    section_heading="研究方法",
+                    matched_child_ids=("chunk_1",),
+                ),
+            ),
+        )
+
+
+class FakeSiliconFlow:
+    def __init__(self) -> None:
+        self.responses = [
+            {
+                "thesis_text": "数字人文方法扩展了传统文献研究的证据能力。",
+                "angle": "证据方法转型",
+                "kb_support_assessment": "任务语料提供直接支持。",
+                "persona_id": "persona_1",
+            },
+            {
+                "thesis": {
+                    "thesis_text": "数字人文方法扩展了传统文献研究的证据能力。",
+                    "angle": "证据方法转型",
+                    "kb_support_assessment": "任务语料提供直接支持。",
+                    "persona_id": "persona_1",
+                },
+                "root_nodes": [
+                    {
+                        "node_id": "1",
+                        "heading": "证据方法的变化",
+                        "rhetorical_purpose": "论证核心主张",
+                        "candidate_source_keys": ["S1"],
+                        "children": [],
+                    }
+                ],
+                "term_registry": {},
+                "kb_id": "kb",
+            },
+            {
+                "section_id": "1",
+                "heading": "证据方法的变化",
+                "paragraphs": ["数字人文方法能够扩展传统文献研究的证据处理能力。[S1]"],
+                "claims": [
+                    {
+                        "claim_id": "1_c1",
+                        "text": "数字人文方法能够扩展传统文献研究的证据处理能力。",
+                        "claim_type": "fact",
+                        "source_keys": ["S1"],
+                        "paragraph_index": 0,
+                    }
+                ],
+                "evidence_pack": {
+                    "section_id": "1",
+                    "items": [
+                        {
+                            "source_key": "S1",
+                            "chunk_id": "chunk_1",
+                            "doc_id": "doc_task",
+                            "verbatim_excerpt": "数字人文方法能够扩展传统文献研究的证据处理能力。",
+                            "page_start": 3,
+                            "page_end": 3,
+                            "section_heading": "研究方法",
+                        }
+                    ],
+                },
+            },
+            {
+                "verified_claims": [
+                    {
+                        "claim_id": "1_c1",
+                        "verdict": "supported",
+                        "verifier_rationale": "证据原文直接支持。",
+                    }
+                ]
+            },
+            "数字人文方法能够扩展传统文献研究的证据处理能力。[S1]",
+            {"fact_drift_detected": False},
+            {"issues": [], "overall_assessment": "结构清晰。"},
+            {
+                "sections": [
+                    {
+                        "section_id": "1",
+                        "polished_text": "数字人文方法能够扩展传统文献研究的证据处理能力。[S1]",
+                    }
+                ],
+                "transitions_added": [],
+                "global_consistency_notes": "无需调整。",
+            },
+            {"fact_drift_detected": False},
+        ]
+        self.calls = []
+
+    def chat(self, messages, **kwargs):
+        self.calls.append((messages, kwargs))
+        response = self.responses.pop(0)
+        content = (
+            response if isinstance(response, str) else json.dumps(response, ensure_ascii=False)
+        )
+        return ChatResult(content=content, model="fake")
+
+
+def test_full_writing_graph_runs_offline(tmp_path: Path) -> None:
+    kb_repository = FakeKnowledgeRepository()
+    retriever = FakeRetriever(kb_repository)
+    context = FakeTaskContext()
+    result = run_writing_pipeline_with_progress(
+        persona_id="persona_1",
+        task_description="讨论数字人文方法",
+        domain="数字人文",
+        context=context,
+        siliconflow=FakeSiliconFlow(),
+        retriever=retriever,
+        persona_repository=FakePersonaRepository(),
+        kb_repository=kb_repository,
+        checkpoint_dir=tmp_path,
+        kb_id="kb",
+        task_id="task_1",
+        selected_doc_ids={"doc_task"},
+    )
+
+    assert result["status"] == "done"
+    assert result["task_id"] == "task_1"
+    assert "数字人文" in result["final_draft_json"]
+    final_draft = json.loads(result["final_draft_json"])
+    assert "[1]" in final_draft["sections"][0]["polished_text"]
+    assert "[S1]" not in final_draft["sections"][0]["polished_text"]
+    outline = json.loads(result["outline_json"])
+    assert outline["root_nodes"][0]["candidate_evidence"][0]["chunk_id"] == "chunk_1"
+    assert outline["root_nodes"][0]["candidate_source_keys"] == ["S1"]
+    assert len(retriever.requests) == 4
+    assert all(request.filters.doc_ids == {"doc_task"} for request in retriever.requests)
+    assert context.progress[-1][0] == 100
+
+    resumed_client = FakeSiliconFlow()
+    resumed_client.responses.clear()
+    resumed = run_writing_pipeline_with_progress(
+        persona_id="persona_1",
+        task_description="讨论数字人文方法",
+        domain="数字人文",
+        context=FakeTaskContext(),
+        siliconflow=resumed_client,
+        retriever=FakeRetriever(kb_repository),
+        persona_repository=FakePersonaRepository(),
+        kb_repository=kb_repository,
+        checkpoint_dir=tmp_path,
+        kb_id="kb",
+        task_id="task_1",
+        selected_doc_ids={"doc_task"},
+        resume=True,
+    )
+    assert resumed["status"] == "done"
+    assert resumed_client.calls == []
+
+
+def test_fact_claim_requires_source_and_inline_marker() -> None:
+    with pytest.raises(ValueError, match="至少一个 source_key"):
+        Claim(
+            claim_id="c1",
+            text="事实",
+            claim_type="fact",
+            paragraph_index=0,
+        )
+
+    with pytest.raises(ValueError, match="缺少引用标记"):
+        SectionDraft.model_validate(
+            {
+                "section_id": "1",
+                "heading": "标题",
+                "paragraphs": ["有来源但没有标记。"],
+                "claims": [
+                    {
+                        "claim_id": "c1",
+                        "text": "有来源但没有标记。",
+                        "claim_type": "fact",
+                        "source_keys": ["S1"],
+                        "paragraph_index": 0,
+                    }
+                ],
+                "evidence_pack": {
+                    "section_id": "1",
+                    "items": [
+                        {
+                            "source_key": "S1",
+                            "chunk_id": "chunk",
+                            "doc_id": "doc",
+                            "verbatim_excerpt": "原文",
+                        }
+                    ],
+                },
+            }
+        )
+
+
+def test_partial_verdict_never_routes_to_polish() -> None:
+    claim = Claim(
+        claim_id="c1",
+        text="事实",
+        claim_type="fact",
+        source_keys=["S1"],
+        paragraph_index=0,
+    )
+    verified = VerifiedDraft.model_validate(
+        {
+            "section_id": "1",
+            "verified_claims": [
+                {
+                    "claim": claim.model_dump(),
+                    "verdict": "partial",
+                    "verifier_rationale": "仅部分支持",
+                }
+            ],
+            "supported_count": 0,
+            "partial_count": 1,
+            "unsupported_count": 0,
+        }
+    )
+    state = {
+        "current_section_index": 0,
+        "sections": [
+            {
+                "section_id": "1",
+                "verified_draft_json": verified.model_dump_json(),
+                "revision_count": 0,
+            }
+        ],
+    }
+    assert should_continue_after_verify(state) == "revise"
+
+
+def test_reference_assembler_uses_citeproc() -> None:
+    repository = FakeKnowledgeRepository()
+    result: ReferenceList = assemble_reference_list(
+        [
+            EvidenceItem(
+                source_key="S1",
+                chunk_id="chunk_1",
+                doc_id="doc_task",
+                verbatim_excerpt="原文",
+            )
+        ],
+        citation_style="gb-t-7714",
+        kb_repository=repository,
+        kb_id="kb",
+    )
+    assert result.items[0].citation_text == "张三. 数字人文研究. 出版研究, 2024(2): 10-20."

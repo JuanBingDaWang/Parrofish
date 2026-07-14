@@ -1,0 +1,858 @@
+"""LangGraph 写作流水线节点。
+
+每个节点 = 一个 LangGraph 状态转换函数，封装一个流水线步骤。
+通过 WritingPipeline 类实现依赖注入（persona_repository / retriever / siliconflow）。
+
+设计铁律检查点（每个节点注释中说明如何遵守八条铁律）。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from collections.abc import Callable
+from typing import TYPE_CHECKING
+
+from writing_factory.generate.models import (
+    AnnotatedOutline,
+    EvidenceItem,
+    GenerationContext,
+    GlobalPolishResult,
+    OutlineNode,
+    PolishedDraft,
+    PolishedSection,
+    SectionDraft,
+    StructureReview,
+    TermConsistencyReport,
+    ThesisStatement,
+    VerifiedDraft,
+)
+from writing_factory.orchestration.consistency import (
+    review_structure,
+    review_term_consistency,
+    run_global_polish,
+)
+from writing_factory.orchestration.reference_assembler import (
+    assemble_reference_list,
+    render_final_citation_markers,
+)
+from writing_factory.orchestration.state import (
+    MAX_REVISIONS_PER_SECTION,
+    PIPELINE_STATUS_ASSEMBLING,
+    PIPELINE_STATUS_DONE,
+    PIPELINE_STATUS_DRAFTING,
+    PIPELINE_STATUS_ERROR,
+    PIPELINE_STATUS_FRAMEWORK,
+    PIPELINE_STATUS_GLOBAL_POLISH,
+    PIPELINE_STATUS_POLISHING,
+    PIPELINE_STATUS_STRUCTURE_REVIEW,
+    PIPELINE_STATUS_VERIFYING,
+    SECTION_STATUS_DRAFTED,
+    SECTION_STATUS_ERROR,
+    SECTION_STATUS_PENDING,
+    SECTION_STATUS_POLISHED,
+    SECTION_STATUS_REVISING,
+    SECTION_STATUS_VERIFIED,
+    SectionState,
+    WritingState,
+)
+
+if TYPE_CHECKING:
+    from writing_factory.kb.retrieval import HybridRetriever
+    from writing_factory.llm.siliconflow import SiliconFlowClient
+    from writing_factory.store.kb_repository import KnowledgeBaseRepository
+    from writing_factory.store.persona_repository import PersonaRepository
+
+logger = logging.getLogger(__name__)
+
+# ── 辅助函数 ──────────────────────────────────────────────────
+
+
+def _ctx(state: WritingState) -> GenerationContext:
+    """从 state 反序列化 GenerationContext。"""
+    return GenerationContext.model_validate_json(state["context_json"])
+
+
+def _thesis(state: WritingState) -> ThesisStatement | None:
+    t = state.get("thesis_json")
+    return ThesisStatement.model_validate_json(t) if t else None
+
+
+def _outline(state: WritingState) -> AnnotatedOutline | None:
+    o = state.get("outline_json")
+    return AnnotatedOutline.model_validate_json(o) if o else None
+
+
+def _current_section(state: WritingState) -> dict | None:
+    """获取当前节的 SectionState dict。"""
+    idx = state.get("current_section_index", 0)
+    sections = state.get("sections", [])
+    if 0 <= idx < len(sections):
+        return sections[idx]
+    return None
+
+
+def _update_section(state: WritingState, updates: dict) -> list[dict]:
+    """更新当前节并返回新的 sections 列表。"""
+    idx = state["current_section_index"]
+    sections = list(state["sections"])
+    sections[idx] = {**sections[idx], **updates}
+    return sections
+
+
+# ── 节点类 ────────────────────────────────────────────────────
+
+
+class WritingPipeline:
+    """LangGraph 写作流水线节点集合。
+
+    通过构造函数注入外部依赖，每个方法可作为 LangGraph add_node 的回调。
+    """
+
+    def __init__(
+        self,
+        persona_repository: PersonaRepository,
+        retriever: HybridRetriever,
+        siliconflow: SiliconFlowClient,
+        kb_repository: KnowledgeBaseRepository,
+        progress: Callable[[int, str], None] | None = None,
+        check_cancelled: Callable[[], None] | None = None,
+    ) -> None:
+        self.persona_repository = persona_repository
+        self.retriever = retriever
+        self.siliconflow = siliconflow
+        self.kb_repository = kb_repository
+        self.progress = progress or (lambda _percent, _message: None)
+        self.check_cancelled = check_cancelled or (lambda: None)
+
+    # ── 节点：选题 ────────────────────────────────────────────
+    # 铁律遵守：
+    #   #1 persona 控文风 ✓ — 选题阶段用 persona 锐化角度，不是事实
+    #   #7 锚定论点 ✓ — 产出 ThesisStatement 即全篇锚
+    #   #8 生成阶段只读 ✓ — 不调用 write tool
+
+    def select_topic_node(self, state: WritingState) -> dict:
+        """选题节点：persona + KB 检索 → ThesisStatement。"""
+        from writing_factory.generate.topic_selection import select_topic
+
+        logger.info("节点: select_topic")
+        context = _ctx(state)
+
+        try:
+            thesis = select_topic(
+                context=context,
+                persona_repository=self.persona_repository,
+                retriever=self.retriever,
+                siliconflow=self.siliconflow,
+                progress=self.progress,
+                check_cancelled=self.check_cancelled,
+            )
+            return {
+                "thesis_json": thesis.model_dump_json(),
+                "status": PIPELINE_STATUS_FRAMEWORK,
+            }
+        except Exception as exc:
+            self.check_cancelled()
+            logger.exception("select_topic 失败")
+            return {"status": PIPELINE_STATUS_ERROR, "error": str(exc)}
+
+    # ── 节点：框架 ────────────────────────────────────────────
+    # 铁律遵守：
+    #   #1 persona 控文风 ✓ — 框架用 persona 定论证骨架
+    #   #2 事实先冻结 ✓ — 只在候选证据层面做映射，不写正文
+    #   #7 锚定论点 ✓ — 每个节点 rhetorical_purpose 指向 thesis
+
+    def build_framework_node(self, state: WritingState) -> dict:
+        """框架节点：thesis + persona + KB 检索 → AnnotatedOutline。"""
+        from writing_factory.generate.framework import build_framework
+
+        logger.info("节点: build_framework")
+        context = _ctx(state)
+        thesis = _thesis(state)
+        if thesis is None:
+            return {"status": PIPELINE_STATUS_ERROR, "error": "thesis 为 None"}
+
+        try:
+            outline = build_framework(
+                context=context,
+                thesis=thesis,
+                persona_repository=self.persona_repository,
+                retriever=self.retriever,
+                siliconflow=self.siliconflow,
+                progress=self.progress,
+                check_cancelled=self.check_cancelled,
+            )
+
+            # 初始化 sections 列表
+            sections: list[dict] = []
+            all_nodes = _flatten_outline_nodes(outline.root_nodes)
+            for node in all_nodes:
+                sections.append(
+                    SectionState(
+                        section_id=node.node_id,
+                        heading=node.heading,
+                        status=SECTION_STATUS_PENDING,
+                        draft_json=None,
+                        verified_draft_json=None,
+                        polished_section_json=None,
+                        revision_count=0,
+                        source_key_offset=0,
+                        previous_conclusion=None,
+                        next_purpose=None,
+                        error=None,
+                    )
+                )
+
+            return {
+                "outline_json": outline.model_dump_json(),
+                "term_registry_json": json.dumps(outline.term_registry, ensure_ascii=False),
+                "sections": sections,
+                "current_section_index": 0,
+                "source_key_counter": sum(len(node.candidate_evidence) for node in all_nodes),
+                "status": PIPELINE_STATUS_DRAFTING,
+            }
+        except Exception as exc:
+            self.check_cancelled()
+            logger.exception("build_framework 失败")
+            return {"status": PIPELINE_STATUS_ERROR, "error": str(exc)}
+
+    # ── 节点：起草 ────────────────────────────────────────────
+    # 铁律遵守：
+    #   #1 persona 控文风 ✓ — 起草用 persona 表达 DNA 写初稿
+    #   #2 事实先冻结 ✓ — 先锁定 EvidencePack 再写
+    #   #3 事实论断绑定 chunk ✓ — 每个 fact claim 必须有 source_key
+    #   #4 引用由代码拼装 ✓ — source_key 由代码分配，不由模型生成
+    #   #7 锚定论点 ✓ — thesis + outline 在每个起草胶囊中
+
+    def draft_section_node(self, state: WritingState) -> dict:
+        """起草节点：逐节检索证据 → 锁定 EvidencePack → LLM 起草。"""
+        from writing_factory.generate.drafting import draft_section
+
+        logger.info("节点: draft_section")
+        context = _ctx(state)
+        thesis = _thesis(state)
+        outline = _outline(state)
+        cur = _current_section(state)
+        if thesis is None or outline is None or cur is None:
+            return {"status": PIPELINE_STATUS_ERROR, "error": "缺少 thesis/outline/current_section"}
+
+        term_registry = json.loads(state.get("term_registry_json", "{}"))
+        is_revision = cur.get("revision_count", 0) > 0
+        source_key_offset = (
+            cur.get("source_key_offset", 0) if is_revision else state.get("source_key_counter", 0)
+        )
+        revision_feedback: list[dict[str, str]] = []
+        if is_revision and cur.get("verified_draft_json"):
+            previous_verification = VerifiedDraft.model_validate_json(cur["verified_draft_json"])
+            revision_feedback = [
+                {
+                    "claim_id": item.claim.claim_id,
+                    "verdict": item.verdict,
+                    "rationale": item.verifier_rationale,
+                }
+                for item in previous_verification.verified_claims
+                if item.verdict != "supported"
+            ]
+
+        # 找到当前提纲节点
+        all_nodes = _flatten_outline_nodes(outline.root_nodes)
+        idx = state["current_section_index"]
+        if idx >= len(all_nodes):
+            return {"status": PIPELINE_STATUS_ERROR, "error": f"section index {idx} 超出范围"}
+
+        outline_node = all_nodes[idx]
+
+        # 衔接上下文
+        previous_conclusion = None
+        next_purpose = None
+        if idx > 0:
+            prev_sec = state["sections"][idx - 1]
+            previous_conclusion = prev_sec.get("previous_conclusion")
+        if idx + 1 < len(all_nodes):
+            next_purpose = all_nodes[idx + 1].rhetorical_purpose
+
+        try:
+            section_draft = draft_section(
+                context=context,
+                thesis=thesis,
+                outline_node=outline_node,
+                term_registry=term_registry,
+                persona_repository=self.persona_repository,
+                retriever=self.retriever,
+                siliconflow=self.siliconflow,
+                previous_section_conclusion=previous_conclusion,
+                next_section_purpose=next_purpose,
+                source_key_offset=source_key_offset,
+                revision_feedback=revision_feedback,
+                prior_claims=json.loads(state.get("claims_made_json", "[]")),
+                progress=self.progress,
+                check_cancelled=self.check_cancelled,
+            )
+
+            # 更新 source_key_counter
+            key_numbers = [
+                int(item.source_key.removeprefix("S"))
+                for item in section_draft.evidence_pack.items
+                if item.source_key.removeprefix("S").isdigit()
+            ]
+            new_counter = (
+                state.get("source_key_counter", 0)
+                if is_revision
+                else max([state.get("source_key_counter", 0), *key_numbers])
+            )
+
+            # 提取本节结论（最后一段最后一句，用于下一节衔接）
+            conclusion = ""
+            if section_draft.paragraphs:
+                conclusion = section_draft.paragraphs[-1]
+
+            sections_update = _update_section(
+                state,
+                {
+                    "status": SECTION_STATUS_DRAFTED,
+                    "draft_json": section_draft.model_dump_json(),
+                    "verified_draft_json": None,
+                    "source_key_offset": source_key_offset,
+                    "previous_conclusion": conclusion,
+                    "next_purpose": next_purpose,
+                },
+            )
+
+            return {
+                "sections": sections_update,
+                "source_key_counter": new_counter,
+                "status": PIPELINE_STATUS_VERIFYING,
+            }
+        except Exception as exc:
+            self.check_cancelled()
+            logger.exception("draft_section 失败")
+            sections_update = _update_section(
+                state,
+                {
+                    "status": SECTION_STATUS_ERROR,
+                    "error": str(exc),
+                },
+            )
+            return {"sections": sections_update, "status": PIPELINE_STATUS_ERROR, "error": str(exc)}
+
+    # ── 节点：核对 ────────────────────────────────────────────
+    # 铁律遵守：
+    #   #5 不让作者校验自己 ✓ — 核对使用中性角色，不加载 persona
+    #   #2 事实先冻结 ✓ — 只检查 fact 类型 claim，不碰 interpretation/common
+    #   #4 引用由代码拼装 ✓ — 不产生新引用，只比对已有 source_key → chunk
+
+    def verify_section_node(self, state: WritingState) -> dict:
+        """核对节点：逐 claim 比对 chunk 原文 → 判定 supported/partial/unsupported。"""
+        from writing_factory.generate.verification import verify_section
+
+        logger.info("节点: verify_section")
+        cur = _current_section(state)
+        if cur is None:
+            return {"status": PIPELINE_STATUS_ERROR, "error": "current_section 为 None"}
+
+        draft_json = cur.get("draft_json")
+        if draft_json is None:
+            return {"status": PIPELINE_STATUS_ERROR, "error": "draft_json 为 None"}
+
+        section_draft = SectionDraft.model_validate_json(draft_json)
+
+        try:
+            verified = verify_section(
+                section_draft=section_draft,
+                siliconflow=self.siliconflow,
+                progress=self.progress,
+                check_cancelled=self.check_cancelled,
+            )
+
+            sections_update = _update_section(
+                state,
+                {
+                    "status": SECTION_STATUS_VERIFIED,
+                    "verified_draft_json": verified.model_dump_json(),
+                },
+            )
+
+            return {
+                "sections": sections_update,
+                "status": PIPELINE_STATUS_POLISHING,
+            }
+        except Exception as exc:
+            self.check_cancelled()
+            logger.exception("verify_section 失败")
+            sections_update = _update_section(
+                state,
+                {
+                    "status": SECTION_STATUS_ERROR,
+                    "error": str(exc),
+                },
+            )
+            return {"sections": sections_update, "status": PIPELINE_STATUS_ERROR, "error": str(exc)}
+
+    def fail_verification_node(self, state: WritingState) -> dict:
+        """Stop the pipeline rather than publishing claims that failed verification."""
+
+        cur = _current_section(state)
+        section_id = cur.get("section_id", "?") if cur else "?"
+        message = f"节 {section_id} 在最大修订次数后仍有未通过核对的事实论断"
+        if cur is not None:
+            sections_update = _update_section(
+                state,
+                {"status": SECTION_STATUS_ERROR, "error": message},
+            )
+        else:
+            sections_update = state.get("sections", [])
+        return {
+            "sections": sections_update,
+            "status": PIPELINE_STATUS_ERROR,
+            "error": message,
+        }
+
+    # ── 节点：打磨 ────────────────────────────────────────────
+    # 铁律遵守：
+    #   #1 persona 控文风 ✓ — 打磨用 persona 表达 DNA 润色文风
+    #   #2 事实先冻结 ✓ — 此时 fact claim 已全部核对，打磨只做纯文风
+    #   #5 不让作者校验自己 ✓ — 打磨后轻量核对使用中性角色
+    #   #4 引用由代码拼装 ✓ — 打磨不修改 source_key 引用标记
+
+    def polish_section_node(self, state: WritingState) -> dict:
+        """打磨节点：persona 表达 DNA + 已核对草稿 → 成稿 + 防漂移检查。"""
+        from writing_factory.generate.polishing import polish_section
+
+        logger.info("节点: polish_section")
+        thesis = _thesis(state)
+        cur = _current_section(state)
+        if thesis is None or cur is None:
+            return {"status": PIPELINE_STATUS_ERROR, "error": "缺少 thesis/current_section"}
+
+        verified_json = cur.get("verified_draft_json")
+        if verified_json is None:
+            return {"status": PIPELINE_STATUS_ERROR, "error": "verified_draft_json 为 None"}
+
+        verified_draft = VerifiedDraft.model_validate_json(verified_json)
+
+        # 需要从 draft 中取段落文本
+        draft_json = cur.get("draft_json")
+        if draft_json is None:
+            return {
+                "status": PIPELINE_STATUS_ERROR,
+                "error": "draft_json 为 None（打磨需要原始段落）",
+            }
+
+        section_draft = SectionDraft.model_validate_json(draft_json)
+
+        # 加载 persona spec
+        context = _ctx(state)
+        persona_spec = self.persona_repository.load_runtime(context.persona_id or "")
+        if persona_spec is None:
+            return {
+                "status": PIPELINE_STATUS_ERROR,
+                "error": f"persona '{context.persona_id}' 未就绪",
+            }
+        persona_spec_json = persona_spec.model_dump(mode="json")
+
+        try:
+            polished = polish_section(
+                verified_draft=verified_draft,
+                persona_spec_json=persona_spec_json,
+                thesis=thesis,
+                section_heading=cur["heading"],
+                section_paragraphs=section_draft.paragraphs,
+                siliconflow=self.siliconflow,
+                progress=self.progress,
+                check_cancelled=self.check_cancelled,
+            )
+
+            sections_update = _update_section(
+                state,
+                {
+                    "status": SECTION_STATUS_POLISHED,
+                    "polished_section_json": polished.model_dump_json(),
+                },
+            )
+            existing_claims = json.loads(state.get("claims_made_json", "[]"))
+            accepted_claims = [
+                item.claim.text
+                for item in verified_draft.verified_claims
+                if item.verdict == "supported"
+            ]
+            claims_made = list(dict.fromkeys([*existing_claims, *accepted_claims]))
+
+            return {
+                "sections": sections_update,
+                "claims_made_json": json.dumps(claims_made, ensure_ascii=False),
+                "status": PIPELINE_STATUS_POLISHING,  # 下一节或组装
+            }
+        except Exception as exc:
+            self.check_cancelled()
+            logger.exception("polish_section 失败")
+            sections_update = _update_section(
+                state,
+                {
+                    "status": SECTION_STATUS_ERROR,
+                    "error": str(exc),
+                },
+            )
+            return {"sections": sections_update, "status": PIPELINE_STATUS_ERROR, "error": str(exc)}
+
+    # ── 节点：组装 ────────────────────────────────────────────
+    # 铁律遵守：
+    #   #4 引用由代码拼装不由模型敲 ✓ — 引用列表由 reference_assembler 纯代码生成
+
+    def assemble_node(self, state: WritingState) -> dict:
+        """组装节点：拼接各节 polished_text + 代码生成参考文献列表。"""
+        logger.info("节点: assemble")
+
+        thesis = _thesis(state)
+        if thesis is None:
+            return {"status": PIPELINE_STATUS_ERROR, "error": "thesis 为 None"}
+
+        # 收集所有 polished sections
+        polished_sections: list[PolishedSection] = []
+        all_evidence_items: list[EvidenceItem] = []
+
+        for sec in state.get("sections", []):
+            ps_json = sec.get("polished_section_json")
+            if ps_json:
+                ps = PolishedSection.model_validate_json(ps_json)
+                if ps.fact_drift_detected:
+                    return {
+                        "status": PIPELINE_STATUS_ERROR,
+                        "error": f"节 {ps.section_id} 的打磨结果未通过事实冻结安全门",
+                    }
+                polished_sections.append(ps)
+            else:
+                return {
+                    "status": PIPELINE_STATUS_ERROR,
+                    "error": f"节 {sec.get('section_id', '?')} 缺少打磨结果",
+                }
+
+            draft_json = sec.get("draft_json")
+            verified_json = sec.get("verified_draft_json")
+            if not draft_json or not verified_json:
+                return {
+                    "status": PIPELINE_STATUS_ERROR,
+                    "error": f"节 {sec.get('section_id', '?')} 缺少草稿或核对结果",
+                }
+            sd = SectionDraft.model_validate_json(draft_json)
+            verified = VerifiedDraft.model_validate_json(verified_json)
+            if verified.unsupported_count or verified.partial_count:
+                return {
+                    "status": PIPELINE_STATUS_ERROR,
+                    "error": f"节 {verified.section_id} 仍有未通过核对的事实论断",
+                }
+            cited_keys = {
+                key
+                for item in verified.verified_claims
+                if item.claim.claim_type == "fact" and item.verdict == "supported"
+                for key in item.claim.source_keys
+            }
+            all_evidence_items.extend(
+                item for item in sd.evidence_pack.items if item.source_key in cited_keys
+            )
+
+        # 代码拼装参考文献列表（铁律 #4）
+        context = _ctx(state)
+        try:
+            reference_list = assemble_reference_list(
+                evidence_items=all_evidence_items,
+                citation_style=context.citation_style,
+                kb_repository=self.kb_repository,
+                kb_id=context.kb_id,
+            )
+            rendered_sections = render_final_citation_markers(
+                polished_sections,
+                reference_list,
+            )
+        except Exception as exc:
+            self.check_cancelled()
+            logger.exception("assemble_reference_list 失败")
+            return {"status": PIPELINE_STATUS_ERROR, "error": f"引用拼装失败: {exc}"}
+
+        # 组装最终稿
+        final_draft = PolishedDraft(
+            title=(thesis.suggested_title or context.task_description.splitlines()[0][:100]),
+            sections=rendered_sections,
+            reference_list=reference_list,
+            thesis=thesis,
+            fact_drift_free=all(not ps.fact_drift_detected for ps in rendered_sections),
+        )
+
+        return {
+            "reference_list_json": reference_list.model_dump_json(),
+            "final_draft_json": final_draft.model_dump_json(),
+            "status": PIPELINE_STATUS_DONE,
+        }
+
+    # ── 节点：术语一致性审查 ────────────────────────────────────
+    # 铁律遵守：
+    #   #7 锚定论点 ✓ — 检查术语一致性，确保全文概念统一
+    #   #5 不让作者校验自己 ✓ — 使用中性角色
+
+    def term_consistency_node(self, state: WritingState) -> dict:
+        """术语一致性审查节点：检查全篇术语使用是否一致。"""
+        logger.info("节点: term_consistency")
+
+        term_registry = json.loads(state.get("term_registry_json", "{}"))
+        if not term_registry:
+            logger.warning("term_registry 为空，跳过术语审查")
+            return {
+                "term_consistency_json": TermConsistencyReport().model_dump_json(),
+                "status": PIPELINE_STATUS_STRUCTURE_REVIEW,
+            }
+
+        try:
+            report = review_term_consistency(
+                term_registry=term_registry,
+                sections=state.get("sections", []),
+                siliconflow=self.siliconflow,
+                check_cancelled=self.check_cancelled,
+            )
+            return {
+                "term_consistency_json": report.model_dump_json(),
+                "status": PIPELINE_STATUS_STRUCTURE_REVIEW,
+            }
+        except Exception as exc:
+            self.check_cancelled()
+            logger.exception("term_consistency 失败")
+            return {
+                "term_consistency_json": TermConsistencyReport(
+                    reviewer_note=f"术语审查异常: {exc}",
+                ).model_dump_json(),
+                "status": PIPELINE_STATUS_STRUCTURE_REVIEW,
+            }
+
+    # ── 节点：结构审查 ──────────────────────────────────────────
+    # 铁律遵守：
+    #   #7 锚定论点 ✓ — 评估论证结构是否与 thesis 一致
+
+    def structure_review_node(self, state: WritingState) -> dict:
+        """结构审查节点：检查全文结构平衡、逻辑推进、过渡衔接。"""
+        logger.info("节点: structure_review")
+
+        thesis = _thesis(state)
+        if thesis is None:
+            return {"status": PIPELINE_STATUS_ERROR, "error": "thesis 为 None"}
+
+        outline = _outline(state)
+        if outline is None:
+            return {"status": PIPELINE_STATUS_ERROR, "error": "outline 为 None"}
+
+        # 扁平化提纲节点
+        all_nodes = _flatten_outline_nodes(outline.root_nodes)
+        outline_nodes = [
+            {
+                "node_id": n.node_id,
+                "heading": n.heading,
+                "rhetorical_purpose": n.rhetorical_purpose,
+            }
+            for n in all_nodes
+        ]
+
+        try:
+            review = review_structure(
+                thesis_text=thesis.thesis_text,
+                outline_nodes=outline_nodes,
+                sections=state.get("sections", []),
+                siliconflow=self.siliconflow,
+                check_cancelled=self.check_cancelled,
+            )
+            return {
+                "structure_review_json": review.model_dump_json(),
+                "status": PIPELINE_STATUS_GLOBAL_POLISH,
+            }
+        except Exception as exc:
+            self.check_cancelled()
+            logger.exception("structure_review 失败")
+            return {
+                "structure_review_json": StructureReview(
+                    overall_assessment=f"结构审查异常: {exc}",
+                ).model_dump_json(),
+                "status": PIPELINE_STATUS_GLOBAL_POLISH,
+            }
+
+    # ── 节点：全局一致性打磨（1M 上下文） ────────────────────────
+    # 铁律遵守：
+    #   #2 事实先冻结 ✓ — 只做术语/过渡，不改事实
+    #   #4 引用由代码拼装 ✓ — 不修改 source_key
+    #   #7 锚定论点 ✓ — 对照 thesis 检查整体一致性
+
+    def global_polish_node(self, state: WritingState) -> dict:
+        """全局打磨节点：利用 1M 上下文做全篇一致性审查与过渡润色。"""
+        logger.info("节点: global_polish")
+
+        thesis = _thesis(state)
+        if thesis is None:
+            return {"status": PIPELINE_STATUS_ERROR, "error": "thesis 为 None"}
+
+        # 加载已有审查报告（可选）
+        term_report: TermConsistencyReport | None = None
+        tcr = state.get("term_consistency_json")
+        if tcr:
+            try:
+                term_report = TermConsistencyReport.model_validate_json(tcr)
+            except Exception:
+                pass
+
+        struct_review: StructureReview | None = None
+        sr = state.get("structure_review_json")
+        if sr:
+            try:
+                struct_review = StructureReview.model_validate_json(sr)
+            except Exception:
+                pass
+
+        try:
+            result = run_global_polish(
+                thesis_text=thesis.thesis_text,
+                sections=state.get("sections", []),
+                siliconflow=self.siliconflow,
+                term_consistency_report=term_report,
+                structure_review=struct_review,
+                check_cancelled=self.check_cancelled,
+            )
+
+            # 将全局打磨后的各节文本写回 sections 状态
+            sections_update = _apply_global_polish_sections(
+                sections=state.get("sections", []),
+                global_result=result,
+            )
+
+            return {
+                "sections": sections_update,
+                "global_polish_json": result.model_dump_json(),
+                "status": PIPELINE_STATUS_ASSEMBLING,
+            }
+        except Exception as exc:
+            self.check_cancelled()
+            logger.exception("global_polish 失败")
+            return {
+                "global_polish_json": json.dumps(
+                    {
+                        "sections": [],
+                        "transitions_added": [],
+                        "global_consistency_notes": f"全局打磨异常: {exc}，已跳过此步骤。",
+                    },
+                    ensure_ascii=False,
+                ),
+                "status": PIPELINE_STATUS_ASSEMBLING,
+            }
+
+
+# ── 路由函数 ──────────────────────────────────────────────────
+
+
+def should_continue_after_verify(state: WritingState) -> str:
+    """核对后决定：继续打磨还是回退修订。
+
+    Returns:
+        "polish": 无 unsupported claim，进入打磨
+        "revise": 存在 unsupported 且未达最大修订次数，回退起草
+        "error": 达到最大修订次数
+    """
+    cur = _current_section(state)
+    if cur is None:
+        return "error"
+
+    verified_json = cur.get("verified_draft_json")
+    if verified_json is None:
+        return "error"
+
+    verified = VerifiedDraft.model_validate_json(verified_json)
+    revision_count = cur.get("revision_count", 0)
+
+    if verified.unsupported_count == 0 and verified.partial_count == 0:
+        return "polish"
+
+    if revision_count < MAX_REVISIONS_PER_SECTION:
+        return "revise"
+
+    logger.warning(
+        "节 %s 达到最大修订次数 %d，仍有 %d unsupported / %d partial",
+        cur.get("section_id"),
+        MAX_REVISIONS_PER_SECTION,
+        verified.unsupported_count,
+        verified.partial_count,
+    )
+    return "error"
+
+
+def should_continue_after_polish(state: WritingState) -> str:
+    """打磨后决定：下一节还是组装。
+
+    Returns:
+        "next_section": 还有未处理的节
+        "assemble": 所有节已完成
+    """
+    sections = state.get("sections", [])
+    current_idx = state.get("current_section_index", 0)
+
+    if current_idx + 1 < len(sections):
+        return "next_section"
+
+    return "assemble"
+
+
+def prepare_next_section(state: WritingState) -> dict:
+    """将 current_section_index 推进到下一节。"""
+    return {
+        "current_section_index": state["current_section_index"] + 1,
+        "status": PIPELINE_STATUS_DRAFTING,
+    }
+
+
+def prepare_revise_section(state: WritingState) -> dict:
+    """增加修订计数，回到起草状态。"""
+    cur = _current_section(state)
+    if cur is None:
+        return {"status": PIPELINE_STATUS_ERROR, "error": "revise: current_section 为 None"}
+    sections_update = _update_section(
+        state,
+        {
+            "status": SECTION_STATUS_REVISING,
+            "revision_count": cur.get("revision_count", 0) + 1,
+        },
+    )
+    return {"sections": sections_update, "status": PIPELINE_STATUS_DRAFTING}
+
+
+# ── 内部工具 ──────────────────────────────────────────────────
+
+
+def _flatten_outline_nodes(nodes: list[OutlineNode]) -> list[OutlineNode]:
+    """DFS 展开提纲树为线性列表（先根遍历）。"""
+    result: list[OutlineNode] = []
+    for node in nodes:
+        result.append(node)
+        result.extend(_flatten_outline_nodes(node.children))
+    return result
+
+
+def _apply_global_polish_sections(
+    sections: list[dict],
+    global_result: GlobalPolishResult,
+) -> list[dict]:
+    """将全局打磨后的各节文本写回 SectionState 列表。
+
+    GlobalPolishResult 中的 sections 按顺序对应原始 sections。
+    只更新 polished_section_json，保留其他字段不变。
+
+    Args:
+        sections: 原始 SectionState 列表。
+        global_result: 全局打磨结果。
+
+    Returns:
+        更新后的 sections 列表。
+    """
+    result_sections = list(sections)
+    polished_map: dict[str, str] = {}
+    for ps in global_result.sections:
+        polished_map[ps.section_id] = ps.model_dump_json()
+
+    for i, sec in enumerate(result_sections):
+        sid = sec.get("section_id", "")
+        if sid in polished_map:
+            result_sections[i] = {
+                **sec,
+                "polished_section_json": polished_map[sid],
+            }
+    return result_sections

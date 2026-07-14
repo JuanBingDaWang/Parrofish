@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from writing_factory.config import Settings, load_settings
-from writing_factory.config.logging import configure_logging
+from writing_factory.config.logging import configure_logging, shutdown_logging
 from writing_factory.distill.academic_pipeline import AcademicDistillationEngine
 from writing_factory.distill.extraction import PersonaMapExtractor
 from writing_factory.distill.fidelity import FidelityService, PersonaFidelityEvaluator
@@ -23,7 +23,7 @@ from writing_factory.kb.retrieval import (
 )
 from writing_factory.llm import MinerUClient, SiliconFlowClient
 from writing_factory.llm.common import DynamicConcurrencyGate
-from writing_factory.store import Database, RuntimeSettingsRepository
+from writing_factory.store import Database, ProjectRepository, RuntimeSettingsRepository
 from writing_factory.store.bm25_index import BM25Index
 from writing_factory.store.kb_repository import KnowledgeBaseRepository
 from writing_factory.store.persona_repository import PersonaRepository
@@ -46,6 +46,7 @@ class ApplicationContext:
     sparse_retriever: SparseRetriever
     hybrid_retriever: HybridRetriever
     persona_repository: PersonaRepository
+    project_repository: ProjectRepository
     distillation: DistillationService
     fidelity: FidelityService
     default_kb_id: str
@@ -55,6 +56,7 @@ class ApplicationContext:
 
         self.siliconflow.close()
         self.mineru.close()
+        shutdown_logging()
 
     def set_siliconflow_concurrency(self, value: int) -> None:
         """持久化并立即应用全局 SiliconFlow 并发上限。"""
@@ -106,6 +108,8 @@ def build_application(settings: Settings | None = None) -> ApplicationContext:
     vectors = LanceVectorIndex(resolved.lancedb_path)
     bm25 = BM25Index(repository)
     persona_repository = PersonaRepository(database)
+    project_repository = ProjectRepository(database)
+    project_repository.ensure_default(default_kb_id)
     ingestion = IngestionService(
         resolved,
         repository,
@@ -149,6 +153,7 @@ def build_application(settings: Settings | None = None) -> ApplicationContext:
         sparse_retriever=SparseRetriever(bm25),
         hybrid_retriever=HybridRetriever(repository, vectors, bm25, siliconflow),
         persona_repository=persona_repository,
+        project_repository=project_repository,
         distillation=distillation,
         fidelity=FidelityService(
             persona_repository,

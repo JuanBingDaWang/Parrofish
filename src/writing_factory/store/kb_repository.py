@@ -421,6 +421,41 @@ class KnowledgeBaseRepository:
             )
         return documents
 
+    def get_bibliographies(self, kb_id: str, doc_ids: set[str]) -> dict[str, Bibliography]:
+        """Return full Bibliography objects for a set of doc_ids.
+
+        Used by the reference assembler to format citations per style
+        (GB/T 7714, APA, MLA).
+        """
+        if not doc_ids:
+            return {}
+
+        placeholders = ",".join("?" for _ in doc_ids)
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT d.doc_id, d.bib_json
+                FROM documents d
+                JOIN knowledge_base_documents kbd ON kbd.doc_id = d.doc_id
+                WHERE kbd.kb_id = ? AND kbd.status = 'ready'
+                  AND d.doc_id IN ({placeholders})
+                """,
+                [kb_id] + sorted(doc_ids),
+            ).fetchall()
+
+        result: dict[str, Bibliography] = {}
+        for row in rows:
+            bib_dict = json.loads(row["bib_json"])
+            result[row["doc_id"]] = Bibliography(
+                author=bib_dict.get("author"),
+                title=bib_dict.get("title", ""),
+                year=bib_dict.get("year"),
+                publisher_or_journal=bib_dict.get("publisher_or_journal"),
+                document_type=bib_dict.get("document_type"),
+                extra=bib_dict.get("extra", {}),
+            )
+        return result
+
     def list_documents(self, kb_id: str) -> list[dict[str, object]]:
         """Return document metadata and status for the minimal KB interface."""
 

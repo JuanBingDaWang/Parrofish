@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -136,6 +137,138 @@ def main() -> int:
         task_context.report_progress(100, "自检完成")
         return result
 
+    def run_writing_pipeline(
+        persona_id: str,
+        task_description: str,
+        domain: str,
+        context: TaskContext,
+        task_id: str,
+        selected_doc_ids: set[str],
+        explicitly_allowed_persona_doc_ids: set[str],
+        resume: bool = False,
+    ) -> dict:
+        from writing_factory.orchestration.pipeline_runner import (
+            run_writing_pipeline_with_progress,
+        )
+
+        app_context.project_repository.mark_task_status(task_id, "running")
+        try:
+            result = run_writing_pipeline_with_progress(
+                persona_id=persona_id,
+                task_description=task_description,
+                domain=domain,
+                context=context,
+                siliconflow=app_context.siliconflow,
+                retriever=app_context.hybrid_retriever,
+                persona_repository=app_context.persona_repository,
+                kb_repository=app_context.repository,
+                checkpoint_dir=app_context.settings.data_dir / "checkpoints",
+                kb_id=app_context.default_kb_id,
+                citation_style=app_context.settings.citation_style,
+                task_id=task_id,
+                selected_doc_ids=selected_doc_ids,
+                explicitly_allowed_persona_doc_ids=explicitly_allowed_persona_doc_ids,
+                resume=resume,
+            )
+        except Exception:
+            if context.is_cancelled:
+                app_context.project_repository.mark_task_status(task_id, "cancelled")
+            else:
+                app_context.project_repository.mark_task_status(task_id, "error")
+            raise
+        app_context.project_repository.update_task_state(task_id, result)
+        return result
+
+    def evaluate_generation(
+        thesis_json: str,
+        draft_json: str,
+        context: dict,
+        task_context: TaskContext,
+    ) -> dict | None:
+        """Run Stage 7 evaluation on a completed draft.
+
+        This is optional — the writing pipeline can run without it.
+        Returns a dict with keys: faithfulness, judge, judge_rationale, injection
+        or None if evaluation is not available.
+        """
+        try:
+            from writing_factory.eval.run_eval import EvaluationRunner
+            from writing_factory.eval.traceability import evidence_context_from_state
+
+            runner = EvaluationRunner(
+                siliconflow=app_context.siliconflow,
+                database=app_context.database,
+            )
+
+            # Parse draft text
+            draft_data = json.loads(draft_json) if isinstance(draft_json, str) else draft_json
+            sections = draft_data.get("sections", [])
+            draft_text = "\n\n".join(
+                s.get("polished_text", "") for s in sections if s.get("polished_text")
+            )
+            thesis_text = ""
+            thesis_data = json.loads(thesis_json) if isinstance(thesis_json, str) else thesis_json
+            if isinstance(thesis_data, dict):
+                thesis_text = thesis_data.get("thesis_text", thesis_data.get("angle", ""))
+
+            evidence_context = evidence_context_from_state(context)
+
+            task_context.report_progress(10, "引用可溯性评估")
+            traceability = runner.evaluate_traceability(
+                context,
+                persist=True,
+                kb_id=app_context.default_kb_id,
+                pipeline_run_id=context.get("task_id"),
+            )
+
+            # Faithfulness
+            task_context.report_progress(20, "忠实度评估")
+            faithfulness_result = runner.evaluate_faithfulness(
+                question=thesis_text or "（无论点）",
+                answer=draft_text or "（无正文）",
+                context=evidence_context,
+                persist=True,
+                kb_id=app_context.default_kb_id,
+                pipeline_run_id=context.get("task_id"),
+            )
+
+            # LLM Judge
+            task_context.report_progress(50, "裁判评分")
+            judge_result = runner.evaluate_judge(
+                thesis=thesis_text or "（无论点）",
+                draft=draft_text or "（无正文）",
+                persist=True,
+                kb_id=app_context.default_kb_id,
+                pipeline_run_id=context.get("task_id"),
+            )
+
+            # Injection
+            task_context.report_progress(80, "注入检测")
+            injection_verdict = runner.check_injection(draft_text)
+
+            task_context.report_progress(100, "评估完成")
+            evaluation = {
+                "faithfulness": round(faithfulness_result.score, 4)
+                if faithfulness_result
+                else None,
+                "traceability": round(traceability.verified_support_ratio, 4),
+                "hallucination_rate": round(traceability.hallucination_rate, 4),
+                "traceability_passed": traceability.passed,
+                "judge": round(judge_result.overall_score, 4) if judge_result else None,
+                "judge_rationale": judge_result.judge_rationale if judge_result else None,
+                "judge_error": judge_result.evaluation_error if judge_result else None,
+                "injection": injection_verdict.risk_level if injection_verdict else None,
+            }
+            task_id = context.get("task_id")
+            if task_id:
+                app_context.project_repository.save_evaluation(task_id, evaluation)
+            return evaluation
+        except Exception as exc:
+            logger = __import__("logging").getLogger(__name__)
+            logger.exception("阶段 7 评估失败")
+            task_context.report_progress(100, f"评估失败: {exc}")
+            return {"error": str(exc)}
+
     window = MainWindow(
         check_siliconflow,
         ingest_document=ingest_document,
@@ -156,7 +289,36 @@ def main() -> int:
         get_retrieval_option=app_context.get_retrieval_option,
         set_retrieval_option=app_context.set_retrieval_option,
         retrieve=retrieve,
+        run_writing_pipeline=run_writing_pipeline,
+        evaluate_generation=evaluate_generation,
+        list_projects=app_context.project_repository.list_projects,
+        create_project=lambda title, description: app_context.project_repository.create_project(
+            kb_id=app_context.default_kb_id,
+            title=title,
+            description=description,
+        ),
+        update_project=lambda project_id, title, description: (
+            app_context.project_repository.update_project(
+                project_id,
+                title=title,
+                description=description,
+            )
+        ),
+        delete_projects=app_context.project_repository.delete_projects,
+        create_writing_task=lambda **kwargs: app_context.project_repository.create_task(
+            kb_id=app_context.default_kb_id,
+            citation_style=app_context.settings.citation_style,
+            **kwargs,
+        ),
+        list_writing_tasks=app_context.project_repository.list_tasks,
+        load_writing_task=app_context.project_repository.get_task,
+        save_edited_draft=app_context.project_repository.save_edited_draft,
+        delete_writing_tasks=app_context.project_repository.delete_tasks,
     )
     application.aboutToQuit.connect(app_context.close)
     window.show()
     return application.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

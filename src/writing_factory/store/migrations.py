@@ -267,6 +267,60 @@ MIGRATIONS: tuple[str, ...] = (
     CREATE INDEX IF NOT EXISTS idx_persona_specs_profile_version
         ON persona_specs(profile_id, version_number DESC);
     """,
+    """
+    CREATE TABLE IF NOT EXISTS generation_evaluations (
+        evaluation_id TEXT PRIMARY KEY,
+        kb_id TEXT,
+        task_description TEXT,
+        pipeline_run_id TEXT,
+        evaluation_type TEXT NOT NULL,
+        score REAL NOT NULL,
+        pass_threshold REAL,
+        passed INTEGER NOT NULL DEFAULT 0,
+        result_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_gen_eval_type
+        ON generation_evaluations(evaluation_type, created_at DESC);
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS projects (
+        project_id TEXT PRIMARY KEY,
+        kb_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS writing_tasks (
+        task_id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+        kb_id TEXT NOT NULL,
+        persona_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        task_description TEXT NOT NULL,
+        domain TEXT NOT NULL DEFAULT '',
+        citation_style TEXT NOT NULL DEFAULT 'gb-t-7714',
+        selected_doc_ids_json TEXT NOT NULL,
+        allowed_persona_doc_ids_json TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL DEFAULT 'pending',
+        state_json TEXT,
+        edited_draft_text TEXT,
+        edited_outline_text TEXT,
+        evaluation_json TEXT,
+        error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_writing_tasks_project_updated
+        ON writing_tasks(project_id, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_writing_tasks_status
+        ON writing_tasks(status, updated_at DESC);
+    """,
 )
 
 
