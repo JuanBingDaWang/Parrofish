@@ -331,6 +331,7 @@ def test_pipeline_state_updates_sections_partial_draft_and_diagnostics(qtbot) ->
                 "heading": "第二节",
                 "status": "revising",
                 "revision_count": 2,
+                "recovery_revision_count": 1,
                 "elapsed_seconds": 30,
             },
         ],
@@ -342,6 +343,7 @@ def test_pipeline_state_updates_sections_partial_draft_and_diagnostics(qtbot) ->
     assert page.section_table.rowCount() == 2
     assert page.section_table.item(0, 2).text() == "✓ 完成"
     assert page.section_table.item(0, 3).text() == "1"
+    assert page.section_table.item(1, 3).text() == "2+恢复1/2"
     assert page.section_table.item(0, 4).text() == "02:05"
     assert "已经保存的第一节正文" in page._draft_view.toPlainText()
     assert "检索辅助文本" in page.diagnostic_output_view.toPlainText()

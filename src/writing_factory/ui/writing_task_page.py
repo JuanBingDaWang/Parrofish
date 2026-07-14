@@ -44,6 +44,7 @@ from PyQt6.QtWidgets import (
 
 from writing_factory.generate.models import GenerationOptions
 from writing_factory.orchestration.state import (
+    MAX_RECOVERY_REVISIONS_PER_SECTION,
     PIPELINE_STATUS_ASSEMBLING,
     PIPELINE_STATUS_DONE,
     PIPELINE_STATUS_DRAFTING,
@@ -1217,7 +1218,7 @@ class WritingTaskPage(QWidget):
                     str(section.get("status", "")),
                     str(section.get("status", "")),
                 ),
-                str(section.get("revision_count", 0)),
+                self._format_revision_count(section),
                 self._format_section_elapsed(section.get("elapsed_seconds")),
             )
             for column, value in enumerate(values):
@@ -1231,6 +1232,14 @@ class WritingTaskPage(QWidget):
             return "—"
         seconds = max(0, round(value))
         return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+    @staticmethod
+    def _format_revision_count(section: dict[str, Any]) -> str:
+        normal = int(section.get("revision_count", 0))
+        recovery = int(section.get("recovery_revision_count", 0))
+        if recovery:
+            return f"{normal}+恢复{recovery}/{MAX_RECOVERY_REVISIONS_PER_SECTION}"
+        return str(normal)
 
     def _pipeline_succeeded(self, result: Any) -> None:
         if not isinstance(result, dict):

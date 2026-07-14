@@ -29,6 +29,7 @@ from writing_factory.orchestration.reference_assembler import (
     render_final_citation_markers,
 )
 from writing_factory.orchestration.state import (
+    MAX_RECOVERY_REVISIONS_PER_SECTION,
     MAX_REVISIONS_PER_SECTION,
     PIPELINE_STATUS_DONE,
     PIPELINE_STATUS_ERROR,
@@ -53,6 +54,7 @@ __all__ = [
     "review_term_consistency",
     "review_structure",
     "run_global_polish",
+    "MAX_RECOVERY_REVISIONS_PER_SECTION",
     "MAX_REVISIONS_PER_SECTION",
     "PIPELINE_STATUS_DONE",
     "PIPELINE_STATUS_EVIDENCE_PREFETCH",

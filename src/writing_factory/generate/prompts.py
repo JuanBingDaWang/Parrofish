@@ -334,7 +334,7 @@ def drafting_messages(
     term_registry: dict[str, str],
     previous_section_conclusion: str | None = None,
     next_section_purpose: str | None = None,
-    revision_feedback: list[dict[str, str]] | None = None,
+    revision_feedback: list[dict[str, object]] | None = None,
     prior_claims: list[str] | None = None,
     target_length_chars: int | None = None,
 ) -> list[dict[str, str]]:
@@ -397,6 +397,15 @@ def drafting_messages(
         request["rules"].append(
             "这是核对未通过后的修订：必须逐条处理 mandatory_revision_feedback，"
             "不得原样重复被判为 partial 或 unsupported 的事实论断。"
+        )
+        request["rules"].extend(
+            [
+                "unsupported 论断必须删除，或严格缩写为冻结证据逐字摘录能够支持的范围；"
+                "不得仅替换 source_key 来保留原论断。",
+                "partial 论断必须收缩到核验理由指出的受支持范围。",
+                "只有不再包含可外部核验事实时，才可降格为 interpretation；降格后不得携带"
+                " source_key，也不得用判断句伪装原事实论断。",
+            ]
         )
     if prior_claims:
         payload["claims_already_made"] = prior_claims

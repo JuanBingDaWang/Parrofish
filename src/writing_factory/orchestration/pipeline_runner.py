@@ -33,14 +33,26 @@ from uuid import uuid4
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-from writing_factory.generate.models import GenerationContext, GenerationOptions, PolishedSection
+from writing_factory.generate.models import (
+    GenerationContext,
+    GenerationOptions,
+    PolishedSection,
+    VerifiedDraft,
+)
 from writing_factory.generate.source_policy import build_persona_generation_source_policy
+from writing_factory.orchestration.errors import PipelineNodeError
 from writing_factory.orchestration.graph import (
     build_writing_graph,
     close_writing_graph,
     create_initial_state,
 )
-from writing_factory.orchestration.state import PIPELINE_STATUS_DONE, PIPELINE_STATUS_ERROR
+from writing_factory.orchestration.state import (
+    MAX_RECOVERY_REVISIONS_PER_SECTION,
+    PIPELINE_STATUS_DONE,
+    PIPELINE_STATUS_DRAFTING,
+    PIPELINE_STATUS_ERROR,
+    SECTION_STATUS_REVISING,
+)
 
 if TYPE_CHECKING:
     from writing_factory.kb.retrieval import HybridRetriever
@@ -158,9 +170,10 @@ def run_writing_pipeline_with_progress(
     config = {"configurable": {"thread_id": resolved_task_id}}
 
     try:
-        report_progress(0, "初始化流水线")
         context.check_cancelled()
-        report_progress(2, "编译写作流水线图")
+        if not resume:
+            report_progress(0, "初始化流水线")
+            report_progress(2, "编译写作流水线图")
         graph = build_writing_graph(
             persona_repository=persona_repository,
             retriever=retriever,
@@ -170,10 +183,28 @@ def run_writing_pipeline_with_progress(
             progress=report_activity,
             check_cancelled=context.check_cancelled,
         )
+        if resume:
+            current = graph.get_state(config)
+            if current is not None:
+                pending_node = current.next[0] if current.next else ""
+                last_reported_percent = max(
+                    last_reported_percent,
+                    _checkpoint_progress(pending_node, dict(current.values)),
+                )
+            context.report_progress(last_reported_percent, "读取写作断点")
         graph_input = None if resume else initial
-        stream_config = _legacy_resume_config(graph, config) if resume else config
-        if stream_config is not config:
-            report_progress(last_reported_percent, "恢复升级前的失败断点")
+        stream_config = config
+        if resume:
+            stream_config = _legacy_resume_config(graph, config)
+            if stream_config is not config:
+                report_progress(last_reported_percent, "恢复升级前的失败断点")
+            else:
+                stream_config, recovered = _verification_recovery_config(graph, config)
+                if recovered:
+                    report_progress(
+                        last_reported_percent,
+                        "安全门失败节已进入受控恢复修订",
+                    )
         for event in graph.stream(graph_input, stream_config):
             context.check_cancelled()
 
@@ -264,6 +295,73 @@ def _legacy_resume_config(graph, config: dict[str, Any]) -> dict[str, Any]:
     return config
 
 
+def _verification_recovery_config(
+    graph,
+    config: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """Turn a pending verification failure into a bounded repair checkpoint."""
+
+    current = graph.get_state(config)
+    if current is None or "fail_verification" not in current.next:
+        return config, False
+
+    state = dict(current.values)
+    sections = list(state.get("sections", []))
+    index = state.get("current_section_index")
+    if not isinstance(index, int) or not 0 <= index < len(sections):
+        raise PipelineNodeError("事实核对恢复", "安全门断点缺少有效的当前章节")
+
+    section = dict(sections[index])
+    verified_json = section.get("verified_draft_json")
+    if not verified_json:
+        raise PipelineNodeError("事实核对恢复", "安全门断点缺少结构化核对结果")
+    verified = VerifiedDraft.model_validate_json(verified_json)
+    failed = [item for item in verified.verified_claims if item.verdict != "supported"]
+    if not failed:
+        raise PipelineNodeError("事实核对恢复", "安全门断点中没有可供修复的失败论断")
+
+    recovery_count = int(section.get("recovery_revision_count", 0))
+    if recovery_count >= MAX_RECOVERY_REVISIONS_PER_SECTION:
+        details = "；".join(
+            f"{item.claim.claim_id}({','.join(item.claim.source_keys) or '无来源键'})："
+            f"{item.verifier_rationale[:180]}"
+            for item in failed[:5]
+        )
+        raise PipelineNodeError(
+            "事实核对恢复",
+            "额外恢复修订已用尽"
+            f"（{recovery_count}/{MAX_RECOVERY_REVISIONS_PER_SECTION}）"
+            f"，仍未通过：{details}",
+        )
+
+    section.update(
+        {
+            "status": SECTION_STATUS_REVISING,
+            "recovery_revision_count": recovery_count + 1,
+            "polished_section_json": None,
+            "error": None,
+        }
+    )
+    sections[index] = section
+    updated_config = graph.update_state(
+        config,
+        {
+            "sections": sections,
+            "status": PIPELINE_STATUS_DRAFTING,
+            "error": None,
+        },
+        as_node="prepare_revise_section",
+    )
+    logger.info(
+        "恢复事实核对安全门断点: section=%s recovery=%d/%d failed_claims=%s",
+        section.get("section_id"),
+        recovery_count + 1,
+        MAX_RECOVERY_REVISIONS_PER_SECTION,
+        [item.claim.claim_id for item in failed],
+    )
+    return updated_config, True
+
+
 def _checkpoint_progress(node_name: str, state: dict[str, Any]) -> int:
     """Compute overall progress exclusively from committed checkpoint state."""
 
@@ -309,6 +407,7 @@ def summarize_writing_state(state: dict[str, Any]) -> dict[str, Any]:
             "heading": section.get("heading", ""),
             "status": section.get("status", "pending"),
             "revision_count": section.get("revision_count", 0),
+            "recovery_revision_count": section.get("recovery_revision_count", 0),
             "target_length_chars": section.get("target_length_chars"),
             "elapsed_seconds": section.get("elapsed_seconds", 0.0),
         }

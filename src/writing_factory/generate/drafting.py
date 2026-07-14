@@ -56,7 +56,7 @@ def draft_section(
     siliconflow: SiliconFlowClient,
     previous_section_conclusion: str | None = None,
     next_section_purpose: str | None = None,
-    revision_feedback: list[dict[str, str]] | None = None,
+    revision_feedback: list[dict[str, object]] | None = None,
     prior_claims: list[str] | None = None,
     target_length_chars: int | None = None,
     evidence_pack: EvidencePack | None = None,

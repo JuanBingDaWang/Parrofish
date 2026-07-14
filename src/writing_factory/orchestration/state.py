@@ -24,6 +24,7 @@ class SectionState(TypedDict, total=False):
     polished_section_json: str | None  # PolishedSection.model_dump_json()
     # 修订计数（防止无限循环）
     revision_count: int
+    recovery_revision_count: int
     source_key_offset: int
     target_length_chars: int
     elapsed_seconds: float
@@ -107,3 +108,6 @@ PIPELINE_STATUS_ERROR = "error"
 
 # 每节最多修订次数
 MAX_REVISIONS_PER_SECTION = 3
+
+# 人工继续安全门失败任务后，额外允许的受控恢复修订次数
+MAX_RECOVERY_REVISIONS_PER_SECTION = 2

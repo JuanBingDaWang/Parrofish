@@ -47,6 +47,7 @@ from writing_factory.orchestration.reference_assembler import (
     render_final_citation_markers,
 )
 from writing_factory.orchestration.state import (
+    MAX_RECOVERY_REVISIONS_PER_SECTION,
     MAX_REVISIONS_PER_SECTION,
     PIPELINE_STATUS_ASSEMBLING,
     PIPELINE_STATUS_DONE,
@@ -280,6 +281,7 @@ class WritingPipeline:
                         verified_draft_json=None,
                         polished_section_json=None,
                         revision_count=0,
+                        recovery_revision_count=0,
                         source_key_offset=0,
                         target_length_chars=section_budget,
                         elapsed_seconds=0.0,
@@ -400,7 +402,8 @@ class WritingPipeline:
             raise ValueError("缺少论点、提纲或当前章节")
 
         term_registry = json.loads(state.get("term_registry_json", "{}"))
-        is_revision = cur.get("revision_count", 0) > 0
+        recovery_revision_count = cur.get("recovery_revision_count", 0)
+        is_revision = cur.get("revision_count", 0) > 0 or recovery_revision_count > 0
         frozen_evidence_json = cur.get("evidence_pack_json")
         if not frozen_evidence_json and is_revision and cur.get("draft_json"):
             legacy_draft = SectionDraft.model_validate_json(cur["draft_json"])
@@ -421,8 +424,17 @@ class WritingPipeline:
             revision_feedback = [
                 {
                     "claim_id": item.claim.claim_id,
+                    "claim_text": item.claim.text,
+                    "claim_type": item.claim.claim_type,
+                    "source_keys": list(item.claim.source_keys),
                     "verdict": item.verdict,
                     "rationale": item.verifier_rationale,
+                    "required_action": (
+                        "删除该事实论断，或缩写到冻结证据明确支持的范围；"
+                        "不得只更换引用键。"
+                        if item.verdict == "unsupported"
+                        else "把论断收缩到核验理由指出的受支持范围。"
+                    ),
                 }
                 for item in previous_verification.verified_claims
                 if item.verdict != "supported"
@@ -447,11 +459,15 @@ class WritingPipeline:
 
         try:
             started_at = time.perf_counter()
-            version_label = (
-                f"修订 {cur.get('revision_count', 0)}"
-                if is_revision
-                else "初稿"
-            )
+            if recovery_revision_count:
+                version_label = (
+                    "恢复修订 "
+                    f"{recovery_revision_count}/{MAX_RECOVERY_REVISIONS_PER_SECTION}"
+                )
+            elif is_revision:
+                version_label = f"修订 {cur.get('revision_count', 0)}"
+            else:
+                version_label = "初稿"
             stage = getattr(self.siliconflow, "stream_stage", None)
             with (
                 stage(f"章节起草 · {outline_node.heading} · {version_label}")
@@ -599,7 +615,28 @@ class WritingPipeline:
 
         cur = _current_section(state)
         section_id = cur.get("section_id", "?") if cur else "?"
-        message = f"节 {section_id} 在最大修订次数后仍有未通过核对的事实论断"
+        if cur is None or not cur.get("verified_draft_json"):
+            raise PipelineNodeError("事实核对安全门", f"节 {section_id} 缺少核对结果")
+        verified = VerifiedDraft.model_validate_json(cur["verified_draft_json"])
+        failed = [item for item in verified.verified_claims if item.verdict != "supported"]
+        details = "；".join(
+            f"{item.claim.claim_id}={item.verdict}"
+            f"({','.join(item.claim.source_keys) or '无来源键'})："
+            f"{item.verifier_rationale[:180]}"
+            for item in failed[:5]
+        )
+        recovery_count = cur.get("recovery_revision_count", 0)
+        recovery_note = (
+            f"，恢复修订 {recovery_count}/{MAX_RECOVERY_REVISIONS_PER_SECTION}"
+            if recovery_count
+            else ""
+        )
+        message = (
+            f"节 {section_id} 在普通修订 {cur.get('revision_count', 0)}/"
+            f"{MAX_REVISIONS_PER_SECTION}{recovery_note} 后仍有未通过核对的事实论断"
+        )
+        if details:
+            message = f"{message}：{details}"
         raise PipelineNodeError("事实核对安全门", message)
 
     # ── 节点：打磨 ────────────────────────────────────────────
@@ -1060,6 +1097,7 @@ def should_continue_after_verify(state: WritingState) -> str:
 
     verified = VerifiedDraft.model_validate_json(verified_json)
     revision_count = cur.get("revision_count", 0)
+    recovery_revision_count = cur.get("recovery_revision_count", 0)
 
     if verified.unsupported_count == 0 and verified.partial_count == 0:
         return "polish"
@@ -1067,10 +1105,15 @@ def should_continue_after_verify(state: WritingState) -> str:
     if revision_count < MAX_REVISIONS_PER_SECTION:
         return "revise"
 
+    if 0 < recovery_revision_count < MAX_RECOVERY_REVISIONS_PER_SECTION:
+        return "revise"
+
     logger.warning(
-        "节 %s 达到最大修订次数 %d，仍有 %d unsupported / %d partial",
+        "节 %s 达到修订上限 %d + 恢复修订 %d/%d，仍有 %d unsupported / %d partial",
         cur.get("section_id"),
         MAX_REVISIONS_PER_SECTION,
+        recovery_revision_count,
+        MAX_RECOVERY_REVISIONS_PER_SECTION,
         verified.unsupported_count,
         verified.partial_count,
     )
@@ -1106,13 +1149,15 @@ def prepare_revise_section(state: WritingState) -> dict:
     cur = _current_section(state)
     if cur is None:
         raise PipelineNodeError("章节修订准备", "缺少当前章节")
-    sections_update = _update_section(
-        state,
-        {
-            "status": SECTION_STATUS_REVISING,
-            "revision_count": cur.get("revision_count", 0) + 1,
-        },
-    )
+    revision_count = cur.get("revision_count", 0)
+    updates = {"status": SECTION_STATUS_REVISING}
+    if revision_count < MAX_REVISIONS_PER_SECTION:
+        updates["revision_count"] = revision_count + 1
+    else:
+        updates["recovery_revision_count"] = (
+            cur.get("recovery_revision_count", 0) + 1
+        )
+    sections_update = _update_section(state, updates)
     return {"sections": sections_update, "status": PIPELINE_STATUS_DRAFTING}
 
 

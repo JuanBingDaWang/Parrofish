@@ -24,6 +24,7 @@ from writing_factory.generate.models import (
     StructureReview,
     TermConsistencyReport,
     ThesisStatement,
+    VerifiedClaim,
     VerifiedDraft,
 )
 from writing_factory.generate.prompts import drafting_messages, verification_messages
@@ -31,10 +32,15 @@ from writing_factory.generate.verification import verify_section
 from writing_factory.kb.models import Bibliography, FusedHit, RetrievalResult
 from writing_factory.llm.models import ChatResult
 from writing_factory.orchestration.errors import PipelineNodeError
-from writing_factory.orchestration.nodes import WritingPipeline, should_continue_after_verify
+from writing_factory.orchestration.nodes import (
+    WritingPipeline,
+    prepare_revise_section,
+    should_continue_after_verify,
+)
 from writing_factory.orchestration.pipeline_runner import (
     _checkpoint_progress,
     _legacy_resume_config,
+    _verification_recovery_config,
     run_writing_pipeline_with_progress,
 )
 from writing_factory.orchestration.reference_assembler import assemble_reference_list
@@ -256,11 +262,12 @@ def test_full_writing_graph_runs_offline(tmp_path: Path) -> None:
 
     resumed_client = FakeSiliconFlow()
     resumed_client.responses.clear()
+    resumed_context = FakeTaskContext()
     resumed = run_writing_pipeline_with_progress(
         persona_id="persona_1",
         task_description="讨论数字人文方法",
         domain="数字人文",
-        context=FakeTaskContext(),
+        context=resumed_context,
         siliconflow=resumed_client,
         retriever=FakeRetriever(kb_repository),
         persona_repository=FakePersonaRepository(),
@@ -273,6 +280,10 @@ def test_full_writing_graph_runs_offline(tmp_path: Path) -> None:
     )
     assert resumed["status"] == "done"
     assert resumed_client.calls == []
+    assert [percent for percent, _message in resumed_context.progress] == sorted(
+        percent for percent, _message in resumed_context.progress
+    )
+    assert resumed_context.progress[0][1] == "读取写作断点"
 
 
 def test_evidence_prefetch_is_concurrent_and_keeps_outline_order() -> None:
@@ -473,6 +484,17 @@ def test_revision_recovers_frozen_evidence_and_strips_prior_source_keys(monkeypa
         ],
         evidence_pack=frozen,
     )
+    failed_verification = VerifiedDraft(
+        section_id="3",
+        verified_claims=[
+            VerifiedClaim(
+                claim=old_draft.claims[0],
+                verdict="unsupported",
+                verifier_rationale="S96 没有支持这项事实。",
+            )
+        ],
+        unsupported_count=1,
+    )
     captured: dict[str, object] = {}
 
     def fake_draft_section(**kwargs):
@@ -508,6 +530,7 @@ def test_revision_recovers_frozen_evidence_and_strips_prior_source_keys(monkeypa
                     "revision_count": 1,
                     "source_key_offset": 92,
                     "draft_json": old_draft.model_dump_json(),
+                    "verified_draft_json": failed_verification.model_dump_json(),
                 }
             ],
             "current_section_index": 0,
@@ -518,6 +541,17 @@ def test_revision_recovers_frozen_evidence_and_strips_prior_source_keys(monkeypa
 
     assert captured["evidence_pack"] == frozen
     assert captured["prior_claims"] == ["前文事实。"]
+    assert captured["revision_feedback"] == [
+        {
+            "claim_id": "c1",
+            "claim_text": "冻结事实。",
+            "claim_type": "fact",
+            "source_keys": ["S96"],
+            "verdict": "unsupported",
+            "rationale": "S96 没有支持这项事实。",
+            "required_action": "删除该事实论断，或缩写到冻结证据明确支持的范围；不得只更换引用键。",
+        }
+    ]
     assert EvidencePack.model_validate_json(
         result["sections"][0]["evidence_pack_json"]
     ) == frozen
@@ -772,6 +806,110 @@ def test_legacy_terminal_error_rewinds_to_latest_healthy_pending_checkpoint() ->
     selected = _legacy_resume_config(graph, thread_config)
 
     assert selected == healthy.config
+
+
+def test_pending_verification_gate_becomes_bounded_recovery_revision() -> None:
+    claim = Claim(
+        claim_id="sec3_clm3",
+        text="没有证据支持的事实。[S95]",
+        claim_type="fact",
+        source_keys=["S95"],
+        paragraph_index=0,
+    )
+    verified = VerifiedDraft(
+        section_id="3",
+        verified_claims=[
+            VerifiedClaim(
+                claim=claim,
+                verdict="unsupported",
+                verifier_rationale="S95 与该事实无关。",
+            )
+        ],
+        unsupported_count=1,
+    )
+    state = {
+        "status": "polishing",
+        "current_section_index": 0,
+        "sections": [
+            {
+                "section_id": "3",
+                "status": "verified",
+                "revision_count": 3,
+                "verified_draft_json": verified.model_dump_json(),
+            }
+        ],
+    }
+    captured: dict[str, object] = {}
+
+    class RecoveryGraph:
+        def get_state(self, _config):
+            return SimpleNamespace(values=state, next=("fail_verification",))
+
+        def update_state(self, config, values, *, as_node):
+            captured.update(config=config, values=values, as_node=as_node)
+            return {"configurable": {"thread_id": "task", "checkpoint_id": "recovery"}}
+
+    config = {"configurable": {"thread_id": "task"}}
+
+    selected, recovered = _verification_recovery_config(RecoveryGraph(), config)
+
+    assert recovered
+    assert selected["configurable"]["checkpoint_id"] == "recovery"
+    assert captured["as_node"] == "prepare_revise_section"
+    values = captured["values"]
+    assert values["status"] == "drafting"
+    assert values["sections"][0]["revision_count"] == 3
+    assert values["sections"][0]["recovery_revision_count"] == 1
+    assert values["sections"][0]["status"] == "revising"
+
+
+def test_recovery_revision_has_separate_two_attempt_limit() -> None:
+    claim = Claim(
+        claim_id="c1",
+        text="事实。[S1]",
+        claim_type="fact",
+        source_keys=["S1"],
+        paragraph_index=0,
+    )
+    verified = VerifiedDraft(
+        section_id="3",
+        verified_claims=[
+            VerifiedClaim(
+                claim=claim,
+                verdict="unsupported",
+                verifier_rationale="证据不支持。",
+            )
+        ],
+        unsupported_count=1,
+    )
+    section = {
+        "section_id": "3",
+        "status": "verified",
+        "revision_count": 3,
+        "recovery_revision_count": 1,
+        "verified_draft_json": verified.model_dump_json(),
+    }
+    state = {"current_section_index": 0, "sections": [section]}
+
+    assert should_continue_after_verify(state) == "revise"
+    prepared = prepare_revise_section(state)
+    assert prepared["sections"][0]["revision_count"] == 3
+    assert prepared["sections"][0]["recovery_revision_count"] == 2
+
+    exhausted = {**state, "sections": [{**section, "recovery_revision_count": 2}]}
+    assert should_continue_after_verify(exhausted) == "error"
+
+    graph = SimpleNamespace(
+        get_state=lambda _config: SimpleNamespace(
+            values=exhausted,
+            next=("fail_verification",),
+        )
+    )
+    with pytest.raises(PipelineNodeError, match="额外恢复修订已用尽.*c1.*证据不支持"):
+        _verification_recovery_config(
+            graph,
+            {"configurable": {"thread_id": "task"}},
+        )
 
 
 def test_fact_claim_requires_source_and_inline_marker() -> None:
