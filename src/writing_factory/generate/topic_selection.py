@@ -129,9 +129,10 @@ def select_topic(
         thinking=True,
         reasoning_effort="high",
         temperature=0.3,
-        max_tokens=2048,
+        max_tokens=8192,
         response_format="json_object",
         seed=42,
+        stream=True,
     )
 
     progress(85, "解析选题结果")

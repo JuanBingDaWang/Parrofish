@@ -245,7 +245,6 @@ class PersonaSynthesizer:
                 seed=17,
                 response_format="json_object",
                 use_cache=True,
-                request_timeout_seconds=1200.0,
                 request_attempts=2,
                 stream=True,
             )
@@ -322,7 +321,6 @@ class PersonaSynthesizer:
                 seed=19,
                 response_format="json_object",
                 use_cache=True,
-                request_timeout_seconds=600.0,
                 request_attempts=2,
                 stream=False,
             )

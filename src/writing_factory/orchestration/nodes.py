@@ -11,12 +11,16 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable
-from functools import wraps
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
+from contextvars import copy_context
+from functools import partial, wraps
 from typing import TYPE_CHECKING
 
 from writing_factory.generate.models import (
     AnnotatedOutline,
     EvidenceItem,
+    EvidencePack,
     GenerationContext,
     GlobalPolishResult,
     OutlineNode,
@@ -43,6 +47,7 @@ from writing_factory.orchestration.state import (
     PIPELINE_STATUS_ASSEMBLING,
     PIPELINE_STATUS_DONE,
     PIPELINE_STATUS_DRAFTING,
+    PIPELINE_STATUS_EVIDENCE_PREFETCH,
     PIPELINE_STATUS_FRAMEWORK,
     PIPELINE_STATUS_GLOBAL_POLISH,
     PIPELINE_STATUS_POLISHING,
@@ -135,7 +140,6 @@ class WritingPipeline:
         retriever: HybridRetriever,
         siliconflow: SiliconFlowClient,
         kb_repository: KnowledgeBaseRepository,
-        framework_generation_timeout_seconds: float = 900.0,
         progress: Callable[[int, str], None] | None = None,
         check_cancelled: Callable[[], None] | None = None,
     ) -> None:
@@ -143,7 +147,6 @@ class WritingPipeline:
         self.retriever = retriever
         self.siliconflow = siliconflow
         self.kb_repository = kb_repository
-        self.framework_generation_timeout_seconds = framework_generation_timeout_seconds
         self.progress = progress or (lambda _percent, _message: None)
         self.check_cancelled = check_cancelled or (lambda: None)
 
@@ -203,7 +206,6 @@ class WritingPipeline:
                 persona_repository=self.persona_repository,
                 retriever=self.retriever,
                 siliconflow=self.siliconflow,
-                request_timeout_seconds=self.framework_generation_timeout_seconds,
                 progress=self.progress,
                 check_cancelled=self.check_cancelled,
             )
@@ -217,6 +219,7 @@ class WritingPipeline:
                         section_id=node.node_id,
                         heading=node.heading,
                         status=SECTION_STATUS_PENDING,
+                        evidence_pack_json=None,
                         draft_json=None,
                         verified_draft_json=None,
                         polished_section_json=None,
@@ -233,13 +236,89 @@ class WritingPipeline:
                 "term_registry_json": json.dumps(outline.term_registry, ensure_ascii=False),
                 "sections": sections,
                 "current_section_index": 0,
-                "source_key_counter": sum(len(node.candidate_evidence) for node in all_nodes),
+                "source_key_counter": _largest_source_key(outline),
                 "status": PIPELINE_STATUS_DRAFTING,
             }
         except Exception:
             self.check_cancelled()
             logger.exception("build_framework 失败")
             raise
+
+    # ── 节点：并发预取并冻结逐节证据 ───────────────────────────
+    # 铁律遵守：
+    #   #2 事实先冻结 ✓ — 先完成所有 EvidencePack，再开始正文起草
+    #   #3 事实论断绑定 chunk ✓ — 每条证据保留 chunk 与页码锚点
+    #   #4 引用由代码拼装 ✓ — 每节预留固定、互不重叠的 source_key 区间
+
+    @_pipeline_node("章节证据预取")
+    def prefetch_evidence_node(self, state: WritingState) -> dict:
+        """并发检索各节证据，并把冻结证据包写入可恢复状态。"""
+
+        from writing_factory.generate.drafting import build_evidence_pack_for_section
+
+        logger.info("节点: prefetch_evidence")
+        context = _ctx(state)
+        thesis = _thesis(state)
+        outline = _outline(state)
+        if thesis is None or outline is None:
+            raise ValueError("缺少论点或提纲，无法预取章节证据")
+
+        all_nodes = _flatten_outline_nodes(outline.root_nodes)
+        if not all_nodes:
+            raise ValueError("提纲没有可起草的章节")
+        self.progress(10, f"并发预取章节证据（0/{len(all_nodes)}）")
+        sections = list(state.get("sections", []))
+        if len(sections) != len(all_nodes):
+            raise ValueError("章节状态与提纲节点数量不一致")
+
+        base_offset = state.get("source_key_counter", 0)
+        key_span = 8
+        gate = getattr(getattr(self.siliconflow, "transport", None), "concurrency_gate", None)
+        worker_limit = max(1, min(len(all_nodes), getattr(gate, "limit", 3)))
+
+        def retrieve(index: int) -> tuple[int, EvidencePack]:
+            self.check_cancelled()
+            node = all_nodes[index]
+            stage = getattr(self.siliconflow, "stream_stage", None)
+            with stage(f"证据预取 · {node.heading}") if stage else nullcontext():
+                pack = build_evidence_pack_for_section(
+                    context=context,
+                    thesis=thesis,
+                    outline_node=node,
+                    retriever=self.retriever,
+                    siliconflow=self.siliconflow,
+                    source_key_offset=base_offset + index * key_span,
+                    check_cancelled=self.check_cancelled,
+                )
+            return index, pack
+
+        packs: dict[int, EvidencePack] = {}
+        with ThreadPoolExecutor(
+            max_workers=worker_limit,
+            thread_name_prefix="evidence-prefetch",
+        ) as executor:
+            futures = []
+            for index in range(len(all_nodes)):
+                task_context = copy_context()
+                futures.append(executor.submit(task_context.run, retrieve, index))
+            for completed, future in enumerate(as_completed(futures), start=1):
+                self.check_cancelled()
+                index, pack = future.result()
+                packs[index] = pack
+                self.progress(10, f"并发预取章节证据（{completed}/{len(all_nodes)}）")
+
+        for index, section in enumerate(sections):
+            sections[index] = {
+                **section,
+                "evidence_pack_json": packs[index].model_dump_json(),
+                "source_key_offset": base_offset + index * key_span,
+            }
+
+        return {
+            "sections": sections,
+            "source_key_counter": base_offset + len(all_nodes) * key_span,
+            "status": PIPELINE_STATUS_EVIDENCE_PREFETCH,
+        }
 
     # ── 节点：起草 ────────────────────────────────────────────
     # 铁律遵守：
@@ -264,8 +343,16 @@ class WritingPipeline:
 
         term_registry = json.loads(state.get("term_registry_json", "{}"))
         is_revision = cur.get("revision_count", 0) > 0
+        frozen_evidence_json = cur.get("evidence_pack_json")
+        frozen_evidence = (
+            EvidencePack.model_validate_json(frozen_evidence_json)
+            if frozen_evidence_json
+            else None
+        )
         source_key_offset = (
-            cur.get("source_key_offset", 0) if is_revision else state.get("source_key_counter", 0)
+            cur.get("source_key_offset", 0)
+            if frozen_evidence is not None or is_revision
+            else state.get("source_key_counter", 0)
         )
         revision_feedback: list[dict[str, str]] = []
         if is_revision and cur.get("verified_draft_json"):
@@ -311,6 +398,7 @@ class WritingPipeline:
                 source_key_offset=source_key_offset,
                 revision_feedback=revision_feedback,
                 prior_claims=json.loads(state.get("claims_made_json", "[]")),
+                evidence_pack=frozen_evidence,
                 progress=self.progress,
                 check_cancelled=self.check_cancelled,
             )
@@ -321,11 +409,7 @@ class WritingPipeline:
                 for item in section_draft.evidence_pack.items
                 if item.source_key.removeprefix("S").isdigit()
             ]
-            new_counter = (
-                state.get("source_key_counter", 0)
-                if is_revision
-                else max([state.get("source_key_counter", 0), *key_numbers])
-            )
+            new_counter = max([state.get("source_key_counter", 0), *key_numbers])
 
             # 提取本节结论（最后一段最后一句，用于下一节衔接）
             conclusion = ""
@@ -568,6 +652,72 @@ class WritingPipeline:
     #   #7 锚定论点 ✓ — 检查术语一致性，确保全文概念统一
     #   #5 不让作者校验自己 ✓ — 使用中性角色
 
+    @_pipeline_node("全文并行审查")
+    def parallel_reviews_node(self, state: WritingState) -> dict:
+        """并发执行互不依赖的术语审查与结构审查。"""
+
+        logger.info("节点: parallel_reviews")
+        self.progress(78, "并行审查术语与全文结构")
+        thesis = _thesis(state)
+        outline = _outline(state)
+        if thesis is None or outline is None:
+            raise ValueError("缺少论点或提纲，无法执行全文审查")
+
+        term_registry = json.loads(state.get("term_registry_json", "{}"))
+        outline_nodes = [
+            {
+                "node_id": node.node_id,
+                "heading": node.heading,
+                "rhetorical_purpose": node.rhetorical_purpose,
+            }
+            for node in _flatten_outline_nodes(outline.root_nodes)
+        ]
+        sections = state.get("sections", [])
+
+        def staged_call(label: str, call):
+            stage = getattr(self.siliconflow, "stream_stage", None)
+            with stage(label) if stage else nullcontext():
+                return call()
+
+        if term_registry:
+            term_call = partial(
+                staged_call,
+                "术语一致性审查",
+                partial(
+                    review_term_consistency,
+                    term_registry=term_registry,
+                    sections=sections,
+                    siliconflow=self.siliconflow,
+                    check_cancelled=self.check_cancelled,
+                ),
+            )
+        else:
+            term_call = TermConsistencyReport
+        structure_call = partial(
+            staged_call,
+            "全文结构审查",
+            partial(
+                review_structure,
+                thesis_text=thesis.thesis_text,
+                outline_nodes=outline_nodes,
+                sections=sections,
+                siliconflow=self.siliconflow,
+                check_cancelled=self.check_cancelled,
+            ),
+        )
+
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="writing-review") as executor:
+            term_future = executor.submit(copy_context().run, term_call)
+            structure_future = executor.submit(copy_context().run, structure_call)
+            term_report = term_future.result()
+            structure_report = structure_future.result()
+        self.check_cancelled()
+        return {
+            "term_consistency_json": term_report.model_dump_json(),
+            "structure_review_json": structure_report.model_dump_json(),
+            "status": PIPELINE_STATUS_GLOBAL_POLISH,
+        }
+
     @_pipeline_node("术语一致性审查")
     def term_consistency_node(self, state: WritingState) -> dict:
         """术语一致性审查节点：检查全篇术语使用是否一致。"""
@@ -652,6 +802,7 @@ class WritingPipeline:
     def global_polish_node(self, state: WritingState) -> dict:
         """全局打磨节点：利用 1M 上下文做全篇一致性审查与过渡润色。"""
         logger.info("节点: global_polish")
+        self.progress(88, "全局一致性打磨")
 
         thesis = _thesis(state)
         if thesis is None:
@@ -788,6 +939,18 @@ def _flatten_outline_nodes(nodes: list[OutlineNode]) -> list[OutlineNode]:
         result.append(node)
         result.extend(_flatten_outline_nodes(node.children))
     return result
+
+
+def _largest_source_key(outline: AnnotatedOutline) -> int:
+    """Return the largest numeric source key already assigned by the framework."""
+
+    numbers = [
+        int(item.source_key.removeprefix("S"))
+        for node in _flatten_outline_nodes(outline.root_nodes)
+        for item in node.candidate_evidence
+        if item.source_key.removeprefix("S").isdigit()
+    ]
+    return max(numbers, default=0)
 
 
 def _apply_global_polish_sections(

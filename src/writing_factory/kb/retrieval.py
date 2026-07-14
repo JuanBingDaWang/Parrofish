@@ -8,6 +8,7 @@ import threading
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from typing import Any
 
 from writing_factory.kb.fusion import fuse_many
@@ -257,8 +258,16 @@ class HybridRetriever:
     def _expand_query(self, request: RetrievalRequest) -> tuple[list[str], str | None]:
         if request.use_rewrite and request.use_hyde:
             with ThreadPoolExecutor(max_workers=2, thread_name_prefix="query-expand") as executor:
-                rewrite_future = executor.submit(self.rewriter.rewrite, request.query)
-                hyde_future = executor.submit(self.rewriter.hyde_passage, request.query)
+                rewrite_future = executor.submit(
+                    copy_context().run,
+                    self.rewriter.rewrite,
+                    request.query,
+                )
+                hyde_future = executor.submit(
+                    copy_context().run,
+                    self.rewriter.hyde_passage,
+                    request.query,
+                )
                 rewritten = rewrite_future.result()
                 hyde_query = hyde_future.result()
         else:

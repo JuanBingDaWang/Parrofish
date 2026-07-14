@@ -57,6 +57,7 @@ def draft_section(
     next_section_purpose: str | None = None,
     revision_feedback: list[dict[str, str]] | None = None,
     prior_claims: list[str] | None = None,
+    evidence_pack: EvidencePack | None = None,
     source_key_offset: int = 0,
     progress: ProgressCallback = _no_progress,
     check_cancelled: CancellationCheck = _no_cancellation,
@@ -84,6 +85,7 @@ def draft_section(
         siliconflow: SiliconFlow 客户端
         previous_section_conclusion: 上一节结论（用于衔接）
         next_section_purpose: 下一节目的（用于铺垫）
+        evidence_pack: 上游已冻结的证据包；传入后不再重复检索
         source_key_offset: source_key 起始偏移量（跨节全局递增）
         progress: 进度回调
         check_cancelled: 取消检查回调
@@ -107,37 +109,25 @@ def draft_section(
         raise ValueError(f"persona '{context.persona_id}' 未就绪")
     persona_json = persona_spec.model_dump(mode="json")
 
-    # ── 2. 检索本节证据 ──────────────────────────────────────────────
-    progress(10, f"检索证据 — {outline_node.heading}")
-    check_cancelled()
-
-    section_query = _build_section_query(thesis, outline_node)
-    retrieval_request = RetrievalRequest(
-        kb_id=context.kb_id,
-        query=section_query,
-        top_k=8,
-        filters=task_document_filter(context),
-        use_rerank=True,
-    )
-    retrieval_result = retriever.search(
-        retrieval_request,
-        progress=progress,
-        check_cancelled=check_cancelled,
-    )
-    enforce_retrieval_safety(retrieval_result, siliconflow)
-
-    # ── 3. 锁定 EvidencePack ─────────────────────────────────────────
-    progress(30, f"锁定证据包 — {outline_node.heading}")
-    check_cancelled()
-
-    evidence_pack = _build_evidence_pack(
-        outline_node=outline_node,
-        retrieval_result=retrieval_result,
-        source_key_offset=source_key_offset,
-        repository=retriever.repository,
-        kb_id=context.kb_id,
-        seed_items=_outline_evidence_items(outline_node),
-    )
+    # ── 2–3. 检索并冻结证据，或复用上游并发预取的冻结结果 ────────────
+    if evidence_pack is None:
+        progress(10, f"检索证据 — {outline_node.heading}")
+        check_cancelled()
+        evidence_pack = build_evidence_pack_for_section(
+            context=context,
+            thesis=thesis,
+            outline_node=outline_node,
+            retriever=retriever,
+            siliconflow=siliconflow,
+            source_key_offset=source_key_offset,
+            progress=progress,
+            check_cancelled=check_cancelled,
+        )
+    else:
+        progress(30, f"使用已冻结证据包 — {outline_node.heading}")
+        check_cancelled()
+        if evidence_pack.section_id != outline_node.node_id:
+            raise ValueError("冻结证据包与当前提纲节点不匹配")
     logger.info(
         "证据包锁定: node=%s, %d items",
         outline_node.node_id,
@@ -165,13 +155,13 @@ def draft_section(
 
     result = siliconflow.chat(
         messages,
-        thinking=True,
-        reasoning_effort="high",
+        thinking=False,
         temperature=0.5,
-        max_tokens=4096,
+        max_tokens=8192,
         response_format="json_object",
         seed=42,
         use_cache=not revision_feedback,
+        stream=True,
     )
 
     progress(85, f"解析草稿 — {outline_node.heading}")
@@ -200,6 +190,7 @@ def build_evidence_pack_for_section(
     thesis: ThesisStatement,
     outline_node: OutlineNode,
     retriever: HybridRetriever,
+    siliconflow: SiliconFlowClient,
     source_key_offset: int = 0,
     progress: ProgressCallback = _no_progress,
     check_cancelled: CancellationCheck = _no_cancellation,
@@ -221,7 +212,7 @@ def build_evidence_pack_for_section(
         progress=progress,
         check_cancelled=check_cancelled,
     )
-    enforce_retrieval_safety(retrieval_result, retriever.siliconflow)
+    enforce_retrieval_safety(retrieval_result, siliconflow)
     return _build_evidence_pack(
         outline_node=outline_node,
         retrieval_result=retrieval_result,

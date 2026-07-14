@@ -71,11 +71,13 @@ _WEIGHT_ASSEMBLE = 5
 _NODE_LABELS: dict[str, str] = {
     "select_topic": "选题中",
     "build_framework": "构建论文框架",
+    "prefetch_evidence": "并发预取并冻结章节证据",
     "draft_section": "起草章节",
     "verify_section": "核对事实",
     "polish_section": "打磨文风",
     "prepare_next_section": "准备下一节",
     "prepare_revise_section": "准备修订",
+    "parallel_reviews": "并行审查术语与全文结构",
     "term_consistency": "术语一致性审查",
     "structure_review": "结构审查",
     "global_polish": "全局一致性打磨",
@@ -117,7 +119,6 @@ def run_writing_pipeline_with_progress(
     task_id: str | None = None,
     selected_doc_ids: set[str] | None = None,
     explicitly_allowed_persona_doc_ids: set[str] | None = None,
-    framework_generation_timeout_seconds: float = 900.0,
     resume: bool = False,
 ) -> dict[str, Any]:
     """Run the full writing pipeline with progress reporting.
@@ -202,7 +203,6 @@ def run_writing_pipeline_with_progress(
             siliconflow=siliconflow,
             kb_repository=kb_repository,
             checkpoint_dir=checkpoint_dir,
-            framework_generation_timeout_seconds=framework_generation_timeout_seconds,
             progress=report_progress,
             check_cancelled=context.check_cancelled,
         )
@@ -354,6 +354,8 @@ def _compute_progress(
     elif node_name == "prepare_next_section":
         new_completed += 1
         new_section_done = 0.0
+    elif node_name == "parallel_reviews":
+        new_base = _WEIGHT_TOPIC + _WEIGHT_FRAMEWORK + _WEIGHT_PER_SECTION
     elif node_name == "term_consistency":
         new_base = _WEIGHT_TOPIC + _WEIGHT_FRAMEWORK + _WEIGHT_PER_SECTION
     elif node_name == "structure_review":

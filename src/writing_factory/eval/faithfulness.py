@@ -97,8 +97,9 @@ class FaithfulnessEvaluator:
                 ],
                 thinking=False,
                 temperature=0.0,
-                max_tokens=2048,
+                max_tokens=8192,
                 seed=42,
+                stream=True,
             )
             raw = (result.content or "").strip()
             # Parse: each line is one claim (skip empty lines)
@@ -143,8 +144,9 @@ class FaithfulnessEvaluator:
                 ],
                 thinking=False,
                 temperature=0.0,
-                max_tokens=512,
+                max_tokens=8192,
                 seed=42,
+                stream=True,
             )
             return self._parse_check_result(claim, result.content or "")
         except Exception:

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+import time
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Literal
 
 from writing_factory.config import Settings
@@ -18,6 +21,11 @@ from writing_factory.llm.models import (
 from writing_factory.store import Database
 
 ReasoningEffort = Literal["high", "max"]
+StreamObserver = Callable[[str, str], None]
+_STREAM_OBSERVER: ContextVar[StreamObserver | None] = ContextVar(
+    "siliconflow_stream_observer",
+    default=None,
+)
 
 
 class SiliconFlowClient:
@@ -28,6 +36,8 @@ class SiliconFlowClient:
         settings: Settings,
         database: Database,
         concurrency_gate: DynamicConcurrencyGate | None = None,
+        *,
+        request_timeout_seconds: float | None = None,
     ) -> None:
         self.settings = settings
         self.transport = ServiceTransport(
@@ -40,12 +50,50 @@ class SiliconFlowClient:
             max_retries=settings.max_retries,
             minimum_interval_seconds=settings.min_request_interval_seconds,
             concurrency_gate=concurrency_gate,
+            default_request_timeout_seconds=(
+                request_timeout_seconds
+                if request_timeout_seconds is not None
+                else settings.siliconflow_request_timeout_seconds
+            ),
         )
 
     def close(self) -> None:
         """Close the underlying HTTP connection pool."""
 
         self.transport.close()
+
+    def set_request_timeout(self, seconds: float) -> None:
+        """Immediately apply the global timeout to subsequent SiliconFlow calls."""
+
+        if seconds <= 0:
+            raise ValueError("SiliconFlow 单次请求超时上限必须大于 0")
+        self.transport.default_request_timeout_seconds = seconds
+
+    @contextmanager
+    def observe_stream(self, observer: StreamObserver) -> Iterator[None]:
+        """Route this execution context's stream activity to one UI worker."""
+
+        token = _STREAM_OBSERVER.set(observer)
+        try:
+            yield
+        finally:
+            _STREAM_OBSERVER.reset(token)
+
+    @contextmanager
+    def stream_stage(self, label: str) -> Iterator[None]:
+        """Tag nested concurrent stream events so UI output cannot interleave silently."""
+
+        parent = _STREAM_OBSERVER.get()
+        if parent is None:
+            yield
+            return
+        token = _STREAM_OBSERVER.set(
+            lambda kind, text: parent(f"{kind}::{label}", text)
+        )
+        try:
+            yield
+        finally:
+            _STREAM_OBSERVER.reset(token)
 
     def chat(
         self,
@@ -54,7 +102,7 @@ class SiliconFlowClient:
         thinking: bool,
         reasoning_effort: ReasoningEffort = "high",
         temperature: float = 0.2,
-        max_tokens: int = 1024,
+        max_tokens: int = 8192,
         seed: int | None = None,
         response_format: Literal["text", "json_object"] = "text",
         use_cache: bool = True,
@@ -87,6 +135,45 @@ class SiliconFlowClient:
             if result_validator is not None:
                 result_validator(self._chat_result(response, streamed=stream))
 
+        observer = _STREAM_OBSERVER.get() if stream else None
+        pending_content: list[str] = []
+        last_content_publish = 0.0
+        last_reasoning_publish = 0.0
+
+        def publish_stream_event(chunk: dict[str, Any]) -> None:
+            nonlocal last_content_publish, last_reasoning_publish
+            if observer is None:
+                return
+            now = time.monotonic()
+            if chunk.get("_stream_event") == "done":
+                if pending_content:
+                    observer("content", "".join(pending_content))
+                    pending_content.clear()
+                return
+            choices = chunk.get("choices") or []
+            if not choices:
+                return
+            delta = choices[0].get("delta") or {}
+            reasoning = delta.get("reasoning_content")
+            content = delta.get("content")
+            if (
+                isinstance(reasoning, str)
+                and reasoning
+                and now - last_reasoning_publish >= 0.5
+            ):
+                # Keep private reasoning out of the UI; only expose activity.
+                observer("reasoning", "activity")
+                last_reasoning_publish = now
+            if isinstance(content, str) and content:
+                pending_content.append(content)
+            if pending_content and (
+                choices[0].get("finish_reason") is not None
+                or now - last_content_publish >= 0.05
+            ):
+                observer("content", "".join(pending_content))
+                pending_content.clear()
+                last_content_publish = now
+
         response = self.transport.request_json(
             "POST",
             "/chat/completions",
@@ -106,6 +193,7 @@ class SiliconFlowClient:
             stream_response=stream,
             priority=priority,
             response_validator=validate_response if result_validator is not None else None,
+            stream_event_callback=publish_stream_event if observer is not None else None,
         )
         result = self._chat_result(response, streamed=stream)
         if result_validator is not None:

@@ -106,9 +106,10 @@ def review_term_consistency(
         messages=messages,
         thinking=False,  # 中性角色，不开思考
         temperature=0.0,  # 最低温度，确保一致性
-        max_tokens=4096,
+        max_tokens=8192,
         response_format="json_object",
         seed=42,
+        stream=True,
     )
 
     check_cancelled()
@@ -166,9 +167,10 @@ def review_structure(
         messages=messages,
         thinking=False,  # 中性角色，不开思考
         temperature=0.0,
-        max_tokens=4096,
+        max_tokens=8192,
         response_format="json_object",
         seed=42,
+        stream=True,
     )
 
     check_cancelled()
@@ -252,6 +254,7 @@ def run_global_polish(
         max_tokens=8192,  # 1M 上下文的输出可能较大
         response_format="json_object",
         seed=42,
+        stream=True,
     )
 
     check_cancelled()
@@ -302,9 +305,10 @@ def run_global_polish(
             ),
             thinking=False,
             temperature=0.0,
-            max_tokens=2048,
+            max_tokens=8192,
             response_format="json_object",
             seed=42,
+            stream=True,
         )
         check_cancelled()
         check_data = json.loads(check_result.content)

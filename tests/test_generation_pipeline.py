@@ -3,22 +3,31 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from writing_factory.generate.models import (
+    AnnotatedOutline,
     Claim,
     EvidenceItem,
+    EvidencePack,
+    GenerationContext,
+    OutlineNode,
     ReferenceList,
     SectionDraft,
+    StructureReview,
+    TermConsistencyReport,
+    ThesisStatement,
     VerifiedDraft,
 )
 from writing_factory.kb.models import Bibliography, FusedHit, RetrievalResult
 from writing_factory.llm.models import ChatResult
 from writing_factory.orchestration.errors import PipelineNodeError
-from writing_factory.orchestration.nodes import should_continue_after_verify
+from writing_factory.orchestration.nodes import WritingPipeline, should_continue_after_verify
 from writing_factory.orchestration.pipeline_runner import (
     _legacy_resume_config,
     run_writing_pipeline_with_progress,
@@ -221,11 +230,14 @@ def test_full_writing_graph_runs_offline(tmp_path: Path) -> None:
     outline = json.loads(result["outline_json"])
     assert outline["root_nodes"][0]["candidate_evidence"][0]["chunk_id"] == "chunk_1"
     assert outline["root_nodes"][0]["candidate_source_keys"] == ["S1"]
+    frozen_pack = EvidencePack.model_validate_json(result["sections"][0]["evidence_pack_json"])
+    assert frozen_pack.section_id == "1"
+    assert result["sections"][0]["source_key_offset"] == 1
     assert len(retriever.requests) == 4
     assert all(request.filters.doc_ids == {"doc_task"} for request in retriever.requests)
     assert context.progress[-1][0] == 100
-    assert client.calls[1][1]["request_timeout_seconds"] == 900.0
-    assert client.calls[1][1]["request_total_timeout_seconds"] == 900.0
+    assert "request_timeout_seconds" not in client.calls[1][1]
+    assert "request_total_timeout_seconds" not in client.calls[1][1]
     assert client.calls[1][1]["max_tokens"] == 8192
     assert client.calls[1][1]["stream"] is True
 
@@ -248,6 +260,153 @@ def test_full_writing_graph_runs_offline(tmp_path: Path) -> None:
     )
     assert resumed["status"] == "done"
     assert resumed_client.calls == []
+
+
+def test_evidence_prefetch_is_concurrent_and_keeps_outline_order() -> None:
+    class ConcurrentRetriever(FakeRetriever):
+        def __init__(self, repository) -> None:
+            super().__init__(repository)
+            self._lock = threading.Lock()
+            self.active = 0
+            self.peak = 0
+
+        def search(self, request, **_kwargs):
+            with self._lock:
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+            try:
+                time.sleep(0.05)
+                section_id = request.query.splitlines()[1]
+                return RetrievalResult(
+                    query=request.query,
+                    hits=(
+                        FusedHit(
+                            chunk_id=f"chunk_{section_id}",
+                            doc_id="doc_task",
+                            text=f"{section_id}的证据。",
+                            source="hybrid",
+                            final_rank=1,
+                            rrf_score=0.9,
+                        ),
+                    ),
+                )
+            finally:
+                with self._lock:
+                    self.active -= 1
+
+    thesis = ThesisStatement(
+        thesis_text="核心论点",
+        angle="测试角度",
+        kb_support_assessment="证据充足",
+        persona_id="persona_1",
+    )
+    nodes = [
+        OutlineNode(node_id=str(index), heading=f"第{index}节", rhetorical_purpose="论证")
+        for index in range(1, 4)
+    ]
+    outline = AnnotatedOutline(thesis=thesis, root_nodes=nodes, kb_id="kb")
+    context = GenerationContext(
+        kb_id="kb",
+        task_description="测试并发预取",
+        persona_id="persona_1",
+        allowed_doc_ids=("doc_task",),
+    )
+    repository = FakeKnowledgeRepository()
+    retriever = ConcurrentRetriever(repository)
+    pipeline = WritingPipeline(
+        persona_repository=FakePersonaRepository(),
+        retriever=retriever,
+        siliconflow=SimpleNamespace(),
+        kb_repository=repository,
+    )
+    state = {
+        "context_json": context.model_dump_json(),
+        "thesis_json": thesis.model_dump_json(),
+        "outline_json": outline.model_dump_json(),
+        "source_key_counter": 4,
+        "sections": [
+            {"section_id": node.node_id, "heading": node.heading, "source_key_offset": 0}
+            for node in nodes
+        ],
+    }
+
+    result = pipeline.prefetch_evidence_node(state)
+
+    assert retriever.peak >= 2
+    assert [section["heading"] for section in result["sections"]] == [
+        "第1节",
+        "第2节",
+        "第3节",
+    ]
+    assert [section["source_key_offset"] for section in result["sections"]] == [4, 12, 20]
+    packs = [
+        EvidencePack.model_validate_json(section["evidence_pack_json"])
+        for section in result["sections"]
+    ]
+    assert [pack.items[0].source_key for pack in packs] == ["S5", "S13", "S21"]
+    assert result["source_key_counter"] == 28
+
+
+def test_term_and_structure_reviews_run_in_parallel(monkeypatch) -> None:
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    def enter(result):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            time.sleep(0.05)
+            return result
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(
+        "writing_factory.orchestration.nodes.review_term_consistency",
+        lambda **_kwargs: enter(TermConsistencyReport(reviewer_note="术语完成")),
+    )
+    monkeypatch.setattr(
+        "writing_factory.orchestration.nodes.review_structure",
+        lambda **_kwargs: enter(StructureReview(overall_assessment="结构完成")),
+    )
+    thesis = ThesisStatement(
+        thesis_text="核心论点",
+        angle="测试角度",
+        kb_support_assessment="证据充足",
+        persona_id="persona_1",
+    )
+    outline = AnnotatedOutline(
+        thesis=thesis,
+        root_nodes=[OutlineNode(node_id="1", heading="第一节", rhetorical_purpose="论证")],
+        term_registry={"术语": "定义"},
+        kb_id="kb",
+    )
+    pipeline = WritingPipeline(
+        persona_repository=FakePersonaRepository(),
+        retriever=SimpleNamespace(),
+        siliconflow=SimpleNamespace(),
+        kb_repository=FakeKnowledgeRepository(),
+    )
+
+    result = pipeline.parallel_reviews_node(
+        {
+            "thesis_json": thesis.model_dump_json(),
+            "outline_json": outline.model_dump_json(),
+            "term_registry_json": json.dumps(outline.term_registry, ensure_ascii=False),
+            "sections": [],
+        }
+    )
+
+    assert peak == 2
+    assert TermConsistencyReport.model_validate_json(
+        result["term_consistency_json"]
+    ).reviewer_note == "术语完成"
+    assert StructureReview.model_validate_json(
+        result["structure_review_json"]
+    ).overall_assessment == "结构完成"
 
 
 def test_framework_regenerates_with_doubled_output_limits(tmp_path: Path) -> None:
@@ -293,7 +452,7 @@ def test_framework_regenerates_with_doubled_output_limits(tmp_path: Path) -> Non
         32768,
     ]
     assert all(
-        client.calls[index][1]["request_total_timeout_seconds"] == 900.0
+        "request_total_timeout_seconds" not in client.calls[index][1]
         for index in (1, 2, 3)
     )
     assert "从头重新生成" in client.calls[2][0][-1]["content"]

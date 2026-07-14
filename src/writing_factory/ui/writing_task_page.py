@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections.abc import Callable
 from typing import Any
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -40,6 +41,7 @@ from writing_factory.orchestration.state import (
     PIPELINE_STATUS_DONE,
     PIPELINE_STATUS_DRAFTING,
     PIPELINE_STATUS_ERROR,
+    PIPELINE_STATUS_EVIDENCE_PREFETCH,
     PIPELINE_STATUS_FRAMEWORK,
     PIPELINE_STATUS_GLOBAL_POLISH,
     PIPELINE_STATUS_STRUCTURE_REVIEW,
@@ -57,6 +59,7 @@ logger = logging.getLogger(__name__)
 _PIPELINE_LABELS: dict[str, str] = {
     PIPELINE_STATUS_TOPIC: "选题中",
     PIPELINE_STATUS_FRAMEWORK: "构建框架",
+    PIPELINE_STATUS_EVIDENCE_PREFETCH: "证据已冻结",
     PIPELINE_STATUS_DRAFTING: "起草中",
     PIPELINE_STATUS_VERIFYING: "核对中",
     PIPELINE_STATUS_TERM_REVIEW: "术语审查",
@@ -141,6 +144,14 @@ class WritingTaskPage(QWidget):
         self._personas: list[dict[str, object]] = []
         self._task_records: list[dict[str, object]] = []
         self._history_refreshed_for_run = False
+        self._run_started_at: float | None = None
+        self._step_started_at: float | None = None
+        self._last_stream_at: float | None = None
+        self._current_step = ""
+        self._stream_stage = ""
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.setInterval(1000)
+        self._elapsed_timer.timeout.connect(self._update_elapsed_display)
         self._build_ui()
 
     # ── UI construction ────────────────────────────────────────
@@ -291,8 +302,16 @@ class WritingTaskPage(QWidget):
         task_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         self.task_table.itemDoubleClicked.connect(lambda _item: self._load_selected_task())
         history_layout.addWidget(self.task_table)
-        history_group.setMinimumHeight(120)
-        self.main_splitter.addWidget(history_group)
+        history_group.setMinimumHeight(150)
+        self.history_scroll = QScrollArea()
+        self.history_scroll.setWidgetResizable(True)
+        self.history_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.history_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.history_scroll.setWidget(history_group)
+        self.history_scroll.setMinimumHeight(90)
+        self.main_splitter.addWidget(self.history_scroll)
 
         # ── Progress panel ──
         self.progress_group = QGroupBox("写入进度")
@@ -310,6 +329,14 @@ class WritingTaskPage(QWidget):
         self.status_label.setObjectName("statusLabel")
         progress_layout.addWidget(self.status_label)
 
+        self.elapsed_label = QLabel("步骤耗时 00:00 · 本次运行 00:00")
+        self.elapsed_label.setObjectName("mutedText")
+        progress_layout.addWidget(self.elapsed_label)
+
+        self.activity_label = QLabel("尚未收到模型流式输出")
+        self.activity_label.setObjectName("mutedText")
+        progress_layout.addWidget(self.activity_label)
+
         self.section_table = QTableWidget(0, 3)
         self.section_table.setHorizontalHeaderLabels(["节", "标题", "状态"])
         self.section_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -322,9 +349,24 @@ class WritingTaskPage(QWidget):
         sh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         progress_layout.addWidget(self.section_table)
 
-        self.progress_group.hide()
-        self.progress_group.setMinimumHeight(120)
-        self.main_splitter.addWidget(self.progress_group)
+        self.live_output_view = QPlainTextEdit()
+        self.live_output_view.setReadOnly(True)
+        self.live_output_view.setPlaceholderText("模型的实时输出将在这里逐步显示")
+        self.live_output_view.setMinimumHeight(140)
+        self.live_output_view.document().setMaximumBlockCount(5000)
+        progress_layout.addWidget(self.live_output_view)
+
+        self.progress_group.setMinimumHeight(310)
+        self.progress_scroll = QScrollArea()
+        self.progress_scroll.setWidgetResizable(True)
+        self.progress_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.progress_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.progress_scroll.setWidget(self.progress_group)
+        self.progress_scroll.setMinimumHeight(90)
+        self.progress_scroll.hide()
+        self.main_splitter.addWidget(self.progress_scroll)
 
         # ── Results panel ──
         self.results_group = QGroupBox("写作结果")
@@ -701,12 +743,14 @@ class WritingTaskPage(QWidget):
             self._outline_view.clear()
             self._ref_view.clear()
             self._eval_view.clear()
-        self.progress_group.show()
+        self.progress_scroll.show()
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("%p%")
         self.progress_bar.setStyleSheet("")
         self.status_label.setText("正在准备流水线…")
         self.section_table.setRowCount(0)
+        self.live_output_view.clear()
+        self._start_run_clock()
         self.eval_button.setEnabled(False)
 
         def task(context: TaskContext) -> dict[str, Any]:
@@ -728,6 +772,7 @@ class WritingTaskPage(QWidget):
             on_success=self._pipeline_succeeded,
             on_error=self._pipeline_failed,
             on_progress=self._pipeline_progressed,
+            on_stream=self._pipeline_streamed,
         )
 
     def _stop_writing(self) -> None:
@@ -740,10 +785,29 @@ class WritingTaskPage(QWidget):
     def _pipeline_progressed(self, percent: int, message: str) -> None:
         self.progress_bar.setValue(percent)
         if message:
+            self._set_current_step(message)
             self.status_label.setText(message)
         if not self._history_refreshed_for_run:
             self._reload_task_history()
             self._history_refreshed_for_run = True
+
+    def _pipeline_streamed(self, kind: str, text: str) -> None:
+        """Display public response deltas while using reasoning only as a heartbeat."""
+
+        self._last_stream_at = time.monotonic()
+        event_kind, separator, stream_label = kind.partition("::")
+        if event_kind != "content" or not text:
+            self._update_elapsed_display()
+            return
+        stage = stream_label if separator else (self._current_step or "模型输出")
+        if stage != self._stream_stage:
+            if self.live_output_view.toPlainText():
+                self.live_output_view.insertPlainText("\n\n")
+            self.live_output_view.insertPlainText(f"===== {stage} =====\n")
+            self._stream_stage = stage
+        self.live_output_view.insertPlainText(text)
+        self.live_output_view.ensureCursorVisible()
+        self._update_elapsed_display()
 
     def _pipeline_succeeded(self, result: Any) -> None:
         if not isinstance(result, dict):
@@ -792,6 +856,7 @@ class WritingTaskPage(QWidget):
 
     def _finish_writing(self) -> None:
         self._task_id = None
+        self._stop_run_clock()
         self._set_running(False)
 
     def _set_running(self, running: bool) -> None:
@@ -927,6 +992,7 @@ class WritingTaskPage(QWidget):
             return
 
         self._set_running(True)
+        self._start_run_clock()
         self.eval_button.setEnabled(False)
         self.status_label.setText("正在运行阶段 7 评估…")
         self.progress_bar.setValue(0)
@@ -945,12 +1011,15 @@ class WritingTaskPage(QWidget):
             on_success=self._eval_succeeded,
             on_error=self._eval_failed,
             on_progress=self._eval_progressed,
+            on_stream=self._pipeline_streamed,
         )
 
     def _eval_progressed(self, percent: int, message: str) -> None:
         self.progress_bar.setValue(percent)
         if message:
-            self.status_label.setText(f"评估: {message}")
+            label = f"评估: {message}"
+            self._set_current_step(label)
+            self.status_label.setText(label)
 
     def _eval_succeeded(self, result: Any) -> None:
         if isinstance(result, dict) and result.get("error"):
@@ -999,8 +1068,51 @@ class WritingTaskPage(QWidget):
 
     def _finish_eval(self) -> None:
         self._task_id = None
+        self._stop_run_clock()
         self._set_running(False)
         self.eval_button.setEnabled(self._last_result is not None)
+
+    def _start_run_clock(self) -> None:
+        now = time.monotonic()
+        self._run_started_at = now
+        self._step_started_at = now
+        self._last_stream_at = None
+        self._current_step = "正在准备流水线"
+        self._stream_stage = ""
+        self._elapsed_timer.start()
+        self._update_elapsed_display()
+
+    def _stop_run_clock(self) -> None:
+        self._update_elapsed_display()
+        self._elapsed_timer.stop()
+
+    def _set_current_step(self, message: str) -> None:
+        if message != self._current_step:
+            self._current_step = message
+            self._step_started_at = time.monotonic()
+            self._update_elapsed_display()
+
+    def _update_elapsed_display(self) -> None:
+        now = time.monotonic()
+        step_seconds = now - self._step_started_at if self._step_started_at is not None else 0
+        run_seconds = now - self._run_started_at if self._run_started_at is not None else 0
+        self.elapsed_label.setText(
+            f"步骤耗时 {self._format_duration(step_seconds)} · "
+            f"本次运行 {self._format_duration(run_seconds)}"
+        )
+        if self._last_stream_at is None:
+            activity = "尚未收到模型流式输出"
+        else:
+            idle = max(0, round(now - self._last_stream_at))
+            activity = f"模型最近活动：{idle} 秒前"
+        self.activity_label.setText(activity)
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        total = max(0, int(seconds))
+        hours, remainder = divmod(total, 3600)
+        minutes, secs = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
 
     # ── Public refresh ─────────────────────────────────────────
 

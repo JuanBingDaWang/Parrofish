@@ -19,6 +19,7 @@ class SectionState(TypedDict, total=False):
     status: str
     # 序列化的中间产物
     draft_json: str | None  # SectionDraft.model_dump_json()
+    evidence_pack_json: str | None  # EvidencePack.model_dump_json()
     verified_draft_json: str | None  # VerifiedDraft.model_dump_json()
     polished_section_json: str | None  # PolishedSection.model_dump_json()
     # 修订计数（防止无限循环）
@@ -90,6 +91,7 @@ SECTION_STATUS_ERROR = "error"
 PIPELINE_STATUS_IDLE = "idle"
 PIPELINE_STATUS_TOPIC = "topic_selecting"
 PIPELINE_STATUS_FRAMEWORK = "framework_building"
+PIPELINE_STATUS_EVIDENCE_PREFETCH = "evidence_prefetch"
 PIPELINE_STATUS_DRAFTING = "drafting"
 PIPELINE_STATUS_VERIFYING = "verifying"
 PIPELINE_STATUS_REVISING = "revising"

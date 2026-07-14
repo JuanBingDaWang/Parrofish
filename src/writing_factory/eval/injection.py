@@ -146,9 +146,10 @@ class InjectionDetector:
                 ],
                 thinking=False,
                 temperature=0.0,
-                max_tokens=512,
+                max_tokens=8192,
                 seed=42,
                 response_format="json_object",
+                stream=True,
             )
             import json
 

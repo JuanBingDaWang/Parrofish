@@ -105,8 +105,7 @@ def test_siliconflow_assembles_streamed_chat(settings) -> None:
     client.transport.close()
     transport = FakeTransport()
     client.transport = transport
-    transport.request_json = lambda *args, **kwargs: {
-        "chunks": [
+    chunks = [
             {
                 "model": "stream-model",
                 "choices": [{"delta": {"reasoning_content": "思考"}}],
@@ -116,14 +115,24 @@ def test_siliconflow_assembles_streamed_chat(settings) -> None:
                 "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
             },
         ]
-    }
+    observed: list[tuple[str, str]] = []
 
-    result = client.chat([{"role": "user", "content": "test"}], thinking=True, stream=True)
+    def streamed_response(*_args, **kwargs):
+        callback = kwargs["stream_event_callback"]
+        for chunk in chunks:
+            callback(chunk)
+        return {"chunks": chunks}
+
+    transport.request_json = streamed_response
+
+    with client.observe_stream(lambda kind, text: observed.append((kind, text))):
+        result = client.chat([{"role": "user", "content": "test"}], thinking=True, stream=True)
 
     assert result.content == "完成"
     assert result.reasoning_content == "思考"
     assert result.finish_reason == "stop"
     assert result.usage.total_tokens == 5
+    assert observed == [("reasoning", "activity"), ("content", "完成")]
     client.close()
 
 

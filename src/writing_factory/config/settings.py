@@ -35,7 +35,7 @@ class Settings(BaseModel):
     citation_style: Literal["gb-t-7714"] = "gb-t-7714"
     distillation_output_language: Literal["zh-CN"] = "zh-CN"
     siliconflow_max_concurrency: int = Field(default=3, ge=1, le=8)
-    framework_generation_timeout_seconds: int = Field(default=900, ge=60, le=3600)
+    siliconflow_request_timeout_seconds: int = Field(default=900, ge=60, le=3600)
     connect_timeout_seconds: float = 10.0
     read_timeout_seconds: float = 180.0
     max_retries: int = 3
@@ -131,7 +131,10 @@ def load_settings(
                 env.get("DISTILLATION_MAP_CONCURRENCY", "3"),
             )
         ),
-        framework_generation_timeout_seconds=int(
-            env.get("FRAMEWORK_GENERATION_TIMEOUT_SECONDS", "900")
+        siliconflow_request_timeout_seconds=int(
+            env.get(
+                "SILICONFLOW_REQUEST_TIMEOUT_SECONDS",
+                env.get("FRAMEWORK_GENERATION_TIMEOUT_SECONDS", "900"),
+            )
         ),
     )

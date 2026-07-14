@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import nullcontext
 
 from writing_factory.llm import SiliconFlowClient
 
@@ -38,19 +39,22 @@ class QueryExpander:
 
         if not query.strip():
             return []
-        result = self.siliconflow.chat(
-            [
-                {"role": "system", "content": REWRITE_SYSTEM},
-                {"role": "user", "content": query},
-            ],
-            thinking=False,
-            temperature=0.2,
-            max_tokens=512,
-            seed=42,
-            response_format="json_object",
-            use_cache=use_cache,
-            priority=20,
-        )
+        stage = getattr(self.siliconflow, "stream_stage", None)
+        with stage("查询改写") if stage else nullcontext():
+            result = self.siliconflow.chat(
+                [
+                    {"role": "system", "content": REWRITE_SYSTEM},
+                    {"role": "user", "content": query},
+                ],
+                thinking=False,
+                temperature=0.2,
+                max_tokens=8192,
+                seed=42,
+                response_format="json_object",
+                use_cache=use_cache,
+                stream=True,
+                priority=20,
+            )
         parsed = self._parse_queries(result.content)
         return parsed or [query]
 
@@ -59,18 +63,21 @@ class QueryExpander:
 
         if not query.strip():
             return None
-        result = self.siliconflow.chat(
-            [
-                {"role": "system", "content": HYDE_SYSTEM},
-                {"role": "user", "content": query},
-            ],
-            thinking=False,
-            temperature=0.3,
-            max_tokens=256,
-            seed=42,
-            use_cache=use_cache,
-            priority=20,
-        )
+        stage = getattr(self.siliconflow, "stream_stage", None)
+        with stage("HyDE 假设文档") if stage else nullcontext():
+            result = self.siliconflow.chat(
+                [
+                    {"role": "system", "content": HYDE_SYSTEM},
+                    {"role": "user", "content": query},
+                ],
+                thinking=False,
+                temperature=0.3,
+                max_tokens=8192,
+                seed=42,
+                use_cache=use_cache,
+                stream=True,
+                priority=20,
+            )
         passage = result.content.strip()
         return passage or None
 

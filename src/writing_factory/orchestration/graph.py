@@ -1,15 +1,15 @@
 """LangGraph StateGraph 构建 + SQLite checkpointer 装配。
 
 图结构:
-    select_topic → build_framework → draft_section → verify_section
+    select_topic → build_framework → prefetch_evidence → draft_section → verify_section
         → conditional{polish | revise}
         → polish_section → conditional{next_section | assemble(→ phase 6)}
-        → term_consistency → structure_review → global_polish → assemble → END
+        → parallel_reviews → global_polish → assemble → END
 
     revise 回路: draft_section ← revise (最多 MAX_REVISIONS_PER_SECTION 次)
     next_section 回路: draft_section ← next_section (遍历所有节)
 
-阶段 6 注入点: per-section 循环结束后, 先做术语一致性→结构审查→全局打磨(1M 上下文),
+阶段 6 注入点: per-section 循环结束后, 并行做术语一致性与结构审查→全局打磨(1M 上下文),
             最后 assemble 拼装参考文献与最终稿。
 
 设计铁律遵守:
@@ -54,7 +54,6 @@ def build_writing_graph(
     siliconflow: SiliconFlowClient,
     kb_repository: KnowledgeBaseRepository,
     checkpoint_dir: Path,
-    framework_generation_timeout_seconds: float = 900.0,
     progress: Callable[[int, str], None] | None = None,
     check_cancelled: Callable[[], None] | None = None,
 ) -> StateGraph:
@@ -76,7 +75,6 @@ def build_writing_graph(
         retriever=retriever,
         siliconflow=siliconflow,
         kb_repository=kb_repository,
-        framework_generation_timeout_seconds=framework_generation_timeout_seconds,
         progress=progress,
         check_cancelled=check_cancelled,
     )
@@ -87,6 +85,7 @@ def build_writing_graph(
     # ── 节点注册 ──────────────────────────────────────────────
     builder.add_node("select_topic", pipeline.select_topic_node)
     builder.add_node("build_framework", pipeline.build_framework_node)
+    builder.add_node("prefetch_evidence", pipeline.prefetch_evidence_node)
     builder.add_node("draft_section", pipeline.draft_section_node)
     builder.add_node("verify_section", pipeline.verify_section_node)
     builder.add_node("fail_verification", pipeline.fail_verification_node)
@@ -94,9 +93,11 @@ def build_writing_graph(
     builder.add_node("assemble", pipeline.assemble_node)
 
     # 阶段 6 — 一致性与全局打磨
+    builder.add_node("parallel_reviews", pipeline.parallel_reviews_node)
+    builder.add_node("global_polish", pipeline.global_polish_node)
+    # 仅供旧版任务断点恢复；新任务不会进入这两个串行节点。
     builder.add_node("term_consistency", pipeline.term_consistency_node)
     builder.add_node("structure_review", pipeline.structure_review_node)
-    builder.add_node("global_polish", pipeline.global_polish_node)
 
     # 条件边过渡节点（只做纯状态更新，不调 LLM）
     builder.add_node("prepare_next_section", prepare_next_section)
@@ -110,8 +111,9 @@ def build_writing_graph(
     # 选题 → 框架
     builder.add_edge("select_topic", "build_framework")
 
-    # 框架 → 起草第一节
-    builder.add_edge("build_framework", "draft_section")
+    # 框架 → 并发预取并冻结各节证据 → 起草第一节
+    builder.add_edge("build_framework", "prefetch_evidence")
+    builder.add_edge("prefetch_evidence", "draft_section")
 
     # 起草 → 核对
     builder.add_edge("draft_section", "verify_section")
@@ -137,7 +139,7 @@ def build_writing_graph(
         should_continue_after_polish,
         {
             "next_section": "prepare_next_section",
-            "assemble": "term_consistency",  # 改为阶段 6 入口
+            "assemble": "parallel_reviews",  # 阶段 6 入口
         },
     )
 
@@ -146,10 +148,9 @@ def build_writing_graph(
 
     # ── 阶段 6 边 ────────────────────────────────────────────
 
-    # 术语审查 → 结构审查
+    # 两项独立审查并发完成后 → 全局打磨
+    builder.add_edge("parallel_reviews", "global_polish")
     builder.add_edge("term_consistency", "structure_review")
-
-    # 结构审查 → 全局打磨
     builder.add_edge("structure_review", "global_polish")
 
     # 全局打磨 → 组装（生成参考文献列表 + 最终稿）

@@ -59,8 +59,8 @@ class MainWindow(QMainWindow):
         list_persona_versions: PersonaVersionLoader | None = None,
         get_siliconflow_concurrency: Callable[[], int] | None = None,
         set_siliconflow_concurrency: Callable[[int], None] | None = None,
-        get_framework_generation_timeout: Callable[[], int] | None = None,
-        set_framework_generation_timeout: Callable[[int], None] | None = None,
+        get_siliconflow_request_timeout: Callable[[], int] | None = None,
+        set_siliconflow_request_timeout: Callable[[int], None] | None = None,
         get_retrieval_option: Callable[[str, bool], bool] | None = None,
         set_retrieval_option: Callable[[str, bool], None] | None = None,
         retrieve: Callable[..., Any] | None = None,
@@ -93,10 +93,8 @@ class MainWindow(QMainWindow):
         self._list_persona_versions = list_persona_versions
         self._get_siliconflow_concurrency = get_siliconflow_concurrency or (lambda: 3)
         self._set_siliconflow_concurrency = set_siliconflow_concurrency
-        self._get_framework_generation_timeout = get_framework_generation_timeout or (
-            lambda: 900
-        )
-        self._set_framework_generation_timeout = set_framework_generation_timeout
+        self._get_siliconflow_request_timeout = get_siliconflow_request_timeout or (lambda: 900)
+        self._set_siliconflow_request_timeout = set_siliconflow_request_timeout
         self._get_retrieval_option = get_retrieval_option or (lambda _k, d=True: d)
         self._set_retrieval_option = set_retrieval_option
         self._retrieve = retrieve
@@ -289,23 +287,23 @@ class MainWindow(QMainWindow):
         timeout_layout = QHBoxLayout(timeout_row)
         timeout_layout.setContentsMargins(18, 14, 14, 14)
         timeout_layout.setSpacing(16)
-        timeout_label = QLabel("框架生成超时上限")
+        timeout_label = QLabel("单次请求超时上限")
         timeout_label.setObjectName("providerName")
-        timeout_description = QLabel("SiliconFlow 单次框架生成尝试（含网络重试）")
+        timeout_description = QLabel("SiliconFlow 全部请求（含网络重试）")
         timeout_description.setObjectName("mutedText")
-        self.framework_timeout_input = QSpinBox()
-        self.framework_timeout_input.setRange(60, 3600)
-        self.framework_timeout_input.setSingleStep(60)
-        self.framework_timeout_input.setSuffix(" 秒")
-        self.framework_timeout_input.setValue(self._get_framework_generation_timeout())
-        self.framework_timeout_input.setToolTip(
-            "每次完整生成尝试分别计时；超时后任务停在框架节点，可从断点继续"
+        self.siliconflow_timeout_input = QSpinBox()
+        self.siliconflow_timeout_input.setRange(60, 3600)
+        self.siliconflow_timeout_input.setSingleStep(60)
+        self.siliconflow_timeout_input.setSuffix(" 秒")
+        self.siliconflow_timeout_input.setValue(self._get_siliconflow_request_timeout())
+        self.siliconflow_timeout_input.setToolTip(
+            "每个 SiliconFlow 逻辑请求分别计时；框架的三次重新生成各自独立计时"
         )
-        self.framework_timeout_input.valueChanged.connect(self._framework_timeout_changed)
+        self.siliconflow_timeout_input.valueChanged.connect(self._siliconflow_timeout_changed)
         timeout_layout.addWidget(timeout_label)
         timeout_layout.addWidget(timeout_description)
         timeout_layout.addStretch(1)
-        timeout_layout.addWidget(self.framework_timeout_input)
+        timeout_layout.addWidget(self.siliconflow_timeout_input)
         layout.addWidget(timeout_row)
 
         mineru_row = QFrame()
@@ -371,17 +369,17 @@ class MainWindow(QMainWindow):
             return
         self.statusBar().showMessage(f"SiliconFlow 最大并发数已设为 {value}", 4000)
 
-    def _framework_timeout_changed(self, value: int) -> None:
-        """持久化单次框架生成尝试的超时上限。"""
+    def _siliconflow_timeout_changed(self, value: int) -> None:
+        """持久化并应用全局 SiliconFlow 单次请求超时上限。"""
 
-        if self._set_framework_generation_timeout is None:
+        if self._set_siliconflow_request_timeout is None:
             return
         try:
-            self._set_framework_generation_timeout(value)
+            self._set_siliconflow_request_timeout(value)
         except ValueError as exc:
             self.statusBar().showMessage(str(exc), 5000)
             return
-        self.statusBar().showMessage(f"框架生成超时上限已设为 {value} 秒", 4000)
+        self.statusBar().showMessage(f"SiliconFlow 单次请求超时上限已设为 {value} 秒", 4000)
 
     def _start_siliconflow_check(self) -> None:
         if self._check_task_id is not None:

@@ -8,6 +8,8 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
+from contextvars import copy_context
 from typing import TYPE_CHECKING
 
 from writing_factory.generate.models import (
@@ -56,7 +58,6 @@ def build_framework(
     persona_repository: PersonaRepository,
     retriever: HybridRetriever,
     siliconflow: SiliconFlowClient,
-    request_timeout_seconds: float = 900.0,
     progress: ProgressCallback = _no_progress,
     check_cancelled: CancellationCheck = _no_cancellation,
 ) -> AnnotatedOutline:
@@ -172,8 +173,6 @@ def build_framework(
                 max_tokens=max_tokens,
                 response_format="json_object",
                 seed=42,
-                request_timeout_seconds=request_timeout_seconds,
-                request_total_timeout_seconds=request_timeout_seconds,
                 stream=True,
                 result_validator=_validate_framework_result,
             )
@@ -304,22 +303,27 @@ def _attach_node_evidence(
 
     def retrieve(node: OutlineNode):
         check_cancelled()
-        request = RetrievalRequest(
-            kb_id=context.kb_id,
-            query=(f"{outline.thesis.thesis_text}\n{node.heading}\n{node.rhetorical_purpose}"),
-            top_k=6,
-            filters=task_document_filter(context),
-            use_rerank=True,
-        )
-        retrieval_result = retriever.search(
-            request,
-            check_cancelled=check_cancelled,
-        )
-        enforce_retrieval_safety(retrieval_result, siliconflow)
-        return retrieval_result
+        stage = getattr(siliconflow, "stream_stage", None)
+        with stage(f"框架证据 · {node.heading}") if stage else nullcontext():
+            request = RetrievalRequest(
+                kb_id=context.kb_id,
+                query=(f"{outline.thesis.thesis_text}\n{node.heading}\n{node.rhetorical_purpose}"),
+                top_k=6,
+                filters=task_document_filter(context),
+                use_rerank=True,
+            )
+            retrieval_result = retriever.search(
+                request,
+                check_cancelled=check_cancelled,
+            )
+            enforce_retrieval_safety(retrieval_result, siliconflow)
+            return retrieval_result
 
     with ThreadPoolExecutor(max_workers=worker_limit) as executor:
-        futures = {executor.submit(retrieve, node): node.node_id for node in nodes}
+        futures = {
+            executor.submit(copy_context().run, retrieve, node): node.node_id
+            for node in nodes
+        }
         for future in as_completed(futures):
             check_cancelled()
             results[futures[future]] = future.result()

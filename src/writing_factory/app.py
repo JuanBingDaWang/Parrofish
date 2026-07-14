@@ -65,23 +65,25 @@ class ApplicationContext:
         self.runtime_settings.set("siliconflow_max_concurrency", value)
         self.distillation.set_max_parallel_tasks(value)
 
-    def get_framework_generation_timeout(self) -> int:
-        """读取每次框架生成尝试包含网络重试在内的超时秒数。"""
+    def get_siliconflow_request_timeout(self) -> int:
+        """读取所有 SiliconFlow 逻辑请求共享的单次超时秒数。"""
 
-        value = self.runtime_settings.get(
+        legacy = self.runtime_settings.get(
             "framework_generation_timeout_seconds",
-            self.settings.framework_generation_timeout_seconds,
+            self.settings.siliconflow_request_timeout_seconds,
         )
+        value = self.runtime_settings.get("siliconflow_request_timeout_seconds", legacy)
         if isinstance(value, int) and 60 <= value <= 3600:
             return value
-        return self.settings.framework_generation_timeout_seconds
+        return self.settings.siliconflow_request_timeout_seconds
 
-    def set_framework_generation_timeout(self, value: int) -> None:
-        """校验并持久化单次框架生成尝试的超时秒数。"""
+    def set_siliconflow_request_timeout(self, value: int) -> None:
+        """校验、持久化并立即应用全局 SiliconFlow 请求超时。"""
 
         if not 60 <= value <= 3600:
-            raise ValueError("框架生成超时上限必须在 60 至 3600 秒之间")
-        self.runtime_settings.set("framework_generation_timeout_seconds", value)
+            raise ValueError("SiliconFlow 单次请求超时上限必须在 60 至 3600 秒之间")
+        self.runtime_settings.set("siliconflow_request_timeout_seconds", value)
+        self.siliconflow.set_request_timeout(value)
 
     def get_retrieval_option(self, key: str, default: bool = True) -> bool:
         """读取检索增强开关（HyDE / 查询改写），默认开启以优先写作质量。"""
@@ -118,8 +120,23 @@ def build_application(settings: Settings | None = None) -> ApplicationContext:
         if isinstance(stored_concurrency, int) and 1 <= stored_concurrency <= 8
         else resolved.siliconflow_max_concurrency
     )
+    legacy_timeout = runtime_settings.get(
+        "framework_generation_timeout_seconds",
+        resolved.siliconflow_request_timeout_seconds,
+    )
+    stored_timeout = runtime_settings.get("siliconflow_request_timeout_seconds", legacy_timeout)
+    request_timeout = (
+        stored_timeout
+        if isinstance(stored_timeout, int) and 60 <= stored_timeout <= 3600
+        else resolved.siliconflow_request_timeout_seconds
+    )
     siliconflow_gate = DynamicConcurrencyGate(concurrency)
-    siliconflow = SiliconFlowClient(resolved, database, siliconflow_gate)
+    siliconflow = SiliconFlowClient(
+        resolved,
+        database,
+        siliconflow_gate,
+        request_timeout_seconds=request_timeout,
+    )
     mineru = MinerUClient(resolved, database)
     repository = KnowledgeBaseRepository(database)
     default_kb_id = repository.ensure_default()

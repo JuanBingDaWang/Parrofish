@@ -154,26 +154,24 @@ def main() -> int:
 
         app_context.project_repository.mark_task_status(task_id, "running")
         try:
-            result = run_writing_pipeline_with_progress(
-                persona_id=persona_id,
-                task_description=task_description,
-                domain=domain,
-                context=context,
-                siliconflow=app_context.siliconflow,
-                retriever=app_context.hybrid_retriever,
-                persona_repository=app_context.persona_repository,
-                kb_repository=app_context.repository,
-                checkpoint_dir=app_context.settings.data_dir / "checkpoints",
-                kb_id=app_context.default_kb_id,
-                citation_style=app_context.settings.citation_style,
-                task_id=task_id,
-                selected_doc_ids=selected_doc_ids,
-                explicitly_allowed_persona_doc_ids=explicitly_allowed_persona_doc_ids,
-                framework_generation_timeout_seconds=(
-                    app_context.get_framework_generation_timeout()
-                ),
-                resume=resume,
-            )
+            with app_context.siliconflow.observe_stream(context.report_stream):
+                result = run_writing_pipeline_with_progress(
+                    persona_id=persona_id,
+                    task_description=task_description,
+                    domain=domain,
+                    context=context,
+                    siliconflow=app_context.siliconflow,
+                    retriever=app_context.hybrid_retriever,
+                    persona_repository=app_context.persona_repository,
+                    kb_repository=app_context.repository,
+                    checkpoint_dir=app_context.settings.data_dir / "checkpoints",
+                    kb_id=app_context.default_kb_id,
+                    citation_style=app_context.settings.citation_style,
+                    task_id=task_id,
+                    selected_doc_ids=selected_doc_ids,
+                    explicitly_allowed_persona_doc_ids=explicitly_allowed_persona_doc_ids,
+                    resume=resume,
+                )
         except Exception as exc:
             if context.is_cancelled:
                 app_context.project_repository.mark_task_status(task_id, "cancelled")
@@ -242,30 +240,31 @@ def main() -> int:
                 pipeline_run_id=context.get("task_id"),
             )
 
-            # Faithfulness
-            task_context.report_progress(20, "忠实度评估")
-            faithfulness_result = runner.evaluate_faithfulness(
-                question=thesis_text or "（无论点）",
-                answer=draft_text or "（无正文）",
-                context=evidence_context,
-                persist=True,
-                kb_id=app_context.default_kb_id,
-                pipeline_run_id=context.get("task_id"),
-            )
+            with app_context.siliconflow.observe_stream(task_context.report_stream):
+                # Faithfulness
+                task_context.report_progress(20, "忠实度评估")
+                faithfulness_result = runner.evaluate_faithfulness(
+                    question=thesis_text or "（无论点）",
+                    answer=draft_text or "（无正文）",
+                    context=evidence_context,
+                    persist=True,
+                    kb_id=app_context.default_kb_id,
+                    pipeline_run_id=context.get("task_id"),
+                )
 
-            # LLM Judge
-            task_context.report_progress(50, "裁判评分")
-            judge_result = runner.evaluate_judge(
-                thesis=thesis_text or "（无论点）",
-                draft=draft_text or "（无正文）",
-                persist=True,
-                kb_id=app_context.default_kb_id,
-                pipeline_run_id=context.get("task_id"),
-            )
+                # LLM Judge
+                task_context.report_progress(50, "裁判评分")
+                judge_result = runner.evaluate_judge(
+                    thesis=thesis_text or "（无论点）",
+                    draft=draft_text or "（无正文）",
+                    persist=True,
+                    kb_id=app_context.default_kb_id,
+                    pipeline_run_id=context.get("task_id"),
+                )
 
-            # Injection
-            task_context.report_progress(80, "注入检测")
-            injection_verdict = runner.check_injection(draft_text)
+                # Injection
+                task_context.report_progress(80, "注入检测")
+                injection_verdict = runner.check_injection(draft_text)
 
             task_context.report_progress(100, "评估完成")
             evaluation = {
@@ -307,8 +306,8 @@ def main() -> int:
         list_persona_versions=app_context.persona_repository.list_versions,
         get_siliconflow_concurrency=lambda: app_context.siliconflow_gate.limit,
         set_siliconflow_concurrency=app_context.set_siliconflow_concurrency,
-        get_framework_generation_timeout=app_context.get_framework_generation_timeout,
-        set_framework_generation_timeout=app_context.set_framework_generation_timeout,
+        get_siliconflow_request_timeout=app_context.get_siliconflow_request_timeout,
+        set_siliconflow_request_timeout=app_context.set_siliconflow_request_timeout,
         get_retrieval_option=app_context.get_retrieval_option,
         set_retrieval_option=app_context.set_retrieval_option,
         retrieve=retrieve,

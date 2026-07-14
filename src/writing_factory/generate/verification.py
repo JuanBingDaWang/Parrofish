@@ -106,9 +106,10 @@ def verify_section(
         messages=messages,
         thinking=False,  # 铁律 #5：中性角色，不开思考模式
         temperature=0.0,  # 最低温度，确保一致性
-        max_tokens=4096,
+        max_tokens=8192,
         response_format="json_object",
         seed=42,
+        stream=True,
     )
 
     progress(80, "解析核对结果")

@@ -54,17 +54,17 @@ def test_settings_page_applies_shared_siliconflow_concurrency(qtbot) -> None:
     assert changed == [6]
 
 
-def test_settings_page_persists_framework_generation_timeout(qtbot) -> None:
+def test_settings_page_persists_global_siliconflow_request_timeout(qtbot) -> None:
     changed: list[int] = []
     window = MainWindow(
         lambda: ChatResult(content="OK", model="test"),
-        get_framework_generation_timeout=lambda: 1200,
-        set_framework_generation_timeout=changed.append,
+        get_siliconflow_request_timeout=lambda: 1200,
+        set_siliconflow_request_timeout=changed.append,
     )
     qtbot.addWidget(window)
 
-    assert window.framework_timeout_input.value() == 1200
-    window.framework_timeout_input.setValue(1500)
+    assert window.siliconflow_timeout_input.value() == 1200
+    window.siliconflow_timeout_input.setValue(1500)
 
     assert changed == [1500]
 
@@ -101,9 +101,20 @@ def test_writing_page_previews_isolated_target_sources_and_uses_scroll_regions(q
     assert page.source_summary_label.text() == "已选 3 篇 · 隔离 2 篇 · 实际可用 1 篇"
     assert page.start_button.isEnabled()
     assert isinstance(page.main_splitter.widget(0), QScrollArea)
+    assert isinstance(page.history_scroll, QScrollArea)
+    assert isinstance(page.progress_scroll, QScrollArea)
     assert page.document_list.minimumHeight() >= 180
     assert page.task_table.maximumHeight() > 1000
     assert page.section_table.maximumHeight() > 1000
+    window.navigation.setCurrentRow(3)
+    page.progress_scroll.show()
+    window.resize(960, 640)
+    window.show()
+    qtbot.waitUntil(
+        lambda: page.history_scroll.verticalScrollBar().maximum() > 0
+        and page.progress_scroll.verticalScrollBar().maximum() > 0,
+        timeout=2000,
+    )
 
     page.document_list.item(2).setCheckState(Qt.CheckState.Unchecked)
     assert page.source_summary_label.text() == "已选 2 篇 · 隔离 2 篇 · 实际可用 0 篇"
@@ -166,6 +177,29 @@ def test_writing_failure_refreshes_history_without_green_full_progress(qtbot) ->
     assert page.progress_bar.value() == 99
     assert page.progress_bar.format() == "失败 · %p%"
     assert "#b42318" in page.progress_bar.styleSheet()
+
+
+def test_writing_page_shows_elapsed_time_and_public_stream_only(qtbot) -> None:
+    window = MainWindow(lambda: ChatResult(content="OK", model="test"))
+    qtbot.addWidget(window)
+    page = window.writing_task_page
+    page._start_run_clock()
+    page._run_started_at = time.monotonic() - 65
+    page._step_started_at = time.monotonic() - 5
+
+    page._pipeline_streamed("reasoning", "不应显示的推理文本")
+    assert "不应显示" not in page.live_output_view.toPlainText()
+    assert "模型最近活动" in page.activity_label.text()
+
+    page._pipeline_streamed("content", '{"title":"')
+    page._pipeline_streamed("content::全文结构审查", "结构清晰")
+    content = page.live_output_view.toPlainText()
+    assert "正在准备流水线" in content
+    assert "全文结构审查" in content
+    assert "结构清晰" in content
+    page._update_elapsed_display()
+    assert "本次运行 01:05" in page.elapsed_label.text()
+    page._stop_run_clock()
 
 
 def test_settings_page_persists_retrieval_enhancement_switches(qtbot) -> None:

@@ -101,8 +101,9 @@ def polish_section(
         thinking=True,  # 铁律 #1：使用 persona 思考模式
         reasoning_effort="high",
         temperature=0.7,  # 文风打磨允许一定随机性
-        max_tokens=4096,
+        max_tokens=8192,
         seed=42,
+        stream=True,
     )
 
     polished_text = polish_result.content.strip()
@@ -143,9 +144,10 @@ def polish_section(
         messages=fact_check_msgs,
         thinking=False,  # 铁律 #5：中性角色，不开思考模式
         temperature=0.0,
-        max_tokens=2048,
+        max_tokens=8192,
         response_format="json_object",
         seed=42,
+        stream=True,
     )
 
     progress(90, "解析打磨结果")

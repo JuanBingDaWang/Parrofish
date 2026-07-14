@@ -43,6 +43,7 @@ class ServiceTransport:
         minimum_interval_seconds: float = 0.0,
         http_client: httpx.Client | None = None,
         concurrency_gate: DynamicConcurrencyGate | None = None,
+        default_request_timeout_seconds: float | None = None,
     ) -> None:
         self.provider = provider
         self.base_url = base_url.rstrip("/")
@@ -50,6 +51,7 @@ class ServiceTransport:
         self.max_retries = max(1, max_retries)
         self.rate_limiter = RateLimiter(minimum_interval_seconds)
         self.concurrency_gate = concurrency_gate
+        self.default_request_timeout_seconds = default_request_timeout_seconds
         self._owns_client = http_client is None
         timeout = httpx.Timeout(
             connect=connect_timeout_seconds,
@@ -89,6 +91,7 @@ class ServiceTransport:
         stream_response: bool = False,
         priority: int = 10,
         response_validator: Callable[[dict[str, Any]], None] | None = None,
+        stream_event_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """Execute one JSON request and record only structural summaries."""
 
@@ -136,14 +139,19 @@ class ServiceTransport:
                     )
                     return cached
 
-        if request_total_timeout_seconds is not None and request_total_timeout_seconds <= 0:
+        total_timeout_seconds = (
+            request_total_timeout_seconds
+            if request_total_timeout_seconds is not None
+            else self.default_request_timeout_seconds
+        )
+        if total_timeout_seconds is not None and total_timeout_seconds <= 0:
             raise ValueError("request_total_timeout_seconds must be positive")
 
         try:
             request_once = self._request_sse_once if stream_response else self._request_once
             deadline = (
-                time.monotonic() + request_total_timeout_seconds
-                if request_total_timeout_seconds is not None
+                time.monotonic() + total_timeout_seconds
+                if total_timeout_seconds is not None
                 else None
             )
 
@@ -166,11 +174,12 @@ class ServiceTransport:
                     normalized_payload,
                     attempt_timeout,
                     priority,
+                    stream_event_callback,
                 )
 
             stop_policy = stop_after_attempt(max(1, request_attempts or self.max_retries))
-            if request_total_timeout_seconds is not None:
-                stop_policy |= stop_before_delay(request_total_timeout_seconds)
+            if total_timeout_seconds is not None:
+                stop_policy |= stop_before_delay(total_timeout_seconds)
             response = Retrying(
                 stop=stop_policy,
                 wait=wait_exponential_jitter(initial=0.5, max=8.0),
@@ -253,6 +262,7 @@ class ServiceTransport:
         payload: Mapping[str, Any],
         request_timeout_seconds: float | None = None,
         priority: int = 10,
+        stream_event_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """Collect one server-sent event response through the shared transport boundary."""
 
@@ -300,6 +310,16 @@ class ServiceTransport:
                                 f"{self.provider} returned an invalid event shape"
                             )
                         chunks.append(decoded)
+                        if stream_event_callback is not None:
+                            try:
+                                stream_event_callback(decoded)
+                            except Exception:
+                                logger.exception("SiliconFlow stream observer failed")
+                if done_received and stream_event_callback is not None:
+                    try:
+                        stream_event_callback({"_stream_event": "done"})
+                    except Exception:
+                        logger.exception("SiliconFlow stream observer failed")
         except httpx.TimeoutException as exc:
             raise RetryableServiceError(f"{self.provider} request timed out") from exc
         except httpx.TransportError as exc:
@@ -319,7 +339,9 @@ class ServiceTransport:
         payload: Mapping[str, Any],
         request_timeout_seconds: float | None = None,
         priority: int = 10,
+        stream_event_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
+        _ = stream_event_callback
         self.rate_limiter.wait()
         timeout_kwargs = (
             {"timeout": request_timeout_seconds} if request_timeout_seconds is not None else {}

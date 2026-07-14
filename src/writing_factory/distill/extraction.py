@@ -77,7 +77,6 @@ class PersonaMapExtractor:
                 seed=11,
                 response_format="json_object",
                 use_cache=True,
-                request_timeout_seconds=600.0,
                 request_attempts=1,
                 stream=True,
             )

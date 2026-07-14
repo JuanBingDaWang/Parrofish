@@ -53,10 +53,21 @@ def test_distillation_defaults_to_simplified_chinese_and_three_map_workers(
 
     assert settings.distillation_output_language == "zh-CN"
     assert settings.siliconflow_max_concurrency == 3
-    assert settings.framework_generation_timeout_seconds == 900
+    assert settings.siliconflow_request_timeout_seconds == 900
 
 
-def test_framework_generation_timeout_can_be_configured(tmp_path: Path) -> None:
+def test_siliconflow_request_timeout_can_be_configured(tmp_path: Path) -> None:
+    (tmp_path / "key_test.txt").write_text("one\ntwo\n", encoding="utf-8")
+
+    settings = load_settings(
+        tmp_path,
+        environ={"SILICONFLOW_REQUEST_TIMEOUT_SECONDS": "1200"},
+    )
+
+    assert settings.siliconflow_request_timeout_seconds == 1200
+
+
+def test_legacy_framework_timeout_environment_name_is_still_read(tmp_path: Path) -> None:
     (tmp_path / "key_test.txt").write_text("one\ntwo\n", encoding="utf-8")
 
     settings = load_settings(
@@ -64,7 +75,7 @@ def test_framework_generation_timeout_can_be_configured(tmp_path: Path) -> None:
         environ={"FRAMEWORK_GENERATION_TIMEOUT_SECONDS": "1200"},
     )
 
-    assert settings.framework_generation_timeout_seconds == 1200
+    assert settings.siliconflow_request_timeout_seconds == 1200
 
 
 def test_siliconflow_rejects_more_than_eight_concurrent_requests(tmp_path: Path) -> None:

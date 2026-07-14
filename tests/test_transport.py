@@ -178,6 +178,35 @@ def test_total_timeout_window_prevents_another_retry(tmp_path: Path) -> None:
     assert requests == 1
 
 
+def test_default_total_timeout_applies_without_per_call_override(tmp_path: Path) -> None:
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(500, json={"message": "temporary"})
+
+    transport = ServiceTransport(
+        provider="test",
+        base_url="https://example.invalid/v1",
+        credential=SecretStr("private-token"),
+        database=_database(tmp_path),
+        connect_timeout_seconds=1,
+        read_timeout_seconds=1,
+        max_retries=3,
+        default_request_timeout_seconds=0.1,
+        http_client=httpx.Client(
+            base_url="https://example.invalid/v1",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    with pytest.raises(ExternalServiceError):
+        transport.request_json("POST", "/operation", operation="operation")
+
+    assert requests == 1
+
+
 def test_protocol_disconnect_is_a_retryable_transport_failure(tmp_path: Path) -> None:
     requests = 0
 
@@ -216,6 +245,7 @@ def test_sse_response_is_collected_inside_unified_transport(tmp_path: Path) -> N
         "data: [DONE]\n\n"
     )
     database = _database(tmp_path)
+    events: list[dict] = []
 
     transport = ServiceTransport(
         provider="test",
@@ -237,12 +267,14 @@ def test_sse_response_is_collected_inside_unified_transport(tmp_path: Path) -> N
         operation="stream",
         payload={"stream": True},
         stream_response=True,
+        stream_event_callback=events.append,
     )
 
     assert [chunk["choices"][0]["delta"]["content"] for chunk in result["chunks"]] == [
         "你",
         "好",
     ]
+    assert events[-1] == {"_stream_event": "done"}
     with database.connection() as connection:
         call = connection.execute(
             "SELECT input_tokens, output_tokens, total_tokens FROM api_calls"

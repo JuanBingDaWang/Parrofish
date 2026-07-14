@@ -528,7 +528,6 @@ class AcademicDistillationEngine:
                 seed=seed,
                 response_format="json_object",
                 use_cache=True,
-                request_timeout_seconds=900.0,
                 request_attempts=2,
                 stream=True,
             )

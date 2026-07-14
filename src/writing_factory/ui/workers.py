@@ -14,6 +14,10 @@ from PyQt6.QtCore import QObject, QThread, pyqtSignal, pyqtSlot
 logger = logging.getLogger(__name__)
 
 
+def _no_stream(_kind: str, _text: str) -> None:
+    pass
+
+
 class TaskCancelled(RuntimeError):
     """Raised by cooperative work after a cancellation request."""
 
@@ -24,6 +28,7 @@ class TaskContext:
 
     _cancel_event: threading.Event
     _progress_callback: Callable[[int, str], None]
+    _stream_callback: Callable[[str, str], None] = _no_stream
 
     @property
     def is_cancelled(self) -> bool:
@@ -42,6 +47,12 @@ class TaskContext:
 
         self._progress_callback(max(0, min(100, percent)), message)
 
+    def report_stream(self, kind: str, text: str) -> None:
+        """Forward incremental model activity without blocking the worker thread."""
+
+        if text:
+            self._stream_callback(kind, text)
+
     def scaled(self, start: int, end: int, *, prefix: str = "") -> TaskContext:
         """Create a child context that maps its progress into one parent range."""
 
@@ -53,7 +64,7 @@ class TaskContext:
             label = f"{prefix}{message}" if message else prefix.removesuffix(" · ")
             self.report_progress(mapped, label)
 
-        return TaskContext(self._cancel_event, report)
+        return TaskContext(self._cancel_event, report, self._stream_callback)
 
 
 class Worker(QObject):
@@ -62,6 +73,7 @@ class Worker(QObject):
     succeeded = pyqtSignal(object)
     failed = pyqtSignal(str)
     progress = pyqtSignal(int, str)
+    streamed = pyqtSignal(str, str)
     finished = pyqtSignal()
 
     def __init__(self, task: Callable[[TaskContext], Any]) -> None:
@@ -73,7 +85,7 @@ class Worker(QObject):
     def run(self) -> None:
         """Run the task and convert failures into sanitized UI signals."""
 
-        context = TaskContext(self._cancel_event, self.progress.emit)
+        context = TaskContext(self._cancel_event, self.progress.emit, self.streamed.emit)
         try:
             context.check_cancelled()
             result = self._task(context)
@@ -110,6 +122,7 @@ class BackgroundTaskManager(QObject):
         on_success: Callable[[Any], None] | None = None,
         on_error: Callable[[str], None] | None = None,
         on_progress: Callable[[int, str], None] | None = None,
+        on_stream: Callable[[str, str], None] | None = None,
     ) -> str:
         """Move a worker to a fresh QThread and start it asynchronously."""
 
@@ -128,6 +141,8 @@ class BackgroundTaskManager(QObject):
             worker.failed.connect(on_error)
         if on_progress is not None:
             worker.progress.connect(on_progress)
+        if on_stream is not None:
+            worker.streamed.connect(on_stream)
         self._tasks[task_id] = (thread, worker)
         self.task_started.emit(task_id)
         thread.start()

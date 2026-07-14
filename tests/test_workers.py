@@ -29,3 +29,24 @@ def test_background_task_keeps_gui_event_loop_responsive(qtbot) -> None:
     timer.stop()
 
     assert len(timer_ticks) >= 3
+
+
+def test_background_task_forwards_stream_activity(qtbot) -> None:
+    manager = BackgroundTaskManager()
+    streamed: list[tuple[str, str]] = []
+    results: list[str] = []
+
+    def task(context: TaskContext) -> str:
+        context.report_stream("reasoning", "activity")
+        context.report_stream("content", "正文")
+        return "done"
+
+    manager.start(
+        task,
+        on_success=results.append,
+        on_stream=lambda kind, text: streamed.append((kind, text)),
+    )
+    qtbot.waitUntil(lambda: results == ["done"], timeout=2000)
+    qtbot.waitUntil(lambda: manager.active_count == 0, timeout=2000)
+
+    assert streamed == [("reasoning", "activity"), ("content", "正文")]

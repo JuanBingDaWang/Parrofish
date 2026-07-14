@@ -220,7 +220,7 @@ def test_reduce_builds_three_source_backed_models() -> None:
     assert len(persona.declared_limits) == 3
     assert client.calls[0]["reasoning_effort"] == "high"
     assert client.calls[0]["max_tokens"] == 8192
-    assert client.calls[0]["request_timeout_seconds"] == 1200.0
+    assert "request_timeout_seconds" not in client.calls[0]
     assert client.calls[0]["request_attempts"] == 2
 
 
