@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from writing_factory.store.migrations import apply_migrations
 
@@ -113,6 +114,32 @@ class Database:
                 """,
                 (cache_key, provider, operation, payload, utc_now(), expires_at),
             )
+
+    def delete_cached_response(self, cache_key: str) -> None:
+        """Remove one response that failed a caller-supplied validity check."""
+
+        with self.connection() as connection:
+            connection.execute("DELETE FROM api_cache WHERE cache_key = ?", (cache_key,))
+
+    def quarantine_response(
+        self,
+        *,
+        call_id: str,
+        request_hash: str,
+        provider: str,
+        operation: str,
+        response: Mapping[str, Any],
+    ) -> str:
+        """Retain an invalid raw response under a key normal cache reads cannot hit."""
+
+        quarantine_key = f"invalid:{request_hash}:{call_id}:{uuid4().hex}"
+        self.set_cached_response(
+            quarantine_key,
+            provider,
+            f"{operation}:invalid",
+            response,
+        )
+        return quarantine_key
 
     def record_api_call(self, record: ApiCallRecord) -> None:
         """Persist call metadata without raw prompts, results, or credentials."""

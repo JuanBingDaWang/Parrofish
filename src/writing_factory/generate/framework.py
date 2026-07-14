@@ -23,6 +23,7 @@ from writing_factory.generate.source_policy import (
     task_document_filter,
 )
 from writing_factory.kb.models import RetrievalRequest
+from writing_factory.llm.models import ChatResult
 
 if TYPE_CHECKING:
     from writing_factory.kb.retrieval import HybridRetriever
@@ -33,6 +34,11 @@ logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[int, str], None]
 CancellationCheck = Callable[[], None]
+FRAMEWORK_OUTPUT_TOKEN_LIMITS = (8192, 16384, 32768)
+
+
+class FrameworkOutputError(ValueError):
+    """The provider completed a request without a usable full outline."""
 
 
 def _no_progress(_percent: int, _message: str) -> None:
@@ -135,31 +141,63 @@ def build_framework(
         node_retrieval_results=node_retrieval_results,
     )
 
-    progress(50, "调用 LLM 构建提纲")
+    # ── 5. 校验并解析为 AnnotatedOutline ─────────────────────────────
+    outline: AnnotatedOutline | None = None
+    last_error: FrameworkOutputError | None = None
+    for attempt, max_tokens in enumerate(FRAMEWORK_OUTPUT_TOKEN_LIMITS, start=1):
+        check_cancelled()
+        progress(
+            50,
+            f"调用 LLM 构建提纲（第 {attempt}/3 次，最多 {max_tokens} tokens）",
+        )
+        active_messages = messages
+        if last_error is not None:
+            active_messages = [
+                *messages,
+                {
+                    "role": "user",
+                    "content": (
+                        "上一次框架输出不完整或不符合 JSON Schema。请从头重新生成完整的 "
+                        "AnnotatedOutline JSON 对象，不要续写残片，不要添加解释或 Markdown。"
+                        f"上一次校验错误：{str(last_error)[:600]}"
+                    ),
+                },
+            ]
+        try:
+            result = siliconflow.chat(
+                active_messages,
+                thinking=True,
+                reasoning_effort="high",
+                temperature=0.3,
+                max_tokens=max_tokens,
+                response_format="json_object",
+                seed=42,
+                request_timeout_seconds=request_timeout_seconds,
+                request_total_timeout_seconds=request_timeout_seconds,
+                stream=True,
+                result_validator=_validate_framework_result,
+            )
+            outline = _parse_framework_result(result)
+            break
+        except FrameworkOutputError as exc:
+            last_error = exc
+            logger.warning(
+                "框架输出校验失败，将重新生成: attempt=%d max_tokens=%d error=%s",
+                attempt,
+                max_tokens,
+                str(exc)[:600],
+            )
+            if attempt == len(FRAMEWORK_OUTPUT_TOKEN_LIMITS):
+                raise ValueError(
+                    "LLM 连续三次未返回完整有效的 AnnotatedOutline JSON："
+                    f"{exc}"
+                ) from exc
+
+    if outline is None:
+        raise ValueError("LLM 未返回可用的 AnnotatedOutline")
+
+    progress(85, "提纲 JSON 校验完成")
     check_cancelled()
-
-    result = siliconflow.chat(
-        messages,
-        thinking=True,
-        reasoning_effort="high",
-        temperature=0.3,
-        max_tokens=4096,
-        response_format="json_object",
-        seed=42,
-        request_timeout_seconds=request_timeout_seconds,
-        request_total_timeout_seconds=request_timeout_seconds,
-        stream=True,
-    )
-
-    progress(85, "解析提纲结果")
-    check_cancelled()
-
-    # ── 5. 解析为 AnnotatedOutline ───────────────────────────────────
-    try:
-        outline = AnnotatedOutline.model_validate_json(result.content)
-    except Exception as exc:
-        logger.error("提纲解析失败，原始响应: %s", result.content[:500])
-        raise ValueError(f"LLM 返回的提纲结果无法解析为 AnnotatedOutline: {exc}") from exc
 
     progress(88, "按提纲节点检索候选证据")
     outline = _attach_node_evidence(
@@ -180,6 +218,31 @@ def build_framework(
         len(outline.term_registry),
     )
     return outline
+
+
+def _validate_framework_result(result: ChatResult) -> None:
+    """Validate a chat result before the transport is allowed to cache it."""
+
+    _parse_framework_result(result)
+
+
+def _parse_framework_result(result: ChatResult) -> AnnotatedOutline:
+    if result.finish_reason == "length":
+        raise FrameworkOutputError("输出达到 max_tokens 上限，JSON 被截断")
+    if result.finish_reason != "stop":
+        reason = result.finish_reason or "missing"
+        raise FrameworkOutputError(f"流结束时缺少正常 stop 标记（finish_reason={reason}）")
+    try:
+        return AnnotatedOutline.model_validate_json(result.content)
+    except Exception as exc:
+        detail = str(exc)
+        if "EOF while parsing" in detail or (
+            "EOF" in detail and "json" in detail.lower()
+        ):
+            raise FrameworkOutputError("JSON 在输出结束前被截断（EOF）") from exc
+        raise FrameworkOutputError(
+            f"JSON 无法通过 AnnotatedOutline 校验：{detail[:1200]}"
+        ) from exc
 
 
 def _format_broad_retrieval(retrieval_result) -> list[dict[str, object]]:

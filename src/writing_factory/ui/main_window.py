@@ -291,7 +291,7 @@ class MainWindow(QMainWindow):
         timeout_layout.setSpacing(16)
         timeout_label = QLabel("框架生成超时上限")
         timeout_label.setObjectName("providerName")
-        timeout_description = QLabel("SiliconFlow 请求总等待窗口（含重试）")
+        timeout_description = QLabel("SiliconFlow 单次框架生成尝试（含网络重试）")
         timeout_description.setObjectName("mutedText")
         self.framework_timeout_input = QSpinBox()
         self.framework_timeout_input.setRange(60, 3600)
@@ -299,7 +299,7 @@ class MainWindow(QMainWindow):
         self.framework_timeout_input.setSuffix(" 秒")
         self.framework_timeout_input.setValue(self._get_framework_generation_timeout())
         self.framework_timeout_input.setToolTip(
-            "仅用于论文框架生成；超时后任务停在框架节点，可从断点继续"
+            "每次完整生成尝试分别计时；超时后任务停在框架节点，可从断点继续"
         )
         self.framework_timeout_input.valueChanged.connect(self._framework_timeout_changed)
         timeout_layout.addWidget(timeout_label)
@@ -372,7 +372,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"SiliconFlow 最大并发数已设为 {value}", 4000)
 
     def _framework_timeout_changed(self, value: int) -> None:
-        """持久化框架生成请求的总超时上限。"""
+        """持久化单次框架生成尝试的超时上限。"""
 
         if self._set_framework_generation_timeout is None:
             return

@@ -66,7 +66,7 @@ class ApplicationContext:
         self.distillation.set_max_parallel_tasks(value)
 
     def get_framework_generation_timeout(self) -> int:
-        """读取框架生成请求包含重试在内的总超时秒数。"""
+        """读取每次框架生成尝试包含网络重试在内的超时秒数。"""
 
         value = self.runtime_settings.get(
             "framework_generation_timeout_seconds",
@@ -77,7 +77,7 @@ class ApplicationContext:
         return self.settings.framework_generation_timeout_seconds
 
     def set_framework_generation_timeout(self, value: int) -> None:
-        """校验并持久化框架生成请求的总超时秒数。"""
+        """校验并持久化单次框架生成尝试的超时秒数。"""
 
         if not 60 <= value <= 3600:
             raise ValueError("框架生成超时上限必须在 60 至 3600 秒之间")

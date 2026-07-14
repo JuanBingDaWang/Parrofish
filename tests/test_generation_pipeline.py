@@ -189,7 +189,7 @@ class FakeSiliconFlow:
         content = (
             response if isinstance(response, str) else json.dumps(response, ensure_ascii=False)
         )
-        return ChatResult(content=content, model="fake")
+        return ChatResult(content=content, model="fake", finish_reason="stop")
 
 
 def test_full_writing_graph_runs_offline(tmp_path: Path) -> None:
@@ -226,6 +226,7 @@ def test_full_writing_graph_runs_offline(tmp_path: Path) -> None:
     assert context.progress[-1][0] == 100
     assert client.calls[1][1]["request_timeout_seconds"] == 900.0
     assert client.calls[1][1]["request_total_timeout_seconds"] == 900.0
+    assert client.calls[1][1]["max_tokens"] == 8192
     assert client.calls[1][1]["stream"] is True
 
     resumed_client = FakeSiliconFlow()
@@ -247,6 +248,55 @@ def test_full_writing_graph_runs_offline(tmp_path: Path) -> None:
     )
     assert resumed["status"] == "done"
     assert resumed_client.calls == []
+
+
+def test_framework_regenerates_with_doubled_output_limits(tmp_path: Path) -> None:
+    class TruncatedFrameworkClient(FakeSiliconFlow):
+        def chat(self, messages, **kwargs):
+            if len(self.calls) == 1:
+                self.calls.append((messages, kwargs))
+                return ChatResult(
+                    content='{"thesis": {"thesis_text": "被截断',
+                    model="fake",
+                    finish_reason="length",
+                )
+            if len(self.calls) == 2:
+                self.calls.append((messages, kwargs))
+                return ChatResult(
+                    content='{"thesis": {"thesis_text": "仍然截断',
+                    model="fake",
+                    finish_reason="stop",
+                )
+            return super().chat(messages, **kwargs)
+
+    kb_repository = FakeKnowledgeRepository()
+    client = TruncatedFrameworkClient()
+    result = run_writing_pipeline_with_progress(
+        persona_id="persona_1",
+        task_description="讨论数字人文方法",
+        domain="数字人文",
+        context=FakeTaskContext(),
+        siliconflow=client,
+        retriever=FakeRetriever(kb_repository),
+        persona_repository=FakePersonaRepository(),
+        kb_repository=kb_repository,
+        checkpoint_dir=tmp_path,
+        kb_id="kb",
+        task_id="task_framework_regeneration",
+        selected_doc_ids={"doc_task"},
+    )
+
+    assert result["status"] == "done"
+    assert [client.calls[index][1]["max_tokens"] for index in (1, 2, 3)] == [
+        8192,
+        16384,
+        32768,
+    ]
+    assert all(
+        client.calls[index][1]["request_total_timeout_seconds"] == 900.0
+        for index in (1, 2, 3)
+    )
+    assert "从头重新生成" in client.calls[2][0][-1]["content"]
 
 
 def test_framework_failure_stops_and_resume_retries_failed_node(tmp_path: Path) -> None:

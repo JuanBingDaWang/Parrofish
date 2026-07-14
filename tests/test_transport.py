@@ -250,6 +250,122 @@ def test_sse_response_is_collected_inside_unified_transport(tmp_path: Path) -> N
     assert dict(call) == {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5}
 
 
+def test_sse_response_without_done_marker_is_rejected(tmp_path: Path) -> None:
+    body = 'data: {"choices":[{"delta":{"content":"未完成"}}]}\n\n'
+    transport = ServiceTransport(
+        provider="test",
+        base_url="https://example.invalid/v1",
+        credential=SecretStr("private-token"),
+        database=_database(tmp_path),
+        connect_timeout_seconds=1,
+        read_timeout_seconds=1,
+        max_retries=1,
+        http_client=httpx.Client(
+            base_url="https://example.invalid/v1",
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, text=body)),
+        ),
+    )
+
+    with pytest.raises(ExternalServiceError, match=r"before \[DONE\]"):
+        transport.request_json(
+            "POST",
+            "/stream",
+            operation="stream",
+            payload={"stream": True},
+            stream_response=True,
+        )
+
+
+def test_invalid_cached_response_is_quarantined_and_refetched(tmp_path: Path) -> None:
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(200, json={"valid": requests > 1, "attempt": requests})
+
+    database = _database(tmp_path)
+    transport = ServiceTransport(
+        provider="test",
+        base_url="https://example.invalid/v1",
+        credential=SecretStr("private-token"),
+        database=database,
+        connect_timeout_seconds=1,
+        read_timeout_seconds=1,
+        max_retries=1,
+        http_client=httpx.Client(
+            base_url="https://example.invalid/v1",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+    arguments = {
+        "method": "POST",
+        "path": "/validated",
+        "operation": "validated",
+        "payload": {"input": "same"},
+        "use_cache": True,
+    }
+    first = transport.request_json(**arguments)
+
+    def require_valid(response: dict) -> None:
+        if not response.get("valid"):
+            raise ValueError("invalid fixture")
+
+    second = transport.request_json(**arguments, response_validator=require_valid)
+    third = transport.request_json(**arguments, response_validator=require_valid)
+
+    assert first["valid"] is False
+    assert second == third == {"valid": True, "attempt": 2}
+    assert requests == 2
+    with database.connection() as connection:
+        cached = connection.execute(
+            "SELECT cache_key, operation FROM api_cache ORDER BY operation"
+        ).fetchall()
+    assert len(cached) == 2
+    assert any(row["cache_key"].startswith("invalid:") for row in cached)
+    assert {row["operation"] for row in cached} == {"validated", "validated:invalid"}
+
+
+def test_fresh_invalid_response_is_only_written_to_quarantine(tmp_path: Path) -> None:
+    database = _database(tmp_path)
+    transport = ServiceTransport(
+        provider="test",
+        base_url="https://example.invalid/v1",
+        credential=SecretStr("private-token"),
+        database=database,
+        connect_timeout_seconds=1,
+        read_timeout_seconds=1,
+        max_retries=1,
+        http_client=httpx.Client(
+            base_url="https://example.invalid/v1",
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, json={"valid": False})
+            ),
+        ),
+    )
+
+    def reject(_response: dict) -> None:
+        raise ValueError("invalid fixture")
+
+    with pytest.raises(ValueError, match="invalid fixture"):
+        transport.request_json(
+            "POST",
+            "/validated",
+            operation="validated",
+            payload={"input": "same"},
+            use_cache=True,
+            response_validator=reject,
+        )
+
+    with database.connection() as connection:
+        cached = connection.execute("SELECT cache_key, operation FROM api_cache").fetchall()
+        call = connection.execute("SELECT status, error_type FROM api_calls").fetchone()
+    assert len(cached) == 1
+    assert cached[0]["cache_key"].startswith("invalid:")
+    assert cached[0]["operation"] == "validated:invalid"
+    assert dict(call) == {"status": "error", "error_type": "ValueError"}
+
+
 def test_presigned_upload_never_sends_provider_authorization(tmp_path: Path) -> None:
     uploaded_headers: list[httpx.Headers] = []
 

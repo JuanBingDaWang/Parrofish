@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, Literal
 
 from writing_factory.config import Settings
@@ -63,6 +63,7 @@ class SiliconFlowClient:
         request_attempts: int | None = None,
         stream: bool = False,
         priority: int = 10,
+        result_validator: Callable[[ChatResult], None] | None = None,
     ) -> ChatResult:
         """Run a deterministic or creative chat request, optionally over SSE."""
 
@@ -81,6 +82,11 @@ class SiliconFlowClient:
             payload["reasoning_effort"] = reasoning_effort
         if seed is not None:
             payload["seed"] = seed
+
+        def validate_response(response: dict[str, Any]) -> None:
+            if result_validator is not None:
+                result_validator(self._chat_result(response, streamed=stream))
+
         response = self.transport.request_json(
             "POST",
             "/chat/completions",
@@ -99,8 +105,17 @@ class SiliconFlowClient:
             request_attempts=request_attempts,
             stream_response=stream,
             priority=priority,
+            response_validator=validate_response if result_validator is not None else None,
         )
-        if stream:
+        result = self._chat_result(response, streamed=stream)
+        if result_validator is not None:
+            result_validator(result)
+        return result
+
+    def _chat_result(self, response: dict[str, Any], *, streamed: bool) -> ChatResult:
+        """Parse one raw provider response into the stable chat contract."""
+
+        if streamed:
             return self._streamed_chat_result(response)
         try:
             choice = response["choices"][0]

@@ -39,9 +39,11 @@ def test_chat_connection(tmp_path: Path) -> None:
             max_tokens=8,
             seed=7,
             use_cache=False,
+            stream=True,
         )
     finally:
         client.close()
 
     assert result.content.strip()
     assert result.model
+    assert result.finish_reason == "stop"

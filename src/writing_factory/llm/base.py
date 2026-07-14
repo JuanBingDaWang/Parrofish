@@ -7,7 +7,7 @@ import json
 import logging
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from typing import Any
 
@@ -88,6 +88,7 @@ class ServiceTransport:
         request_attempts: int | None = None,
         stream_response: bool = False,
         priority: int = 10,
+        response_validator: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """Execute one JSON request and record only structural summaries."""
 
@@ -100,19 +101,40 @@ class ServiceTransport:
         if use_cache:
             cached = self.database.get_cached_response(request_hash)
             if cached is not None:
-                self._record_call(
-                    call_id=call_id,
-                    request_hash=request_hash,
-                    operation=operation,
-                    model=model,
-                    reasoning_effort=reasoning_effort,
-                    prompt_summary=summary,
-                    cache_hit=True,
-                    status="success",
-                    duration_ms=self._elapsed_ms(started_at),
-                    response=cached,
-                )
-                return cached
+                try:
+                    if response_validator is not None:
+                        response_validator(cached)
+                except Exception as exc:
+                    self.database.quarantine_response(
+                        call_id=call_id,
+                        request_hash=request_hash,
+                        provider=self.provider,
+                        operation=operation,
+                        response=cached,
+                    )
+                    self.database.delete_cached_response(request_hash)
+                    logger.warning(
+                        "discarded invalid cached response provider=%s operation=%s "
+                        "error_type=%s call_id=%s",
+                        self.provider,
+                        operation,
+                        type(exc).__name__,
+                        call_id,
+                    )
+                else:
+                    self._record_call(
+                        call_id=call_id,
+                        request_hash=request_hash,
+                        operation=operation,
+                        model=model,
+                        reasoning_effort=reasoning_effort,
+                        prompt_summary=summary,
+                        cache_hit=True,
+                        status="success",
+                        duration_ms=self._elapsed_ms(started_at),
+                        response=cached,
+                    )
+                    return cached
 
         if request_total_timeout_seconds is not None and request_total_timeout_seconds <= 0:
             raise ValueError("request_total_timeout_seconds must be positive")
@@ -177,6 +199,32 @@ class ServiceTransport:
                 raise
             raise safe_error from exc
 
+        try:
+            if response_validator is not None:
+                response_validator(response)
+        except Exception as exc:
+            self.database.quarantine_response(
+                call_id=call_id,
+                request_hash=request_hash,
+                provider=self.provider,
+                operation=operation,
+                response=response,
+            )
+            self._record_call(
+                call_id=call_id,
+                request_hash=request_hash,
+                operation=operation,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                prompt_summary=summary,
+                cache_hit=False,
+                status="error",
+                duration_ms=self._elapsed_ms(started_at),
+                response=response,
+                error_type=type(exc).__name__,
+            )
+            raise
+
         if use_cache:
             self.database.set_cached_response(
                 request_hash,
@@ -214,6 +262,7 @@ class ServiceTransport:
         )
         wall_started = time.monotonic()
         chunks: list[dict[str, Any]] = []
+        done_received = False
         gate = self.concurrency_gate
         slot = gate.slot(priority=priority) if gate is not None else _null_slot()
         try:
@@ -238,6 +287,7 @@ class ServiceTransport:
                             continue
                         data = value[5:].strip()
                         if data == "[DONE]":
+                            done_received = True
                             break
                         try:
                             decoded = json.loads(data)
@@ -254,6 +304,10 @@ class ServiceTransport:
             raise RetryableServiceError(f"{self.provider} request timed out") from exc
         except httpx.TransportError as exc:
             raise RetryableServiceError(f"{self.provider} network error") from exc
+        if not done_received:
+            raise RetryableServiceError(
+                f"{self.provider} event stream ended before [DONE]"
+            )
         if not chunks:
             raise ExternalServiceError(f"{self.provider} returned an empty event stream")
         return {"chunks": chunks}
