@@ -90,6 +90,7 @@ class ProjectRepository:
         citation_style: str,
         selected_doc_ids: set[str],
         allowed_persona_doc_ids: set[str] | None = None,
+        generation_options: dict | None = None,
     ) -> str:
         if not selected_doc_ids:
             raise ValueError("写作任务至少需要选择一篇事实语料")
@@ -101,8 +102,9 @@ class ProjectRepository:
                 INSERT INTO writing_tasks(
                     task_id, project_id, kb_id, persona_id, title, task_description,
                     domain, citation_style, selected_doc_ids_json,
-                    allowed_persona_doc_ids_json, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                    allowed_persona_doc_ids_json, generation_options_json,
+                    status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
                 """,
                 (
                     task_id,
@@ -115,6 +117,7 @@ class ProjectRepository:
                     citation_style,
                     json.dumps(sorted(selected_doc_ids), ensure_ascii=False),
                     json.dumps(sorted(allowed_persona_doc_ids or set()), ensure_ascii=False),
+                    json.dumps(generation_options or {}, ensure_ascii=False),
                     now,
                     now,
                 ),
@@ -122,9 +125,10 @@ class ProjectRepository:
         return task_id
 
     def update_task_state(self, task_id: str, state: dict) -> None:
-        status = str(state.get("status", "unknown"))
+        state_status = str(state.get("status", "unknown"))
+        status = state_status if state_status in {"done", "error", "cancelled"} else "running"
         now = utc_now()
-        completed_at = now if status == "done" else None
+        completed_at = now if state_status == "done" else None
         with self.database.connection() as connection:
             connection.execute(
                 """
@@ -197,6 +201,9 @@ class ProjectRepository:
         result["selected_doc_ids"] = set(json.loads(result.pop("selected_doc_ids_json")))
         result["allowed_persona_doc_ids"] = set(
             json.loads(result.pop("allowed_persona_doc_ids_json"))
+        )
+        result["generation_options"] = json.loads(
+            result.pop("generation_options_json", "{}") or "{}"
         )
         result["state"] = json.loads(result["state_json"]) if result.get("state_json") else None
         result["evaluation"] = (

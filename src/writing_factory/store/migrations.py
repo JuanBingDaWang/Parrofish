@@ -321,6 +321,10 @@ MIGRATIONS: tuple[str, ...] = (
     CREATE INDEX IF NOT EXISTS idx_writing_tasks_status
         ON writing_tasks(status, updated_at DESC);
     """,
+    """
+    ALTER TABLE writing_tasks
+        ADD COLUMN generation_options_json TEXT NOT NULL DEFAULT '{}';
+    """,
 )
 
 

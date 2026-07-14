@@ -276,6 +276,14 @@ def framework_messages(
             每项含 node_id（临时标识）、heading_hint（建议标题）、retrieved_chunks 等
     """
 
+    target_length = context.generation_options.target_length_chars
+    if target_length <= 2000:
+        unit_range = "3-5"
+    elif target_length <= 5000:
+        unit_range = "4-8"
+    else:
+        ideal = max(6, min(14, round(target_length / 750)))
+        unit_range = f"{max(5, ideal - 2)}-{min(16, ideal + 2)}"
     request = {
         "task": "构建论证骨架",
         "rules": [
@@ -286,6 +294,8 @@ def framework_messages(
             "如果某个节点完全没有 KB 支持且无法作为纯论证，不要包含它。",
             "term_registry 列出论文中使用的关键术语及其定义，确保全文一致性。",
             "提纲应有清晰的层次结构（一级节点 → 二级子节点），深度不超过 3 层。",
+            f"全文目标约 {target_length} 字，只安排 {unit_range} 个叶子正文单元。",
+            "有 children 的父节点只作为层级标题容器，不单独写正文；正文内容不得与子节点重复。",
         ],
         "response_schema": _schema_without_titles(AnnotatedOutline.model_json_schema()),
     }
@@ -294,6 +304,8 @@ def framework_messages(
         "thesis": thesis.model_dump(mode="json"),
         "node_retrieval_results": node_retrieval_results,
         "kb_id": context.kb_id,
+        "target_length_chars": target_length,
+        "drafting_unit_range": unit_range,
     }
     return [
         {"role": "system", "content": FRAMEWORK_SYSTEM},
@@ -324,6 +336,7 @@ def drafting_messages(
     next_section_purpose: str | None = None,
     revision_feedback: list[dict[str, str]] | None = None,
     prior_claims: list[str] | None = None,
+    target_length_chars: int | None = None,
 ) -> list[dict[str, str]]:
     """构造起草请求：persona + 锚定论点 + 本节提纲节点 + 证据包 → 结构化草稿。
 
@@ -345,8 +358,8 @@ def drafting_messages(
             "fact 类型论断的 source_keys 不能为空。",
             "不得引入证据包之外的任何事实、数据、引文、书名、人名、年份或事件。",
             "按 persona 的论证风格和表达习惯组织段落，但保持学术论文的第三人称规范。",
-            "段落数控制在 3-8 段，每段不宜过长。",
             "source_key 在正文中使用 [S1]、[S2] 等标记，置于相关陈述之后。",
+            "只能使用 allowed_source_keys 中列出的 source_key；其他章节出现过的键一律不可用。",
             "只返回 section_id、heading、paragraphs、claims；不得回传 evidence_pack。",
         ],
         "response_schema": _schema_without_titles(SectionDraftOutput.model_json_schema()),
@@ -360,8 +373,21 @@ def drafting_messages(
             "rhetorical_purpose": outline_node.rhetorical_purpose,
         },
         "evidence_pack": evidence_pack.model_dump(mode="json"),
+        "allowed_source_keys": [item.source_key for item in evidence_pack.items],
         "term_registry": term_registry,
     }
+    if target_length_chars:
+        if target_length_chars <= 500:
+            paragraph_rule = "控制在 1-3 段"
+        elif target_length_chars <= 1000:
+            paragraph_rule = "控制在 2-5 段"
+        else:
+            paragraph_rule = "控制在 3-8 段"
+        payload["target_length_chars"] = target_length_chars
+        request["rules"].append(
+            f"本正文单元目标约 {target_length_chars} 个中文字符"
+            f"（允许上下浮动 20%），{paragraph_rule}。"
+        )
     if previous_section_conclusion:
         payload["previous_section_conclusion"] = previous_section_conclusion
     if next_section_purpose:

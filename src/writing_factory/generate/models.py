@@ -28,6 +28,74 @@ VerificationVerdict = Literal["supported", "partial", "unsupported"]
 """
 
 CitationStyle = Literal["gb-t-7714", "apa", "mla"]
+QualityPreset = Literal["strict", "balanced", "fast_draft", "custom"]
+GenerationQualityStatus = Literal["verified_final", "unverified_draft"]
+
+
+class GenerationOptions(BaseModel):
+    """Per-task quality and cost controls persisted with every checkpoint."""
+
+    model_config = ConfigDict(frozen=True)
+
+    preset: QualityPreset = Field(default="strict", description="质量预设")
+    target_length_chars: int = Field(default=5000, ge=500, le=100000, description="目标中文字数")
+    fact_verification: bool = Field(default=True, description="是否执行 LLM 事实语义核验")
+    section_polish: bool = Field(default=True, description="是否执行逐节文风打磨")
+    section_drift_check: bool = Field(default=True, description="是否核对逐节打磨后的事实漂移")
+    term_review: bool = Field(default=True, description="是否执行全文术语审查")
+    structure_review: bool = Field(default=True, description="是否执行全文结构审查")
+    global_polish: bool = Field(default=True, description="是否执行全局一致性打磨")
+    global_drift_check: bool = Field(default=True, description="是否核对全局打磨后的事实漂移")
+
+    @classmethod
+    def from_preset(
+        cls,
+        preset: QualityPreset,
+        *,
+        target_length_chars: int,
+    ) -> GenerationOptions:
+        """Build one of the supported user-facing quality profiles."""
+
+        if preset == "strict":
+            return cls(target_length_chars=target_length_chars)
+        if preset == "balanced":
+            return cls(
+                preset=preset,
+                target_length_chars=target_length_chars,
+                section_polish=False,
+                section_drift_check=False,
+                term_review=False,
+                structure_review=False,
+                global_polish=False,
+                global_drift_check=False,
+            )
+        if preset == "fast_draft":
+            return cls(
+                preset=preset,
+                target_length_chars=target_length_chars,
+                fact_verification=False,
+                section_polish=False,
+                section_drift_check=False,
+                term_review=False,
+                structure_review=False,
+                global_polish=False,
+                global_drift_check=False,
+            )
+        return cls(preset=preset, target_length_chars=target_length_chars)
+
+    @property
+    def quality_status(self) -> GenerationQualityStatus:
+        """Only fully checked transformation chains qualify as verified final copy."""
+
+        transformations_checked = (
+            (not self.section_polish or self.section_drift_check)
+            and (not self.global_polish or self.global_drift_check)
+        )
+        return (
+            "verified_final"
+            if self.fact_verification and transformations_checked
+            else "unverified_draft"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +338,10 @@ class VerifiedDraft(BaseModel):
     unsupported_count: int = Field(default=0, description="unsupported 论断数")
     partial_count: int = Field(default=0, description="partial 论断数")
     supported_count: int = Field(default=0, description="supported 论断数")
+    semantic_verification_performed: bool = Field(
+        default=True,
+        description="是否执行了中性 LLM 语义核验；False 表示仅通过结构安全门",
+    )
 
     @model_validator(mode="after")
     def validate_verdict_counts(self) -> VerifiedDraft:
@@ -333,6 +405,8 @@ class PolishedSection(BaseModel):
         description="候选打磨发生漂移或核对失败时，是否已回退到冻结事实版本",
     )
     safety_note: str = Field(default="", description="打磨安全门的处理说明")
+    style_polish_performed: bool = Field(default=True, description="是否执行了 LLM 文风打磨")
+    drift_check_performed: bool = Field(default=True, description="是否执行了中性 LLM 防漂移检查")
 
 
 class PolishedDraft(BaseModel):
@@ -345,6 +419,11 @@ class PolishedDraft(BaseModel):
     reference_list: ReferenceList = Field(description="代码拼装的参考文献列表")
     thesis: ThesisStatement = Field(description="锚定论点")
     fact_drift_free: bool = Field(default=True, description="全篇打磨后是否无事实漂移")
+    quality_status: GenerationQualityStatus = Field(
+        default="verified_final",
+        description="verified_final 或明确标记的 unverified_draft",
+    )
+    quality_notes: list[str] = Field(default_factory=list, description="未执行质量步骤的透明说明")
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +448,10 @@ class GenerationContext(BaseModel):
         default=(), description="默认排除的作者蒸馏来源文档"
     )
     source_policy_id: str | None = Field(default=None, description="事实来源隔离策略标识")
+    generation_options: GenerationOptions = Field(
+        default_factory=GenerationOptions,
+        description="本任务冻结的篇幅与质量选项",
+    )
 
 
 # ---------------------------------------------------------------------------

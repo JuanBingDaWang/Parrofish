@@ -100,21 +100,24 @@ def test_writing_page_previews_isolated_target_sources_and_uses_scroll_regions(q
 
     assert page.source_summary_label.text() == "已选 3 篇 · 隔离 2 篇 · 实际可用 1 篇"
     assert page.start_button.isEnabled()
-    assert isinstance(page.main_splitter.widget(0), QScrollArea)
+    assert page.main_splitter.orientation() == Qt.Orientation.Horizontal
+    assert page.main_splitter.widget(0) is page.history_scroll
     assert isinstance(page.history_scroll, QScrollArea)
+    assert page.history_scroll.minimumWidth() >= 250
     assert isinstance(page.progress_scroll, QScrollArea)
+    assert page.workspace_tabs.count() == 3
     assert page.document_list.minimumHeight() >= 180
     assert page.task_table.maximumHeight() > 1000
     assert page.section_table.maximumHeight() > 1000
     window.navigation.setCurrentRow(3)
-    page.progress_scroll.show()
     window.resize(960, 640)
     window.show()
     qtbot.waitUntil(
-        lambda: page.history_scroll.verticalScrollBar().maximum() > 0
-        and page.progress_scroll.verticalScrollBar().maximum() > 0,
+        lambda: page.config_scroll.verticalScrollBar().maximum() > 0,
         timeout=2000,
     )
+    page.workspace_tabs.setCurrentIndex(page._progress_workspace_index)
+    assert page.progress_tabs.isVisible()
     page._pipeline_streamed("content", "实时内容")
     qtbot.waitUntil(
         lambda: page.progress_scroll.verticalScrollBar().value()
@@ -129,6 +132,47 @@ def test_writing_page_previews_isolated_target_sources_and_uses_scroll_regions(q
     page.allow_persona_sources.setChecked(True)
     assert page.source_summary_label.text() == "已选 2 篇 · 隔离 0 篇 · 实际可用 2 篇"
     assert page.start_button.isEnabled()
+
+
+def test_loading_checkpoint_tracks_current_section(qtbot) -> None:
+    state = {
+        "status": "drafting",
+        "current_section_index": 1,
+        "sections": [
+            {"section_id": "1", "heading": "第一节", "status": "polished"},
+            {"section_id": "2", "heading": "第二节", "status": "drafting"},
+        ],
+    }
+    window = MainWindow(
+        lambda: ChatResult(content="OK", model="test"),
+        list_projects=lambda: [{"project_id": "project", "title": "项目"}],
+        list_writing_tasks=lambda _project_id: [
+            {
+                "task_id": "task",
+                "title": "任务",
+                "status": "error",
+                "updated_at": "2026-07-14T06:17:37+00:00",
+            }
+        ],
+        load_writing_task=lambda _task_id: {
+            "task_id": "task",
+            "title": "任务",
+            "task_description": "要求",
+            "domain": "领域",
+            "selected_doc_ids": set(),
+            "allowed_persona_doc_ids": set(),
+            "generation_options": {},
+            "state": state,
+        },
+    )
+    qtbot.addWidget(window)
+    page = window.writing_task_page
+    page.task_table.selectRow(0)
+
+    page._load_selected_task()
+
+    assert page._current_section_index == 1
+    assert page.section_table.currentRow() == 1
 
 
 def test_project_and_writing_times_display_as_east_eight(qtbot) -> None:
@@ -155,6 +199,9 @@ def test_project_and_writing_times_display_as_east_eight(qtbot) -> None:
 
     assert window.project_page.table.item(0, 4).text() == "2026-07-14 14:17:37"
     assert window.writing_task_page.task_table.item(0, 3).text() == "2026-07-14 14:17:37"
+    window.writing_task_page.task_table.selectRow(0)
+    assert window.writing_task_page.task_error_label.toPlainText() == "失败详情：超时"
+    assert window.writing_task_page.task_error_label.maximumHeight() <= 96
 
 
 def test_writing_failure_refreshes_history_without_green_full_progress(qtbot) -> None:
@@ -206,7 +253,7 @@ def test_writing_page_shows_elapsed_time_and_public_stream_only(qtbot) -> None:
     content = page.live_output_view.toPlainText()
     assert "正在准备流水线" in content
     assert "全文结构审查" in content
-    assert "结构清晰" in content
+    assert "结构清晰" not in content
     assert "本次流式输出中断" in content
     page._update_elapsed_display()
     assert "本次运行 01:05" in page.elapsed_label.text()
@@ -235,6 +282,71 @@ def test_live_output_popout_shares_document_and_controls(qtbot) -> None:
     page._copy_live_output()
     assert QApplication.clipboard().text() == page.live_output_view.toPlainText()
     popout.close()
+
+
+def test_writing_quality_presets_and_automatic_length_detection(qtbot) -> None:
+    window = MainWindow(lambda: ChatResult(content="OK", model="test"))
+    qtbot.addWidget(window)
+    page = window.writing_task_page
+    page.task_input.setPlainText("写一篇1500字左右的数字出版综述")
+    page.target_length_spin.setValue(0)
+    page.quality_preset_combo.setCurrentIndex(
+        page.quality_preset_combo.findData("fast_draft")
+    )
+
+    options = page._generation_options()
+
+    assert options.target_length_chars == 1500
+    assert not options.fact_verification
+    assert not options.section_polish
+    assert all(not checkbox.isEnabled() for checkbox in page._quality_checkboxes)
+
+    page.quality_preset_combo.setCurrentIndex(page.quality_preset_combo.findData("custom"))
+    page.fact_verification_checkbox.setChecked(True)
+    page.section_polish_checkbox.setChecked(False)
+    custom = page._generation_options()
+    assert custom.preset == "custom"
+    assert custom.fact_verification
+    assert not custom.section_polish
+
+
+def test_pipeline_state_updates_sections_partial_draft_and_diagnostics(qtbot) -> None:
+    window = MainWindow(lambda: ChatResult(content="OK", model="test"))
+    qtbot.addWidget(window)
+    page = window.writing_task_page
+    state = {
+        "status": "drafting",
+        "current_section_index": 1,
+        "sections": [
+            {
+                "section_id": "1",
+                "heading": "第一节",
+                "status": "polished",
+                "revision_count": 1,
+                "elapsed_seconds": 125,
+                "polished_text": "已经保存的第一节正文。",
+            },
+            {
+                "section_id": "2",
+                "heading": "第二节",
+                "status": "revising",
+                "revision_count": 2,
+                "elapsed_seconds": 30,
+            },
+        ],
+    }
+
+    page._pipeline_streamed("pipeline_state", json.dumps(state, ensure_ascii=False))
+    page._pipeline_streamed("content::HyDE 假设文档", "检索辅助文本")
+
+    assert page.section_table.rowCount() == 2
+    assert page.section_table.item(0, 2).text() == "✓ 完成"
+    assert page.section_table.item(0, 3).text() == "1"
+    assert page.section_table.item(0, 4).text() == "02:05"
+    assert "已经保存的第一节正文" in page._draft_view.toPlainText()
+    assert "检索辅助文本" in page.diagnostic_output_view.toPlainText()
+    assert "检索辅助文本" not in page.live_output_view.toPlainText()
+    assert page._resume_progress(state) > 14
 
 
 def test_settings_page_persists_retrieval_enhancement_switches(qtbot) -> None:

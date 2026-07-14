@@ -56,6 +56,7 @@ def polish_section(
     section_heading: str,
     section_paragraphs: list[str],
     siliconflow: SiliconFlowClient,
+    check_drift: bool = True,
     progress: ProgressCallback = _no_progress,
     check_cancelled: CancellationCheck = _no_cancellation,
 ) -> PolishedSection:
@@ -72,6 +73,7 @@ def polish_section(
         section_heading: 本节标题
         section_paragraphs: 本节段落正文（已核对）
         siliconflow: SiliconFlow 客户端
+        check_drift: 是否执行中性 LLM 防漂移检查
         progress: 进度回调 (percent, message)
         check_cancelled: 取消检查回调，被取消时抛出异常
 
@@ -124,6 +126,17 @@ def polish_section(
             fact_drift_detected=False,
             reverted_to_verified=True,
             safety_note="代码安全门检测到数字或引用标记变化，已回退到核对通过的正文。",
+            drift_check_performed=False,
+        )
+
+    if not check_drift:
+        progress(100, "已跳过 LLM 防漂移检查")
+        return PolishedSection(
+            section_id=verified_draft.section_id,
+            heading=section_heading,
+            polished_text=polished_text,
+            safety_note="已按任务选项跳过 LLM 防漂移检查；仍保留数字与引用标记代码安全门。",
+            drift_check_performed=False,
         )
 
     progress(60, "打磨后轻量防漂移核对")

@@ -199,6 +199,7 @@ def run_global_polish(
     siliconflow: SiliconFlowClient,
     term_consistency_report: TermConsistencyReport | None = None,
     structure_review: StructureReview | None = None,
+    check_drift: bool = True,
     check_cancelled: Callable[[], None] = _no_cancellation,
 ) -> GlobalPolishResult:
     """利用 1M 上下文做全篇全局一致性打磨。
@@ -289,6 +290,20 @@ def run_global_polish(
             return _reverted_global_result(
                 original_sections,
                 "代码安全门检测到数字或引用标记变化，已回退全局打磨。",
+            )
+
+        if not check_drift:
+            return global_result.model_copy(
+                update={
+                    "sections": [
+                        section.model_copy(update={"drift_check_performed": False})
+                        for section in global_result.sections
+                    ],
+                    "global_consistency_notes": (
+                        f"{global_result.global_consistency_notes} "
+                        "已按任务选项跳过全局 LLM 防漂移检查。"
+                    ).strip(),
+                }
             )
 
         verified_claims = []

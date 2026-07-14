@@ -25,6 +25,8 @@ class SectionState(TypedDict, total=False):
     # 修订计数（防止无限循环）
     revision_count: int
     source_key_offset: int
+    target_length_chars: int
+    elapsed_seconds: float
     # 上一节结论（用于节间衔接）
     previous_conclusion: str | None
     # 下一节目的（用于铺垫）

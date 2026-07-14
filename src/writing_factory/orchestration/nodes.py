@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
@@ -22,6 +24,7 @@ from writing_factory.generate.models import (
     EvidenceItem,
     EvidencePack,
     GenerationContext,
+    GenerationOptions,
     GlobalPolishResult,
     OutlineNode,
     PolishedDraft,
@@ -30,6 +33,7 @@ from writing_factory.generate.models import (
     StructureReview,
     TermConsistencyReport,
     ThesisStatement,
+    VerifiedClaim,
     VerifiedDraft,
 )
 from writing_factory.orchestration.consistency import (
@@ -78,6 +82,13 @@ def _ctx(state: WritingState) -> GenerationContext:
     return GenerationContext.model_validate_json(state["context_json"])
 
 
+def _options(state: WritingState) -> GenerationOptions:
+    raw = state.get("context_json")
+    if raw:
+        return GenerationContext.model_validate_json(raw).generation_options
+    return GenerationOptions()
+
+
 def _thesis(state: WritingState) -> ThesisStatement | None:
     t = state.get("thesis_json")
     return ThesisStatement.model_validate_json(t) if t else None
@@ -103,6 +114,45 @@ def _update_section(state: WritingState, updates: dict) -> list[dict]:
     sections = list(state["sections"])
     sections[idx] = {**sections[idx], **updates}
     return sections
+
+
+def _claim_summary(text: str) -> str:
+    """Remove section-local citation markers before sharing a claim downstream."""
+
+    return re.sub(r"\[S\d+\]", "", text).strip()
+
+
+def _quality_notes(options: GenerationOptions) -> list[str]:
+    checks = (
+        (options.fact_verification, "未执行 LLM 事实语义核验"),
+        (options.section_polish, "未执行章节文风打磨"),
+        (not options.section_polish or options.section_drift_check, "未执行章节防漂移核对"),
+        (options.term_review, "未执行全文术语审查"),
+        (options.structure_review, "未执行全文结构审查"),
+        (options.global_polish, "未执行全局一致性打磨"),
+        (not options.global_polish or options.global_drift_check, "未执行全局防漂移核对"),
+    )
+    return [message for enabled, message in checks if not enabled]
+
+
+def _draftable_outline_nodes(nodes: list[OutlineNode]) -> list[OutlineNode]:
+    """Treat hierarchy parents as containers and return only body-producing leaves."""
+
+    result: list[OutlineNode] = []
+    for node in nodes:
+        if node.children:
+            result.extend(_draftable_outline_nodes(node.children))
+        else:
+            result.append(node)
+    return result
+
+
+def _state_outline_nodes(state: WritingState, outline: AnnotatedOutline) -> list[OutlineNode]:
+    """Resolve nodes in persisted section order, including legacy all-node checkpoints."""
+
+    by_id = {node.node_id: node for node in _flatten_outline_nodes(outline.root_nodes)}
+    resolved = [by_id[section["section_id"]] for section in state.get("sections", [])]
+    return resolved or _draftable_outline_nodes(outline.root_nodes)
 
 
 def _pipeline_node(label: str):
@@ -212,7 +262,13 @@ class WritingPipeline:
 
             # 初始化 sections 列表
             sections: list[dict] = []
-            all_nodes = _flatten_outline_nodes(outline.root_nodes)
+            all_nodes = _draftable_outline_nodes(outline.root_nodes)
+            if not all_nodes:
+                raise ValueError("提纲没有可起草的叶子正文单元")
+            section_budget = max(
+                200,
+                context.generation_options.target_length_chars // len(all_nodes),
+            )
             for node in all_nodes:
                 sections.append(
                     SectionState(
@@ -225,6 +281,8 @@ class WritingPipeline:
                         polished_section_json=None,
                         revision_count=0,
                         source_key_offset=0,
+                        target_length_chars=section_budget,
+                        elapsed_seconds=0.0,
                         previous_conclusion=None,
                         next_purpose=None,
                         error=None,
@@ -263,7 +321,7 @@ class WritingPipeline:
         if thesis is None or outline is None:
             raise ValueError("缺少论点或提纲，无法预取章节证据")
 
-        all_nodes = _flatten_outline_nodes(outline.root_nodes)
+        all_nodes = _state_outline_nodes(state, outline)
         if not all_nodes:
             raise ValueError("提纲没有可起草的章节")
         self.progress(10, f"并发预取章节证据（0/{len(all_nodes)}）")
@@ -344,6 +402,9 @@ class WritingPipeline:
         term_registry = json.loads(state.get("term_registry_json", "{}"))
         is_revision = cur.get("revision_count", 0) > 0
         frozen_evidence_json = cur.get("evidence_pack_json")
+        if not frozen_evidence_json and is_revision and cur.get("draft_json"):
+            legacy_draft = SectionDraft.model_validate_json(cur["draft_json"])
+            frozen_evidence_json = legacy_draft.evidence_pack.model_dump_json()
         frozen_evidence = (
             EvidencePack.model_validate_json(frozen_evidence_json)
             if frozen_evidence_json
@@ -368,7 +429,7 @@ class WritingPipeline:
             ]
 
         # 找到当前提纲节点
-        all_nodes = _flatten_outline_nodes(outline.root_nodes)
+        all_nodes = _state_outline_nodes(state, outline)
         idx = state["current_section_index"]
         if idx >= len(all_nodes):
             raise IndexError(f"章节索引 {idx} 超出提纲范围")
@@ -385,23 +446,39 @@ class WritingPipeline:
             next_purpose = all_nodes[idx + 1].rhetorical_purpose
 
         try:
-            section_draft = draft_section(
-                context=context,
-                thesis=thesis,
-                outline_node=outline_node,
-                term_registry=term_registry,
-                persona_repository=self.persona_repository,
-                retriever=self.retriever,
-                siliconflow=self.siliconflow,
-                previous_section_conclusion=previous_conclusion,
-                next_section_purpose=next_purpose,
-                source_key_offset=source_key_offset,
-                revision_feedback=revision_feedback,
-                prior_claims=json.loads(state.get("claims_made_json", "[]")),
-                evidence_pack=frozen_evidence,
-                progress=self.progress,
-                check_cancelled=self.check_cancelled,
+            started_at = time.perf_counter()
+            version_label = (
+                f"修订 {cur.get('revision_count', 0)}"
+                if is_revision
+                else "初稿"
             )
+            stage = getattr(self.siliconflow, "stream_stage", None)
+            with (
+                stage(f"章节起草 · {outline_node.heading} · {version_label}")
+                if stage
+                else nullcontext()
+            ):
+                section_draft = draft_section(
+                    context=context,
+                    thesis=thesis,
+                    outline_node=outline_node,
+                    term_registry=term_registry,
+                    persona_repository=self.persona_repository,
+                    retriever=self.retriever,
+                    siliconflow=self.siliconflow,
+                    previous_section_conclusion=previous_conclusion,
+                    next_section_purpose=next_purpose,
+                    source_key_offset=source_key_offset,
+                    revision_feedback=revision_feedback,
+                    prior_claims=[
+                        _claim_summary(text)
+                        for text in json.loads(state.get("claims_made_json", "[]"))
+                    ],
+                    target_length_chars=cur.get("target_length_chars"),
+                    evidence_pack=frozen_evidence,
+                    progress=self.progress,
+                    check_cancelled=self.check_cancelled,
+                )
 
             # 更新 source_key_counter
             key_numbers = [
@@ -421,10 +498,13 @@ class WritingPipeline:
                 {
                     "status": SECTION_STATUS_DRAFTED,
                     "draft_json": section_draft.model_dump_json(),
+                    "evidence_pack_json": section_draft.evidence_pack.model_dump_json(),
                     "verified_draft_json": None,
                     "source_key_offset": source_key_offset,
                     "previous_conclusion": conclusion,
                     "next_purpose": next_purpose,
+                    "elapsed_seconds": cur.get("elapsed_seconds", 0.0)
+                    + (time.perf_counter() - started_at),
                 },
             )
 
@@ -459,20 +539,48 @@ class WritingPipeline:
             raise ValueError("当前章节缺少结构化草稿")
 
         section_draft = SectionDraft.model_validate_json(draft_json)
+        options = _options(state)
 
         try:
-            verified = verify_section(
-                section_draft=section_draft,
-                siliconflow=self.siliconflow,
-                progress=self.progress,
-                check_cancelled=self.check_cancelled,
-            )
+            started_at = time.perf_counter()
+            if options.fact_verification:
+                stage = getattr(self.siliconflow, "stream_stage", None)
+                with (
+                    stage(f"事实核验 · {cur.get('heading', cur.get('section_id', ''))}")
+                    if stage
+                    else nullcontext()
+                ):
+                    verified = verify_section(
+                        section_draft=section_draft,
+                        siliconflow=self.siliconflow,
+                        progress=self.progress,
+                        check_cancelled=self.check_cancelled,
+                    )
+            else:
+                verified = VerifiedDraft(
+                    section_id=section_draft.section_id,
+                    verified_claims=[
+                        VerifiedClaim(
+                            claim=claim,
+                            verdict="supported",
+                            verifier_rationale=(
+                                "快速草稿模式：仅通过 source key 与引用标记结构安全门，"
+                                "未执行 LLM 语义核验。"
+                            ),
+                        )
+                        for claim in section_draft.claims
+                    ],
+                    supported_count=len(section_draft.claims),
+                    semantic_verification_performed=False,
+                )
 
             sections_update = _update_section(
                 state,
                 {
                     "status": SECTION_STATUS_VERIFIED,
                     "verified_draft_json": verified.model_dump_json(),
+                    "elapsed_seconds": cur.get("elapsed_seconds", 0.0)
+                    + (time.perf_counter() - started_at),
                 },
             )
 
@@ -517,6 +625,7 @@ class WritingPipeline:
             raise ValueError("当前章节缺少核对结果")
 
         verified_draft = VerifiedDraft.model_validate_json(verified_json)
+        options = _options(state)
 
         # 需要从 draft 中取段落文本
         draft_json = cur.get("draft_json")
@@ -524,6 +633,44 @@ class WritingPipeline:
             raise ValueError("当前章节缺少原始段落")
 
         section_draft = SectionDraft.model_validate_json(draft_json)
+        started_at = time.perf_counter()
+
+        if not options.section_polish:
+            passthrough = PolishedSection(
+                section_id=section_draft.section_id,
+                heading=cur["heading"],
+                polished_text="\n\n".join(section_draft.paragraphs).strip(),
+                safety_note="已按任务选项跳过章节文风打磨。",
+                style_polish_performed=False,
+                drift_check_performed=False,
+            )
+            return {
+                "sections": _update_section(
+                    state,
+                    {
+                        "status": SECTION_STATUS_POLISHED,
+                        "polished_section_json": passthrough.model_dump_json(),
+                        "elapsed_seconds": cur.get("elapsed_seconds", 0.0)
+                        + (time.perf_counter() - started_at),
+                    },
+                ),
+                "claims_made_json": json.dumps(
+                    list(
+                        dict.fromkeys(
+                            [
+                                *json.loads(state.get("claims_made_json", "[]")),
+                                *[
+                                    _claim_summary(item.claim.text)
+                                    for item in verified_draft.verified_claims
+                                    if item.verdict == "supported"
+                                ],
+                            ]
+                        )
+                    ),
+                    ensure_ascii=False,
+                ),
+                "status": PIPELINE_STATUS_POLISHING,
+            }
 
         # 加载 persona spec
         context = _ctx(state)
@@ -533,27 +680,36 @@ class WritingPipeline:
         persona_spec_json = persona_spec.model_dump(mode="json")
 
         try:
-            polished = polish_section(
-                verified_draft=verified_draft,
-                persona_spec_json=persona_spec_json,
-                thesis=thesis,
-                section_heading=cur["heading"],
-                section_paragraphs=section_draft.paragraphs,
-                siliconflow=self.siliconflow,
-                progress=self.progress,
-                check_cancelled=self.check_cancelled,
-            )
+            stage = getattr(self.siliconflow, "stream_stage", None)
+            with (
+                stage(f"章节打磨 · {cur.get('heading', cur.get('section_id', ''))}")
+                if stage
+                else nullcontext()
+            ):
+                polished = polish_section(
+                    verified_draft=verified_draft,
+                    persona_spec_json=persona_spec_json,
+                    thesis=thesis,
+                    section_heading=cur["heading"],
+                    section_paragraphs=section_draft.paragraphs,
+                    siliconflow=self.siliconflow,
+                    check_drift=options.section_drift_check,
+                    progress=self.progress,
+                    check_cancelled=self.check_cancelled,
+                )
 
             sections_update = _update_section(
                 state,
                 {
                     "status": SECTION_STATUS_POLISHED,
                     "polished_section_json": polished.model_dump_json(),
+                    "elapsed_seconds": cur.get("elapsed_seconds", 0.0)
+                    + (time.perf_counter() - started_at),
                 },
             )
             existing_claims = json.loads(state.get("claims_made_json", "[]"))
             accepted_claims = [
-                item.claim.text
+                _claim_summary(item.claim.text)
                 for item in verified_draft.verified_claims
                 if item.verdict == "supported"
             ]
@@ -638,7 +794,12 @@ class WritingPipeline:
             sections=rendered_sections,
             reference_list=reference_list,
             thesis=thesis,
-            fact_drift_free=all(not ps.fact_drift_detected for ps in rendered_sections),
+            fact_drift_free=(
+                context.generation_options.quality_status == "verified_final"
+                and all(not ps.fact_drift_detected for ps in rendered_sections)
+            ),
+            quality_status=context.generation_options.quality_status,
+            quality_notes=_quality_notes(context.generation_options),
         )
 
         return {
@@ -664,13 +825,14 @@ class WritingPipeline:
             raise ValueError("缺少论点或提纲，无法执行全文审查")
 
         term_registry = json.loads(state.get("term_registry_json", "{}"))
+        options = _options(state)
         outline_nodes = [
             {
                 "node_id": node.node_id,
                 "heading": node.heading,
                 "rhetorical_purpose": node.rhetorical_purpose,
             }
-            for node in _flatten_outline_nodes(outline.root_nodes)
+            for node in _state_outline_nodes(state, outline)
         ]
         sections = state.get("sections", [])
 
@@ -679,7 +841,7 @@ class WritingPipeline:
             with stage(label) if stage else nullcontext():
                 return call()
 
-        if term_registry:
+        if options.term_review and term_registry:
             term_call = partial(
                 staged_call,
                 "术语一致性审查",
@@ -692,19 +854,28 @@ class WritingPipeline:
                 ),
             )
         else:
-            term_call = TermConsistencyReport
-        structure_call = partial(
-            staged_call,
-            "全文结构审查",
-            partial(
-                review_structure,
-                thesis_text=thesis.thesis_text,
-                outline_nodes=outline_nodes,
-                sections=sections,
-                siliconflow=self.siliconflow,
-                check_cancelled=self.check_cancelled,
-            ),
-        )
+            term_call = partial(
+                TermConsistencyReport,
+                reviewer_note="已按任务选项跳过术语一致性审查。",
+            )
+        if options.structure_review:
+            structure_call = partial(
+                staged_call,
+                "全文结构审查",
+                partial(
+                    review_structure,
+                    thesis_text=thesis.thesis_text,
+                    outline_nodes=outline_nodes,
+                    sections=sections,
+                    siliconflow=self.siliconflow,
+                    check_cancelled=self.check_cancelled,
+                ),
+            )
+        else:
+            structure_call = partial(
+                StructureReview,
+                overall_assessment="已按任务选项跳过全文结构审查。",
+            )
 
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="writing-review") as executor:
             term_future = executor.submit(copy_context().run, term_call)
@@ -765,7 +936,7 @@ class WritingPipeline:
             raise ValueError("缺少带注释提纲")
 
         # 扁平化提纲节点
-        all_nodes = _flatten_outline_nodes(outline.root_nodes)
+        all_nodes = _state_outline_nodes(state, outline)
         outline_nodes = [
             {
                 "node_id": n.node_id,
@@ -808,6 +979,21 @@ class WritingPipeline:
         if thesis is None:
             raise ValueError("缺少已冻结的论文论点")
 
+        options = _options(state)
+        if not options.global_polish:
+            sections = [
+                PolishedSection.model_validate_json(section["polished_section_json"])
+                for section in state.get("sections", [])
+            ]
+            result = GlobalPolishResult(
+                sections=sections,
+                global_consistency_notes="已按任务选项跳过全局一致性打磨。",
+            )
+            return {
+                "global_polish_json": result.model_dump_json(),
+                "status": PIPELINE_STATUS_ASSEMBLING,
+            }
+
         # 加载已有审查报告（可选）
         term_report: TermConsistencyReport | None = None
         tcr = state.get("term_consistency_json")
@@ -832,6 +1018,7 @@ class WritingPipeline:
                 siliconflow=self.siliconflow,
                 term_consistency_report=term_report,
                 structure_review=struct_review,
+                check_drift=options.global_drift_check,
                 check_cancelled=self.check_cancelled,
             )
 

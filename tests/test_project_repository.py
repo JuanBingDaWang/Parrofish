@@ -19,6 +19,7 @@ def test_project_task_and_edited_draft_round_trip(tmp_path: Path) -> None:
         domain="出版学",
         citation_style="gb-t-7714",
         selected_doc_ids={"doc1", "doc2"},
+        generation_options={"preset": "balanced", "target_length_chars": 1500},
     )
     repository.update_task_state(task_id, {"status": "done", "task_id": task_id})
     repository.save_edited_draft(task_id, "人工编辑后的稿件")
@@ -27,7 +28,35 @@ def test_project_task_and_edited_draft_round_trip(tmp_path: Path) -> None:
     task = repository.get_task(task_id)
     assert task is not None
     assert task["selected_doc_ids"] == {"doc1", "doc2"}
+    assert task["generation_options"] == {
+        "preset": "balanced",
+        "target_length_chars": 1500,
+    }
     assert task["state"]["status"] == "done"
     assert task["edited_draft_text"] == "人工编辑后的稿件"
     assert task["evaluation"] == {"traceability": 1.0}
     assert repository.list_projects()[0]["task_count"] == 1
+
+
+def test_partial_pipeline_state_keeps_task_running(tmp_path: Path) -> None:
+    database = Database(tmp_path / "app.db")
+    database.initialize()
+    repository = ProjectRepository(database)
+    project_id = repository.create_project(kb_id="kb", title="论文项目")
+    task_id = repository.create_task(
+        project_id=project_id,
+        kb_id="kb",
+        persona_id="persona",
+        title="测试任务",
+        task_description="讨论数字人文",
+        domain="",
+        citation_style="gb-t-7714",
+        selected_doc_ids={"doc1"},
+    )
+
+    repository.update_task_state(task_id, {"status": "verifying", "sections": []})
+
+    task = repository.get_task(task_id)
+    assert task is not None
+    assert task["status"] == "running"
+    assert task["state"]["status"] == "verifying"

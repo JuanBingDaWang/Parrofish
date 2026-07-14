@@ -174,9 +174,16 @@ def build_framework(
                 response_format="json_object",
                 seed=42,
                 stream=True,
-                result_validator=_validate_framework_result,
+                result_validator=lambda candidate: _validate_framework_result(
+                    candidate,
+                    target_length_chars=context.generation_options.target_length_chars,
+                ),
             )
             outline = _parse_framework_result(result)
+            _validate_outline_budget(
+                outline,
+                target_length_chars=context.generation_options.target_length_chars,
+            )
             break
         except FrameworkOutputError as exc:
             last_error = exc
@@ -219,10 +226,16 @@ def build_framework(
     return outline
 
 
-def _validate_framework_result(result: ChatResult) -> None:
+def _validate_framework_result(
+    result: ChatResult,
+    *,
+    target_length_chars: int | None = None,
+) -> None:
     """Validate a chat result before the transport is allowed to cache it."""
 
-    _parse_framework_result(result)
+    outline = _parse_framework_result(result)
+    if target_length_chars is not None:
+        _validate_outline_budget(outline, target_length_chars=target_length_chars)
 
 
 def _parse_framework_result(result: ChatResult) -> AnnotatedOutline:
@@ -242,6 +255,31 @@ def _parse_framework_result(result: ChatResult) -> AnnotatedOutline:
         raise FrameworkOutputError(
             f"JSON 无法通过 AnnotatedOutline 校验：{detail[:1200]}"
         ) from exc
+
+
+def _drafting_unit_range(target_length_chars: int) -> tuple[int, int]:
+    if target_length_chars <= 2000:
+        return 3, 5
+    if target_length_chars <= 5000:
+        return 4, 8
+    ideal = max(6, min(14, round(target_length_chars / 750)))
+    return max(5, ideal - 2), min(16, ideal + 2)
+
+
+def _validate_outline_budget(
+    outline: AnnotatedOutline,
+    *,
+    target_length_chars: int,
+) -> None:
+    leaves = _draftable_nodes(outline.root_nodes)
+    minimum, maximum = _drafting_unit_range(target_length_chars)
+    if not leaves:
+        raise FrameworkOutputError("提纲没有可起草的叶子正文单元")
+    if len(leaves) > maximum:
+        raise FrameworkOutputError(
+            f"目标篇幅约 {target_length_chars} 字，建议安排 {minimum}-{maximum} 个正文单元，"
+            f"当前提纲有 {len(leaves)} 个叶子正文单元"
+        )
 
 
 def _format_broad_retrieval(retrieval_result) -> list[dict[str, object]]:
@@ -293,7 +331,7 @@ def _attach_node_evidence(
 ) -> AnnotatedOutline:
     """Retrieve each outline node independently and attach exact child evidence."""
 
-    nodes = _flatten_nodes(outline.root_nodes)
+    nodes = _draftable_nodes(outline.root_nodes)
     if not nodes:
         return outline
 
@@ -370,6 +408,16 @@ def _flatten_nodes(nodes: list[OutlineNode]) -> list[OutlineNode]:
     return flattened
 
 
+def _draftable_nodes(nodes: list[OutlineNode]) -> list[OutlineNode]:
+    leaves: list[OutlineNode] = []
+    for node in nodes:
+        if node.children:
+            leaves.extend(_draftable_nodes(node.children))
+        else:
+            leaves.append(node)
+    return leaves
+
+
 def _copy_nodes_with_evidence(
     nodes: list[OutlineNode],
     evidence_by_node: dict[str, list[OutlineEvidence]],
@@ -378,9 +426,9 @@ def _copy_nodes_with_evidence(
         node.model_copy(
             update={
                 "candidate_source_keys": [
-                    item.source_key for item in evidence_by_node[node.node_id]
+                    item.source_key for item in evidence_by_node.get(node.node_id, [])
                 ],
-                "candidate_evidence": evidence_by_node[node.node_id],
+                "candidate_evidence": evidence_by_node.get(node.node_id, []),
                 "children": _copy_nodes_with_evidence(node.children, evidence_by_node),
             }
         )

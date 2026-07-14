@@ -12,6 +12,7 @@ from writing_factory.app import build_application
 from writing_factory.distill.models import PersonaSpec
 from writing_factory.distill.quality import run_static_quality_check
 from writing_factory.distill.serialization import render_persona_markdown
+from writing_factory.generate.models import GenerationOptions
 from writing_factory.generate.source_policy import build_persona_generation_source_policy
 from writing_factory.ui.main_window import MainWindow
 from writing_factory.ui.theme import configure_application_font
@@ -146,13 +147,23 @@ def main() -> int:
         task_id: str,
         selected_doc_ids: set[str],
         explicitly_allowed_persona_doc_ids: set[str],
+        generation_options: dict | None = None,
         resume: bool = False,
     ) -> dict:
         from writing_factory.orchestration.pipeline_runner import (
             run_writing_pipeline_with_progress,
+            summarize_writing_state,
         )
 
         app_context.project_repository.mark_task_status(task_id, "running")
+
+        def persist_checkpoint(state: dict) -> None:
+            app_context.project_repository.update_task_state(task_id, state)
+            context.report_stream(
+                "pipeline_state",
+                json.dumps(summarize_writing_state(state), ensure_ascii=False),
+            )
+
         try:
             with app_context.siliconflow.observe_stream(context.report_stream):
                 result = run_writing_pipeline_with_progress(
@@ -170,6 +181,10 @@ def main() -> int:
                     task_id=task_id,
                     selected_doc_ids=selected_doc_ids,
                     explicitly_allowed_persona_doc_ids=explicitly_allowed_persona_doc_ids,
+                    generation_options=GenerationOptions.model_validate(
+                        generation_options or {}
+                    ),
+                    state_callback=persist_checkpoint,
                     resume=resume,
                 )
         except Exception as exc:
@@ -197,6 +212,20 @@ def main() -> int:
             "isolated_count": len(selected_doc_ids & policy.excluded_persona_doc_ids),
             "usable_count": len(policy.allowed_task_doc_ids),
         }
+
+    def load_writing_task(task_id: str) -> dict[str, object] | None:
+        from writing_factory.orchestration.pipeline_runner import load_latest_writing_state
+
+        record = app_context.project_repository.get_task(task_id)
+        if record is None or record.get("state") is not None:
+            return record
+        checkpoint_state = load_latest_writing_state(
+            app_context.settings.data_dir / "checkpoints",
+            task_id,
+        )
+        if checkpoint_state is not None:
+            record["state"] = checkpoint_state
+        return record
 
     def evaluate_generation(
         thesis_json: str,
@@ -333,7 +362,7 @@ def main() -> int:
             **kwargs,
         ),
         list_writing_tasks=app_context.project_repository.list_tasks,
-        load_writing_task=app_context.project_repository.get_task,
+        load_writing_task=load_writing_task,
         save_edited_draft=app_context.project_repository.save_edited_draft,
         delete_writing_tasks=app_context.project_repository.delete_tasks,
         preview_source_selection=preview_source_selection,

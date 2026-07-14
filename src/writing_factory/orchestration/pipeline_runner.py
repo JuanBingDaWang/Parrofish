@@ -25,25 +25,22 @@ Usage (via main.py closure):
 from __future__ import annotations
 
 import logging
+import sqlite3
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from writing_factory.generate.models import GenerationContext
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+from writing_factory.generate.models import GenerationContext, GenerationOptions, PolishedSection
 from writing_factory.generate.source_policy import build_persona_generation_source_policy
 from writing_factory.orchestration.graph import (
     build_writing_graph,
     close_writing_graph,
     create_initial_state,
 )
-from writing_factory.orchestration.state import (
-    PIPELINE_STATUS_DONE,
-    PIPELINE_STATUS_ERROR,
-    SECTION_STATUS_DRAFTED,
-    SECTION_STATUS_ERROR,
-    SECTION_STATUS_POLISHED,
-    SECTION_STATUS_VERIFIED,
-)
+from writing_factory.orchestration.state import PIPELINE_STATUS_DONE, PIPELINE_STATUS_ERROR
 
 if TYPE_CHECKING:
     from writing_factory.kb.retrieval import HybridRetriever
@@ -53,18 +50,6 @@ if TYPE_CHECKING:
     from writing_factory.ui.workers import TaskContext
 
 logger = logging.getLogger(__name__)
-
-# ── Progress weight model ─────────────────────────────────────
-# Estimated weight per major phase (percentage points out of 100)
-# This gives a rough progress % as the graph executes.
-
-_WEIGHT_TOPIC = 3
-_WEIGHT_FRAMEWORK = 7
-_WEIGHT_PER_SECTION = 68  # split among sections: draft+verify+polish
-_WEIGHT_TERM_REVIEW = 5
-_WEIGHT_STRUCTURE_REVIEW = 5
-_WEIGHT_GLOBAL_POLISH = 7
-_WEIGHT_ASSEMBLE = 5
 
 # ── Human-readable step labels ────────────────────────────────
 
@@ -85,23 +70,6 @@ _NODE_LABELS: dict[str, str] = {
 }
 
 
-def _estimate_section_count(
-    persona_repository: PersonaRepository,
-    persona_id: str,
-    task_description: str,
-) -> int:
-    """Estimate the number of sections for progress calculation.
-
-    Falls back to 5 if we can't determine.
-    """
-    # Could do a quick LLM call here, but for now just use a reasonable default.
-    # The outline-building phase will determine the actual count.
-    _ = persona_repository
-    _ = persona_id
-    _ = task_description
-    return 5
-
-
 def run_writing_pipeline_with_progress(
     *,
     persona_id: str,
@@ -119,6 +87,8 @@ def run_writing_pipeline_with_progress(
     task_id: str | None = None,
     selected_doc_ids: set[str] | None = None,
     explicitly_allowed_persona_doc_ids: set[str] | None = None,
+    generation_options: GenerationOptions | None = None,
+    state_callback: Callable[[dict[str, Any]], None] | None = None,
     resume: bool = False,
 ) -> dict[str, Any]:
     """Run the full writing pipeline with progress reporting.
@@ -164,6 +134,7 @@ def run_writing_pipeline_with_progress(
         allowed_doc_ids=tuple(sorted(source_policy.allowed_task_doc_ids)),
         excluded_persona_doc_ids=tuple(sorted(source_policy.excluded_persona_doc_ids)),
         source_policy_id=source_policy.policy_id,
+        generation_options=generation_options or GenerationOptions(),
     )
 
     # ── Create initial state ───────────────────────────────────
@@ -173,22 +144,15 @@ def run_writing_pipeline_with_progress(
         kb_id=kb_id,
     )
 
-    # ── Estimate section count for progress ────────────────────
-    estimated_sections = _estimate_section_count(persona_repository, persona_id, task_description)
-
-    # Per-section weight
-    per_section_weight = _WEIGHT_PER_SECTION / estimated_sections if estimated_sections > 0 else 10
-
     # ── Stream execution ───────────────────────────────────────
-    # Progress tracking state
-    base_progress = _WEIGHT_TOPIC + _WEIGHT_FRAMEWORK
-    completed_sections = 0
-    current_section_done_weight = 0.0  # 0-1 within current section
     last_reported_percent = 2
 
     def report_progress(percent: int, message: str) -> None:
         nonlocal last_reported_percent
-        last_reported_percent = max(0, min(100, percent))
+        last_reported_percent = max(last_reported_percent, max(0, min(100, percent)))
+        context.report_progress(last_reported_percent, message)
+
+    def report_activity(_percent: int, message: str) -> None:
         context.report_progress(last_reported_percent, message)
 
     config = {"configurable": {"thread_id": resolved_task_id}}
@@ -203,7 +167,7 @@ def run_writing_pipeline_with_progress(
             siliconflow=siliconflow,
             kb_repository=kb_repository,
             checkpoint_dir=checkpoint_dir,
-            progress=report_progress,
+            progress=report_activity,
             check_cancelled=context.check_cancelled,
         )
         graph_input = None if resume else initial
@@ -221,42 +185,15 @@ def run_writing_pipeline_with_progress(
                 if not isinstance(state_updates, dict):
                     continue
 
-                # Get status from state update
-                status = state_updates.get("status", "")
+                snapshot = graph.get_state(config)
+                snapshot_values = dict(snapshot.values) if snapshot else dict(state_updates)
+                snapshot_values["task_id"] = resolved_task_id
+                if state_callback is not None:
+                    state_callback(snapshot_values)
 
-                # ── Report progress ────────────────────────────
-                progress = _compute_progress(
-                    node_name=node_name,
-                    status=status,
-                    state_updates=state_updates,
-                    base_progress=base_progress,
-                    per_section_weight=per_section_weight,
-                    completed_sections=completed_sections,
-                    current_section_done_weight=current_section_done_weight,
-                    estimated_sections=estimated_sections,
-                )
-                if progress is not None:
-                    base_progress, completed_sections, current_section_done_weight = progress
-
-                # Update current_section_done_weight tracking
-                if status == SECTION_STATUS_DRAFTED:
-                    current_section_done_weight = 0.33
-                elif status == SECTION_STATUS_VERIFIED:
-                    current_section_done_weight = 0.66
-                elif status == SECTION_STATUS_POLISHED:
-                    current_section_done_weight = 1.0
-                    completed_sections += 1
-                elif status == SECTION_STATUS_ERROR:
-                    current_section_done_weight = 0.0
-
-                # Track completed sections from prepare_next_section
-                if node_name == "prepare_next_section":
-                    pass  # completed_sections already incremented above
-
-                # Label
                 label = _NODE_LABELS.get(node_name, node_name)
-                section_idx = state_updates.get("current_section_index")
-                total = state_updates.get("total_sections", estimated_sections)
+                section_idx = snapshot_values.get("current_section_index")
+                total = len(snapshot_values.get("sections", []))
                 if section_idx is not None and node_name in (
                     "draft_section",
                     "verify_section",
@@ -267,8 +204,7 @@ def run_writing_pipeline_with_progress(
                         f"(第 {section_idx + 1}/{total} 节)"
                     )
 
-                # Report to UI
-                pct = min(int(base_progress + current_section_done_weight * per_section_weight), 99)
+                pct = _checkpoint_progress(node_name, snapshot_values)
                 report_progress(pct, label)
 
         # ── Graph finished — collect final state ───────────────
@@ -289,6 +225,12 @@ def run_writing_pipeline_with_progress(
         if context.is_cancelled:
             raise
         logger.exception("写作流水线执行异常")
+        if graph is not None and state_callback is not None:
+            snapshot = graph.get_state(config)
+            if snapshot is not None:
+                failed_state = dict(snapshot.values)
+                failed_state["task_id"] = resolved_task_id
+                state_callback(failed_state)
         report_progress(last_reported_percent, f"已停止：{exc}")
         raise
     finally:
@@ -322,60 +264,93 @@ def _legacy_resume_config(graph, config: dict[str, Any]) -> dict[str, Any]:
     return config
 
 
-def _compute_progress(
-    *,
-    node_name: str,
-    status: str,
-    state_updates: dict[str, Any],
-    base_progress: float,
-    per_section_weight: float,
-    completed_sections: int,
-    current_section_done_weight: float,
-    estimated_sections: int,
-) -> tuple[float, int, float] | None:
-    """Update progress tracking based on the current node.
+def _checkpoint_progress(node_name: str, state: dict[str, Any]) -> int:
+    """Compute overall progress exclusively from committed checkpoint state."""
 
-    Returns (base_progress, completed_sections, current_section_done_weight) or None.
-    """
-    new_base = base_progress
-    new_completed = completed_sections
-    new_section_done = current_section_done_weight
+    phase_minimums = {
+        "select_topic": 3,
+        "build_framework": 10,
+        "prefetch_evidence": 14,
+        "parallel_reviews": 88,
+        "term_consistency": 88,
+        "structure_review": 88,
+        "global_polish": 95,
+        "assemble": 99,
+    }
+    sections = state.get("sections", [])
+    if not sections:
+        return phase_minimums.get(node_name, 2)
+    fractions = {
+        "pending": 0.0,
+        "drafting": 0.0,
+        "drafted": 0.34,
+        "verifying": 0.34,
+        "verified": 0.67,
+        "revising": 0.34,
+        "polishing": 0.67,
+        "polished": 1.0,
+        "error": 0.0,
+    }
+    completed_equivalent = sum(
+        fractions.get(str(section.get("status", "pending")), 0.0)
+        for section in sections
+    )
+    section_progress = 14 + round(68 * completed_equivalent / len(sections))
+    return max(section_progress, phase_minimums.get(node_name, 0))
 
-    if node_name == "select_topic":
-        new_base = _WEIGHT_TOPIC
-    elif node_name == "build_framework":
-        new_base = _WEIGHT_TOPIC + _WEIGHT_FRAMEWORK
-    elif node_name == "draft_section":
-        new_section_done = 0.0
-    elif node_name == "verify_section":
-        new_section_done = 0.33
-    elif node_name == "polish_section":
-        new_section_done = 0.66
-    elif node_name == "prepare_next_section":
-        new_completed += 1
-        new_section_done = 0.0
-    elif node_name == "parallel_reviews":
-        new_base = _WEIGHT_TOPIC + _WEIGHT_FRAMEWORK + _WEIGHT_PER_SECTION
-    elif node_name == "term_consistency":
-        new_base = _WEIGHT_TOPIC + _WEIGHT_FRAMEWORK + _WEIGHT_PER_SECTION
-    elif node_name == "structure_review":
-        new_base = _WEIGHT_TOPIC + _WEIGHT_FRAMEWORK + _WEIGHT_PER_SECTION + _WEIGHT_TERM_REVIEW
-    elif node_name == "global_polish":
-        new_base = (
-            _WEIGHT_TOPIC
-            + _WEIGHT_FRAMEWORK
-            + _WEIGHT_PER_SECTION
-            + _WEIGHT_TERM_REVIEW
-            + _WEIGHT_STRUCTURE_REVIEW
+
+def summarize_writing_state(state: dict[str, Any]) -> dict[str, Any]:
+    """Return a compact UI-safe view without copying frozen evidence through Qt."""
+
+    sections: list[dict[str, Any]] = []
+    for section in state.get("sections", []):
+        item = {
+            "section_id": section.get("section_id", ""),
+            "heading": section.get("heading", ""),
+            "status": section.get("status", "pending"),
+            "revision_count": section.get("revision_count", 0),
+            "target_length_chars": section.get("target_length_chars"),
+            "elapsed_seconds": section.get("elapsed_seconds", 0.0),
+        }
+        polished_json = section.get("polished_section_json")
+        if polished_json:
+            try:
+                item["polished_text"] = PolishedSection.model_validate_json(
+                    polished_json
+                ).polished_text
+            except ValueError:
+                pass
+        sections.append(item)
+    return {
+        "task_id": state.get("task_id"),
+        "status": state.get("status"),
+        "current_section_index": state.get("current_section_index", 0),
+        "sections": sections,
+    }
+
+
+def load_latest_writing_state(
+    checkpoint_dir: Path,
+    task_id: str,
+) -> dict[str, Any] | None:
+    """Read a task checkpoint without compiling or executing the writing graph."""
+
+    path = checkpoint_dir / "writing_checkpoints.db"
+    if not path.is_file():
+        return None
+    connection = sqlite3.connect(
+        f"file:{path.resolve().as_posix()}?mode=ro",
+        uri=True,
+        check_same_thread=False,
+    )
+    try:
+        item = SqliteSaver(connection).get_tuple(
+            {"configurable": {"thread_id": task_id}}
         )
-    elif node_name == "assemble":
-        new_base = (
-            _WEIGHT_TOPIC
-            + _WEIGHT_FRAMEWORK
-            + _WEIGHT_PER_SECTION
-            + _WEIGHT_TERM_REVIEW
-            + _WEIGHT_STRUCTURE_REVIEW
-            + _WEIGHT_GLOBAL_POLISH
-        )
-
-    return new_base, new_completed, new_section_done
+        if item is None:
+            return None
+        state = dict(item.checkpoint.get("channel_values", {}))
+        state["task_id"] = task_id
+        return state
+    finally:
+        connection.close()

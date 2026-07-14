@@ -10,12 +10,14 @@ from types import SimpleNamespace
 
 import pytest
 
+from writing_factory.generate.framework import FrameworkOutputError, _validate_outline_budget
 from writing_factory.generate.models import (
     AnnotatedOutline,
     Claim,
     EvidenceItem,
     EvidencePack,
     GenerationContext,
+    GenerationOptions,
     OutlineNode,
     ReferenceList,
     SectionDraft,
@@ -31,6 +33,7 @@ from writing_factory.llm.models import ChatResult
 from writing_factory.orchestration.errors import PipelineNodeError
 from writing_factory.orchestration.nodes import WritingPipeline, should_continue_after_verify
 from writing_factory.orchestration.pipeline_runner import (
+    _checkpoint_progress,
     _legacy_resume_config,
     run_writing_pipeline_with_progress,
 )
@@ -206,6 +209,7 @@ def test_full_writing_graph_runs_offline(tmp_path: Path) -> None:
     retriever = FakeRetriever(kb_repository)
     context = FakeTaskContext()
     client = FakeSiliconFlow()
+    snapshots: list[dict] = []
     result = run_writing_pipeline_with_progress(
         persona_id="persona_1",
         task_description="讨论数字人文方法",
@@ -219,6 +223,7 @@ def test_full_writing_graph_runs_offline(tmp_path: Path) -> None:
         kb_id="kb",
         task_id="task_1",
         selected_doc_ids={"doc_task"},
+        state_callback=snapshots.append,
     )
 
     assert result["status"] == "done"
@@ -239,6 +244,11 @@ def test_full_writing_graph_runs_offline(tmp_path: Path) -> None:
     assert len(retriever.requests) == 4
     assert all(request.filters.doc_ids == {"doc_task"} for request in retriever.requests)
     assert context.progress[-1][0] == 100
+    assert [percent for percent, _message in context.progress] == sorted(
+        percent for percent, _message in context.progress
+    )
+    assert any(snapshot.get("sections") for snapshot in snapshots)
+    assert snapshots[-1]["status"] == "done"
     assert "request_timeout_seconds" not in client.calls[1][1]
     assert "request_total_timeout_seconds" not in client.calls[1][1]
     assert client.calls[1][1]["max_tokens"] == 8192
@@ -348,6 +358,228 @@ def test_evidence_prefetch_is_concurrent_and_keeps_outline_order() -> None:
     ]
     assert [pack.items[0].source_key for pack in packs] == ["S5", "S13", "S21"]
     assert result["source_key_counter"] == 28
+
+
+def test_outline_budget_rejects_too_many_body_units_for_short_article() -> None:
+    thesis = ThesisStatement(
+        thesis_text="核心论点",
+        angle="测试角度",
+        kb_support_assessment="证据充足",
+        persona_id="persona_1",
+    )
+    outline = AnnotatedOutline(
+        thesis=thesis,
+        root_nodes=[
+            OutlineNode(
+                node_id=str(index),
+                heading=f"第{index}节",
+                rhetorical_purpose="论证",
+            )
+            for index in range(1, 7)
+        ],
+        kb_id="kb",
+    )
+
+    with pytest.raises(FrameworkOutputError, match="当前提纲有 6 个"):
+        _validate_outline_budget(outline, target_length_chars=1500)
+
+
+def test_parent_outline_nodes_are_containers_not_duplicate_body_units(monkeypatch) -> None:
+    thesis = ThesisStatement(
+        thesis_text="核心论点",
+        angle="测试角度",
+        kb_support_assessment="证据充足",
+        persona_id="persona_1",
+    )
+    outline = AnnotatedOutline(
+        thesis=thesis,
+        root_nodes=[
+            OutlineNode(
+                node_id="1",
+                heading="父级标题",
+                rhetorical_purpose="组织层级",
+                children=[
+                    OutlineNode(node_id="1.1", heading="子节甲", rhetorical_purpose="论证甲"),
+                    OutlineNode(node_id="1.2", heading="子节乙", rhetorical_purpose="论证乙"),
+                ],
+            ),
+            OutlineNode(node_id="2", heading="独立结论", rhetorical_purpose="总结"),
+        ],
+        kb_id="kb",
+    )
+    monkeypatch.setattr(
+        "writing_factory.generate.framework.build_framework",
+        lambda **_kwargs: outline,
+    )
+    context = GenerationContext(
+        kb_id="kb",
+        task_description="1500字短文",
+        persona_id="persona_1",
+        generation_options=GenerationOptions(target_length_chars=1500),
+    )
+    pipeline = WritingPipeline(
+        persona_repository=FakePersonaRepository(),
+        retriever=SimpleNamespace(),
+        siliconflow=SimpleNamespace(),
+        kb_repository=FakeKnowledgeRepository(),
+    )
+
+    result = pipeline.build_framework_node(
+        {
+            "context_json": context.model_dump_json(),
+            "thesis_json": thesis.model_dump_json(),
+        }
+    )
+
+    assert [section["section_id"] for section in result["sections"]] == ["1.1", "1.2", "2"]
+    assert [section["target_length_chars"] for section in result["sections"]] == [500] * 3
+
+
+def test_revision_recovers_frozen_evidence_and_strips_prior_source_keys(monkeypatch) -> None:
+    thesis = ThesisStatement(
+        thesis_text="核心论点",
+        angle="测试角度",
+        kb_support_assessment="证据充足",
+        persona_id="persona_1",
+    )
+    outline = AnnotatedOutline(
+        thesis=thesis,
+        root_nodes=[OutlineNode(node_id="3", heading="第三节", rhetorical_purpose="论证")],
+        kb_id="kb",
+    )
+    frozen = EvidencePack(
+        section_id="3",
+        items=[
+            EvidenceItem(
+                source_key="S96",
+                chunk_id="chunk_96",
+                doc_id="doc_task",
+                verbatim_excerpt="冻结证据",
+            )
+        ],
+    )
+    old_draft = SectionDraft(
+        section_id="3",
+        heading="第三节",
+        paragraphs=["冻结事实。[S96]"],
+        claims=[
+            Claim(
+                claim_id="c1",
+                text="冻结事实。",
+                claim_type="fact",
+                source_keys=["S96"],
+                paragraph_index=0,
+            )
+        ],
+        evidence_pack=frozen,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_draft_section(**kwargs):
+        captured.update(kwargs)
+        return old_draft
+
+    monkeypatch.setattr(
+        "writing_factory.generate.drafting.draft_section",
+        fake_draft_section,
+    )
+    context = GenerationContext(
+        kb_id="kb",
+        task_description="测试旧断点",
+        persona_id="persona_1",
+    )
+    pipeline = WritingPipeline(
+        persona_repository=FakePersonaRepository(),
+        retriever=SimpleNamespace(),
+        siliconflow=SimpleNamespace(),
+        kb_repository=FakeKnowledgeRepository(),
+    )
+    result = pipeline.draft_section_node(
+        {
+            "context_json": context.model_dump_json(),
+            "thesis_json": thesis.model_dump_json(),
+            "outline_json": outline.model_dump_json(),
+            "term_registry_json": "{}",
+            "sections": [
+                {
+                    "section_id": "3",
+                    "heading": "第三节",
+                    "status": "revising",
+                    "revision_count": 1,
+                    "source_key_offset": 92,
+                    "draft_json": old_draft.model_dump_json(),
+                }
+            ],
+            "current_section_index": 0,
+            "source_key_counter": 100,
+            "claims_made_json": '["前文事实。[S85]"]',
+        }
+    )
+
+    assert captured["evidence_pack"] == frozen
+    assert captured["prior_claims"] == ["前文事实。"]
+    assert EvidencePack.model_validate_json(
+        result["sections"][0]["evidence_pack_json"]
+    ) == frozen
+
+
+def test_quality_presets_reduce_calls_without_mislabeling_fast_draft(tmp_path: Path) -> None:
+    repository = FakeKnowledgeRepository()
+    fast_client = FakeSiliconFlow()
+    fast = run_writing_pipeline_with_progress(
+        persona_id="persona_1",
+        task_description="讨论数字人文方法",
+        domain="数字人文",
+        context=FakeTaskContext(),
+        siliconflow=fast_client,
+        retriever=FakeRetriever(repository),
+        persona_repository=FakePersonaRepository(),
+        kb_repository=repository,
+        checkpoint_dir=tmp_path / "fast",
+        kb_id="kb",
+        task_id="task_fast",
+        selected_doc_ids={"doc_task"},
+        generation_options=GenerationOptions.from_preset(
+            "fast_draft",
+            target_length_chars=1500,
+        ),
+    )
+    balanced_client = FakeSiliconFlow()
+    balanced = run_writing_pipeline_with_progress(
+        persona_id="persona_1",
+        task_description="讨论数字人文方法",
+        domain="数字人文",
+        context=FakeTaskContext(),
+        siliconflow=balanced_client,
+        retriever=FakeRetriever(repository),
+        persona_repository=FakePersonaRepository(),
+        kb_repository=repository,
+        checkpoint_dir=tmp_path / "balanced",
+        kb_id="kb",
+        task_id="task_balanced",
+        selected_doc_ids={"doc_task"},
+        generation_options=GenerationOptions.from_preset(
+            "balanced",
+            target_length_chars=1500,
+        ),
+    )
+
+    assert len(fast_client.calls) == 3
+    assert json.loads(fast["final_draft_json"])["quality_status"] == "unverified_draft"
+    assert len(balanced_client.calls) == 4
+    assert json.loads(balanced["final_draft_json"])["quality_status"] == "verified_final"
+
+
+def test_checkpoint_progress_uses_real_sections() -> None:
+    state = {
+        "sections": [
+            {"status": "polished"},
+            {"status": "verified"},
+            {"status": "pending"},
+        ]
+    }
+    assert _checkpoint_progress("verify_section", state) == 52
+    assert _checkpoint_progress("parallel_reviews", state) == 88
 
 
 def test_term_and_structure_reviews_run_in_parallel(monkeypatch) -> None:

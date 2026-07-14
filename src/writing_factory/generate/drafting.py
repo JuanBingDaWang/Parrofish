@@ -58,6 +58,7 @@ def draft_section(
     next_section_purpose: str | None = None,
     revision_feedback: list[dict[str, str]] | None = None,
     prior_claims: list[str] | None = None,
+    target_length_chars: int | None = None,
     evidence_pack: EvidencePack | None = None,
     source_key_offset: int = 0,
     progress: ProgressCallback = _no_progress,
@@ -88,6 +89,7 @@ def draft_section(
         next_section_purpose: 下一节目的（用于铺垫）
         evidence_pack: 上游已冻结的证据包；传入后不再重复检索
         source_key_offset: source_key 起始偏移量（跨节全局递增）
+        target_length_chars: 本正文单元的目标中文字数
         progress: 进度回调
         check_cancelled: 取消检查回调
 
@@ -149,6 +151,7 @@ def draft_section(
         next_section_purpose=next_section_purpose,
         revision_feedback=revision_feedback,
         prior_claims=prior_claims,
+        target_length_chars=target_length_chars,
     )
 
     progress(50, f"调用 LLM 起草 — {outline_node.heading}")
@@ -161,17 +164,47 @@ def draft_section(
             evidence_pack=evidence_pack,
         )
 
-    result = siliconflow.chat(
-        messages,
-        thinking=False,
-        temperature=0.5,
-        max_tokens=8192,
-        response_format="json_object",
-        seed=42,
-        use_cache=not revision_feedback,
-        stream=True,
-        result_validator=lambda candidate: assemble_draft(candidate.content),
-    )
+    result = None
+    last_error: Exception | None = None
+    for attempt in range(1, 3):
+        active_messages = messages
+        if last_error is not None:
+            allowed_keys = [item.source_key for item in evidence_pack.items]
+            active_messages = [
+                *messages,
+                {
+                    "role": "user",
+                    "content": (
+                        "上一次草稿未通过结构与证据边界校验。请从头返回完整 JSON，"
+                        f"只能使用这些 source_key：{allowed_keys}。"
+                        "不得沿用其他章节的引用键，不要解释或续写残片。"
+                        f"上一次校验错误：{str(last_error)[:600]}"
+                    ),
+                },
+            ]
+            progress(50, f"按校验反馈重新起草 — {outline_node.heading}")
+        try:
+            result = siliconflow.chat(
+                active_messages,
+                thinking=False,
+                temperature=0.5,
+                max_tokens=8192,
+                response_format="json_object",
+                seed=42,
+                use_cache=not revision_feedback and attempt == 1,
+                stream=True,
+                request_attempts=2,
+                result_validator=lambda candidate: assemble_draft(candidate.content),
+            )
+            break
+        except Exception as exc:
+            check_cancelled()
+            last_error = exc
+            if attempt == 2:
+                raise
+
+    if result is None:
+        raise ValueError("LLM 未返回可用的章节草稿")
 
     progress(85, f"解析草稿 — {outline_node.heading}")
     check_cancelled()
