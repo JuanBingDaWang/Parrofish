@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable
+from functools import wraps
 from typing import TYPE_CHECKING
 
 from writing_factory.generate.models import (
@@ -32,6 +33,7 @@ from writing_factory.orchestration.consistency import (
     review_term_consistency,
     run_global_polish,
 )
+from writing_factory.orchestration.errors import PipelineNodeError
 from writing_factory.orchestration.reference_assembler import (
     assemble_reference_list,
     render_final_citation_markers,
@@ -41,14 +43,12 @@ from writing_factory.orchestration.state import (
     PIPELINE_STATUS_ASSEMBLING,
     PIPELINE_STATUS_DONE,
     PIPELINE_STATUS_DRAFTING,
-    PIPELINE_STATUS_ERROR,
     PIPELINE_STATUS_FRAMEWORK,
     PIPELINE_STATUS_GLOBAL_POLISH,
     PIPELINE_STATUS_POLISHING,
     PIPELINE_STATUS_STRUCTURE_REVIEW,
     PIPELINE_STATUS_VERIFYING,
     SECTION_STATUS_DRAFTED,
-    SECTION_STATUS_ERROR,
     SECTION_STATUS_PENDING,
     SECTION_STATUS_POLISHED,
     SECTION_STATUS_REVISING,
@@ -100,6 +100,26 @@ def _update_section(state: WritingState, updates: dict) -> list[dict]:
     return sections
 
 
+def _pipeline_node(label: str):
+    """Wrap a node so exceptions abort before LangGraph commits its update."""
+
+    def decorate(function):
+        @wraps(function)
+        def wrapped(self: WritingPipeline, state: WritingState) -> dict:
+            try:
+                return function(self, state)
+            except PipelineNodeError:
+                raise
+            except Exception as exc:
+                self.check_cancelled()
+                logger.exception("%s failed", function.__name__)
+                raise PipelineNodeError(label, str(exc)) from exc
+
+        return wrapped
+
+    return decorate
+
+
 # ── 节点类 ────────────────────────────────────────────────────
 
 
@@ -115,6 +135,7 @@ class WritingPipeline:
         retriever: HybridRetriever,
         siliconflow: SiliconFlowClient,
         kb_repository: KnowledgeBaseRepository,
+        framework_generation_timeout_seconds: float = 900.0,
         progress: Callable[[int, str], None] | None = None,
         check_cancelled: Callable[[], None] | None = None,
     ) -> None:
@@ -122,6 +143,7 @@ class WritingPipeline:
         self.retriever = retriever
         self.siliconflow = siliconflow
         self.kb_repository = kb_repository
+        self.framework_generation_timeout_seconds = framework_generation_timeout_seconds
         self.progress = progress or (lambda _percent, _message: None)
         self.check_cancelled = check_cancelled or (lambda: None)
 
@@ -131,6 +153,7 @@ class WritingPipeline:
     #   #7 锚定论点 ✓ — 产出 ThesisStatement 即全篇锚
     #   #8 生成阶段只读 ✓ — 不调用 write tool
 
+    @_pipeline_node("选题")
     def select_topic_node(self, state: WritingState) -> dict:
         """选题节点：persona + KB 检索 → ThesisStatement。"""
         from writing_factory.generate.topic_selection import select_topic
@@ -151,10 +174,10 @@ class WritingPipeline:
                 "thesis_json": thesis.model_dump_json(),
                 "status": PIPELINE_STATUS_FRAMEWORK,
             }
-        except Exception as exc:
+        except Exception:
             self.check_cancelled()
             logger.exception("select_topic 失败")
-            return {"status": PIPELINE_STATUS_ERROR, "error": str(exc)}
+            raise
 
     # ── 节点：框架 ────────────────────────────────────────────
     # 铁律遵守：
@@ -162,6 +185,7 @@ class WritingPipeline:
     #   #2 事实先冻结 ✓ — 只在候选证据层面做映射，不写正文
     #   #7 锚定论点 ✓ — 每个节点 rhetorical_purpose 指向 thesis
 
+    @_pipeline_node("框架生成")
     def build_framework_node(self, state: WritingState) -> dict:
         """框架节点：thesis + persona + KB 检索 → AnnotatedOutline。"""
         from writing_factory.generate.framework import build_framework
@@ -170,7 +194,7 @@ class WritingPipeline:
         context = _ctx(state)
         thesis = _thesis(state)
         if thesis is None:
-            return {"status": PIPELINE_STATUS_ERROR, "error": "thesis 为 None"}
+            raise ValueError("缺少已冻结的论文论点")
 
         try:
             outline = build_framework(
@@ -179,6 +203,7 @@ class WritingPipeline:
                 persona_repository=self.persona_repository,
                 retriever=self.retriever,
                 siliconflow=self.siliconflow,
+                request_timeout_seconds=self.framework_generation_timeout_seconds,
                 progress=self.progress,
                 check_cancelled=self.check_cancelled,
             )
@@ -211,10 +236,10 @@ class WritingPipeline:
                 "source_key_counter": sum(len(node.candidate_evidence) for node in all_nodes),
                 "status": PIPELINE_STATUS_DRAFTING,
             }
-        except Exception as exc:
+        except Exception:
             self.check_cancelled()
             logger.exception("build_framework 失败")
-            return {"status": PIPELINE_STATUS_ERROR, "error": str(exc)}
+            raise
 
     # ── 节点：起草 ────────────────────────────────────────────
     # 铁律遵守：
@@ -224,6 +249,7 @@ class WritingPipeline:
     #   #4 引用由代码拼装 ✓ — source_key 由代码分配，不由模型生成
     #   #7 锚定论点 ✓ — thesis + outline 在每个起草胶囊中
 
+    @_pipeline_node("章节起草")
     def draft_section_node(self, state: WritingState) -> dict:
         """起草节点：逐节检索证据 → 锁定 EvidencePack → LLM 起草。"""
         from writing_factory.generate.drafting import draft_section
@@ -234,7 +260,7 @@ class WritingPipeline:
         outline = _outline(state)
         cur = _current_section(state)
         if thesis is None or outline is None or cur is None:
-            return {"status": PIPELINE_STATUS_ERROR, "error": "缺少 thesis/outline/current_section"}
+            raise ValueError("缺少论点、提纲或当前章节")
 
         term_registry = json.loads(state.get("term_registry_json", "{}"))
         is_revision = cur.get("revision_count", 0) > 0
@@ -258,7 +284,7 @@ class WritingPipeline:
         all_nodes = _flatten_outline_nodes(outline.root_nodes)
         idx = state["current_section_index"]
         if idx >= len(all_nodes):
-            return {"status": PIPELINE_STATUS_ERROR, "error": f"section index {idx} 超出范围"}
+            raise IndexError(f"章节索引 {idx} 超出提纲范围")
 
         outline_node = all_nodes[idx]
 
@@ -323,17 +349,10 @@ class WritingPipeline:
                 "source_key_counter": new_counter,
                 "status": PIPELINE_STATUS_VERIFYING,
             }
-        except Exception as exc:
+        except Exception:
             self.check_cancelled()
             logger.exception("draft_section 失败")
-            sections_update = _update_section(
-                state,
-                {
-                    "status": SECTION_STATUS_ERROR,
-                    "error": str(exc),
-                },
-            )
-            return {"sections": sections_update, "status": PIPELINE_STATUS_ERROR, "error": str(exc)}
+            raise
 
     # ── 节点：核对 ────────────────────────────────────────────
     # 铁律遵守：
@@ -341,6 +360,7 @@ class WritingPipeline:
     #   #2 事实先冻结 ✓ — 只检查 fact 类型 claim，不碰 interpretation/common
     #   #4 引用由代码拼装 ✓ — 不产生新引用，只比对已有 source_key → chunk
 
+    @_pipeline_node("事实核对")
     def verify_section_node(self, state: WritingState) -> dict:
         """核对节点：逐 claim 比对 chunk 原文 → 判定 supported/partial/unsupported。"""
         from writing_factory.generate.verification import verify_section
@@ -348,11 +368,11 @@ class WritingPipeline:
         logger.info("节点: verify_section")
         cur = _current_section(state)
         if cur is None:
-            return {"status": PIPELINE_STATUS_ERROR, "error": "current_section 为 None"}
+            raise ValueError("缺少当前章节")
 
         draft_json = cur.get("draft_json")
         if draft_json is None:
-            return {"status": PIPELINE_STATUS_ERROR, "error": "draft_json 为 None"}
+            raise ValueError("当前章节缺少结构化草稿")
 
         section_draft = SectionDraft.model_validate_json(draft_json)
 
@@ -376,36 +396,19 @@ class WritingPipeline:
                 "sections": sections_update,
                 "status": PIPELINE_STATUS_POLISHING,
             }
-        except Exception as exc:
+        except Exception:
             self.check_cancelled()
             logger.exception("verify_section 失败")
-            sections_update = _update_section(
-                state,
-                {
-                    "status": SECTION_STATUS_ERROR,
-                    "error": str(exc),
-                },
-            )
-            return {"sections": sections_update, "status": PIPELINE_STATUS_ERROR, "error": str(exc)}
+            raise
 
+    @_pipeline_node("事实核对安全门")
     def fail_verification_node(self, state: WritingState) -> dict:
         """Stop the pipeline rather than publishing claims that failed verification."""
 
         cur = _current_section(state)
         section_id = cur.get("section_id", "?") if cur else "?"
         message = f"节 {section_id} 在最大修订次数后仍有未通过核对的事实论断"
-        if cur is not None:
-            sections_update = _update_section(
-                state,
-                {"status": SECTION_STATUS_ERROR, "error": message},
-            )
-        else:
-            sections_update = state.get("sections", [])
-        return {
-            "sections": sections_update,
-            "status": PIPELINE_STATUS_ERROR,
-            "error": message,
-        }
+        raise PipelineNodeError("事实核对安全门", message)
 
     # ── 节点：打磨 ────────────────────────────────────────────
     # 铁律遵守：
@@ -414,6 +417,7 @@ class WritingPipeline:
     #   #5 不让作者校验自己 ✓ — 打磨后轻量核对使用中性角色
     #   #4 引用由代码拼装 ✓ — 打磨不修改 source_key 引用标记
 
+    @_pipeline_node("章节打磨")
     def polish_section_node(self, state: WritingState) -> dict:
         """打磨节点：persona 表达 DNA + 已核对草稿 → 成稿 + 防漂移检查。"""
         from writing_factory.generate.polishing import polish_section
@@ -422,21 +426,18 @@ class WritingPipeline:
         thesis = _thesis(state)
         cur = _current_section(state)
         if thesis is None or cur is None:
-            return {"status": PIPELINE_STATUS_ERROR, "error": "缺少 thesis/current_section"}
+            raise ValueError("缺少论点或当前章节")
 
         verified_json = cur.get("verified_draft_json")
         if verified_json is None:
-            return {"status": PIPELINE_STATUS_ERROR, "error": "verified_draft_json 为 None"}
+            raise ValueError("当前章节缺少核对结果")
 
         verified_draft = VerifiedDraft.model_validate_json(verified_json)
 
         # 需要从 draft 中取段落文本
         draft_json = cur.get("draft_json")
         if draft_json is None:
-            return {
-                "status": PIPELINE_STATUS_ERROR,
-                "error": "draft_json 为 None（打磨需要原始段落）",
-            }
+            raise ValueError("当前章节缺少原始段落")
 
         section_draft = SectionDraft.model_validate_json(draft_json)
 
@@ -444,10 +445,7 @@ class WritingPipeline:
         context = _ctx(state)
         persona_spec = self.persona_repository.load_runtime(context.persona_id or "")
         if persona_spec is None:
-            return {
-                "status": PIPELINE_STATUS_ERROR,
-                "error": f"persona '{context.persona_id}' 未就绪",
-            }
+            raise ValueError(f"persona '{context.persona_id}' 未就绪")
         persona_spec_json = persona_spec.model_dump(mode="json")
 
         try:
@@ -482,29 +480,23 @@ class WritingPipeline:
                 "claims_made_json": json.dumps(claims_made, ensure_ascii=False),
                 "status": PIPELINE_STATUS_POLISHING,  # 下一节或组装
             }
-        except Exception as exc:
+        except Exception:
             self.check_cancelled()
             logger.exception("polish_section 失败")
-            sections_update = _update_section(
-                state,
-                {
-                    "status": SECTION_STATUS_ERROR,
-                    "error": str(exc),
-                },
-            )
-            return {"sections": sections_update, "status": PIPELINE_STATUS_ERROR, "error": str(exc)}
+            raise
 
     # ── 节点：组装 ────────────────────────────────────────────
     # 铁律遵守：
     #   #4 引用由代码拼装不由模型敲 ✓ — 引用列表由 reference_assembler 纯代码生成
 
+    @_pipeline_node("稿件与引用组装")
     def assemble_node(self, state: WritingState) -> dict:
         """组装节点：拼接各节 polished_text + 代码生成参考文献列表。"""
         logger.info("节点: assemble")
 
         thesis = _thesis(state)
         if thesis is None:
-            return {"status": PIPELINE_STATUS_ERROR, "error": "thesis 为 None"}
+            raise ValueError("缺少已冻结的论文论点")
 
         # 收集所有 polished sections
         polished_sections: list[PolishedSection] = []
@@ -515,31 +507,19 @@ class WritingPipeline:
             if ps_json:
                 ps = PolishedSection.model_validate_json(ps_json)
                 if ps.fact_drift_detected:
-                    return {
-                        "status": PIPELINE_STATUS_ERROR,
-                        "error": f"节 {ps.section_id} 的打磨结果未通过事实冻结安全门",
-                    }
+                    raise ValueError(f"节 {ps.section_id} 的打磨结果未通过事实冻结安全门")
                 polished_sections.append(ps)
             else:
-                return {
-                    "status": PIPELINE_STATUS_ERROR,
-                    "error": f"节 {sec.get('section_id', '?')} 缺少打磨结果",
-                }
+                raise ValueError(f"节 {sec.get('section_id', '?')} 缺少打磨结果")
 
             draft_json = sec.get("draft_json")
             verified_json = sec.get("verified_draft_json")
             if not draft_json or not verified_json:
-                return {
-                    "status": PIPELINE_STATUS_ERROR,
-                    "error": f"节 {sec.get('section_id', '?')} 缺少草稿或核对结果",
-                }
+                raise ValueError(f"节 {sec.get('section_id', '?')} 缺少草稿或核对结果")
             sd = SectionDraft.model_validate_json(draft_json)
             verified = VerifiedDraft.model_validate_json(verified_json)
             if verified.unsupported_count or verified.partial_count:
-                return {
-                    "status": PIPELINE_STATUS_ERROR,
-                    "error": f"节 {verified.section_id} 仍有未通过核对的事实论断",
-                }
+                raise ValueError(f"节 {verified.section_id} 仍有未通过核对的事实论断")
             cited_keys = {
                 key
                 for item in verified.verified_claims
@@ -566,7 +546,7 @@ class WritingPipeline:
         except Exception as exc:
             self.check_cancelled()
             logger.exception("assemble_reference_list 失败")
-            return {"status": PIPELINE_STATUS_ERROR, "error": f"引用拼装失败: {exc}"}
+            raise RuntimeError(f"引用拼装失败: {exc}") from exc
 
         # 组装最终稿
         final_draft = PolishedDraft(
@@ -588,6 +568,7 @@ class WritingPipeline:
     #   #7 锚定论点 ✓ — 检查术语一致性，确保全文概念统一
     #   #5 不让作者校验自己 ✓ — 使用中性角色
 
+    @_pipeline_node("术语一致性审查")
     def term_consistency_node(self, state: WritingState) -> dict:
         """术语一致性审查节点：检查全篇术语使用是否一致。"""
         logger.info("节点: term_consistency")
@@ -611,31 +592,27 @@ class WritingPipeline:
                 "term_consistency_json": report.model_dump_json(),
                 "status": PIPELINE_STATUS_STRUCTURE_REVIEW,
             }
-        except Exception as exc:
+        except Exception:
             self.check_cancelled()
             logger.exception("term_consistency 失败")
-            return {
-                "term_consistency_json": TermConsistencyReport(
-                    reviewer_note=f"术语审查异常: {exc}",
-                ).model_dump_json(),
-                "status": PIPELINE_STATUS_STRUCTURE_REVIEW,
-            }
+            raise
 
     # ── 节点：结构审查 ──────────────────────────────────────────
     # 铁律遵守：
     #   #7 锚定论点 ✓ — 评估论证结构是否与 thesis 一致
 
+    @_pipeline_node("全文结构审查")
     def structure_review_node(self, state: WritingState) -> dict:
         """结构审查节点：检查全文结构平衡、逻辑推进、过渡衔接。"""
         logger.info("节点: structure_review")
 
         thesis = _thesis(state)
         if thesis is None:
-            return {"status": PIPELINE_STATUS_ERROR, "error": "thesis 为 None"}
+            raise ValueError("缺少已冻结的论文论点")
 
         outline = _outline(state)
         if outline is None:
-            return {"status": PIPELINE_STATUS_ERROR, "error": "outline 为 None"}
+            raise ValueError("缺少带注释提纲")
 
         # 扁平化提纲节点
         all_nodes = _flatten_outline_nodes(outline.root_nodes)
@@ -660,15 +637,10 @@ class WritingPipeline:
                 "structure_review_json": review.model_dump_json(),
                 "status": PIPELINE_STATUS_GLOBAL_POLISH,
             }
-        except Exception as exc:
+        except Exception:
             self.check_cancelled()
             logger.exception("structure_review 失败")
-            return {
-                "structure_review_json": StructureReview(
-                    overall_assessment=f"结构审查异常: {exc}",
-                ).model_dump_json(),
-                "status": PIPELINE_STATUS_GLOBAL_POLISH,
-            }
+            raise
 
     # ── 节点：全局一致性打磨（1M 上下文） ────────────────────────
     # 铁律遵守：
@@ -676,13 +648,14 @@ class WritingPipeline:
     #   #4 引用由代码拼装 ✓ — 不修改 source_key
     #   #7 锚定论点 ✓ — 对照 thesis 检查整体一致性
 
+    @_pipeline_node("全文一致性打磨")
     def global_polish_node(self, state: WritingState) -> dict:
         """全局打磨节点：利用 1M 上下文做全篇一致性审查与过渡润色。"""
         logger.info("节点: global_polish")
 
         thesis = _thesis(state)
         if thesis is None:
-            return {"status": PIPELINE_STATUS_ERROR, "error": "thesis 为 None"}
+            raise ValueError("缺少已冻结的论文论点")
 
         # 加载已有审查报告（可选）
         term_report: TermConsistencyReport | None = None
@@ -722,20 +695,10 @@ class WritingPipeline:
                 "global_polish_json": result.model_dump_json(),
                 "status": PIPELINE_STATUS_ASSEMBLING,
             }
-        except Exception as exc:
+        except Exception:
             self.check_cancelled()
             logger.exception("global_polish 失败")
-            return {
-                "global_polish_json": json.dumps(
-                    {
-                        "sections": [],
-                        "transitions_added": [],
-                        "global_consistency_notes": f"全局打磨异常: {exc}，已跳过此步骤。",
-                    },
-                    ensure_ascii=False,
-                ),
-                "status": PIPELINE_STATUS_ASSEMBLING,
-            }
+            raise
 
 
 # ── 路由函数 ──────────────────────────────────────────────────
@@ -751,11 +714,11 @@ def should_continue_after_verify(state: WritingState) -> str:
     """
     cur = _current_section(state)
     if cur is None:
-        return "error"
+        raise PipelineNodeError("事实核对路由", "缺少当前章节")
 
     verified_json = cur.get("verified_draft_json")
     if verified_json is None:
-        return "error"
+        raise PipelineNodeError("事实核对路由", "当前章节缺少核对结果")
 
     verified = VerifiedDraft.model_validate_json(verified_json)
     revision_count = cur.get("revision_count", 0)
@@ -804,7 +767,7 @@ def prepare_revise_section(state: WritingState) -> dict:
     """增加修订计数，回到起草状态。"""
     cur = _current_section(state)
     if cur is None:
-        return {"status": PIPELINE_STATUS_ERROR, "error": "revise: current_section 为 None"}
+        raise PipelineNodeError("章节修订准备", "缺少当前章节")
     sections_update = _update_section(
         state,
         {

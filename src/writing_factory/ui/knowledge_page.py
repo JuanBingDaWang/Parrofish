@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
 )
 
 from writing_factory.ui.retrieval_panel import RetrievalPanel
+from writing_factory.ui.time_format import format_china_datetime
 from writing_factory.ui.workers import (
     BackgroundTaskManager,
     TaskCancelled,
@@ -313,7 +314,7 @@ class KnowledgeBasePage(QWidget):
                 str(document.get("filename", "")),
                 self._status_label(str(document.get("status", ""))),
                 str(document.get("chunk_count", 0)),
-                str(document.get("ingest_date", ""))[:19].replace("T", " "),
+                format_china_datetime(document.get("ingest_date")),
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)

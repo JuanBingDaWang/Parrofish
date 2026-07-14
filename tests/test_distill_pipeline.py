@@ -861,6 +861,7 @@ def test_repository_updates_and_deletes_ready_persona_with_dependents(tmp_path) 
         source_hash="source",
         input_hash="input",
         source_doc_ids=["doc_a"],
+        control_doc_ids=["doc_control"],
         map_total=1,
     )
     persona = persona.model_copy(update={"id": run.persona_id})
@@ -876,6 +877,10 @@ def test_repository_updates_and_deletes_ready_persona_with_dependents(tmp_path) 
         persona=persona,
         markdown=render_persona_markdown(persona),
     )
+    source_roles = repository.load_source_roles(persona.id)
+    assert source_roles is not None
+    assert source_roles.target_doc_ids == {"doc_a"}
+    assert source_roles.control_doc_ids == {"doc_control"}
     repository.save_evaluation(
         persona_id=persona.id,
         evaluation_type="nuwa_fidelity",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from hashlib import sha256
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -12,6 +13,9 @@ from writing_factory.distill.models import PersonaSpec
 from writing_factory.eval.injection import InjectionDetector
 from writing_factory.generate.models import GenerationContext
 from writing_factory.kb.models import MetadataFilter
+
+if TYPE_CHECKING:
+    from writing_factory.store.persona_repository import PersonaRepository
 
 
 class GenerationSourcePolicy(BaseModel):
@@ -40,10 +44,19 @@ def build_generation_source_policy(
     persona: PersonaSpec,
     selected_task_doc_ids: Iterable[str],
     explicitly_allowed_persona_doc_ids: Iterable[str] = (),
+    target_persona_doc_ids: Iterable[str] | None = None,
 ) -> GenerationSourcePolicy:
-    """默认排除全部蒸馏来源，用户明确复用时才重新放入白名单。"""
+    """默认只排除作者目标语料；对照语料仍可作为任务事实来源。
 
-    persona_ids = {item.doc_id for item in persona.source_info}
+    ``target_persona_doc_ids`` 为 ``None`` 表示旧档案缺少来源角色元数据，
+    此时保守回退为排除 PersonaSpec 中的全部蒸馏来源。
+    """
+
+    persona_ids = (
+        {item.doc_id for item in persona.source_info}
+        if target_persona_doc_ids is None
+        else set(target_persona_doc_ids)
+    )
     explicit = set(explicitly_allowed_persona_doc_ids) & persona_ids
     selected = set(selected_task_doc_ids)
     excluded = persona_ids - explicit
@@ -53,6 +66,29 @@ def build_generation_source_policy(
         policy_id=f"source_policy_{sha256(digest_input.encode('utf-8')).hexdigest()[:16]}",
         allowed_task_doc_ids=allowed,
         excluded_persona_doc_ids=excluded,
+    )
+
+
+def build_persona_generation_source_policy(
+    *,
+    persona_repository: PersonaRepository,
+    persona_id: str,
+    selected_task_doc_ids: Iterable[str],
+    explicitly_allowed_persona_doc_ids: Iterable[str] = (),
+) -> GenerationSourcePolicy:
+    """Build a policy from the profile plus its persisted target/control roles."""
+
+    loaded = persona_repository.load_ready(persona_id)
+    if loaded is None:
+        raise ValueError(f"persona '{persona_id}' 未就绪")
+    persona, _markdown = loaded
+    role_loader = getattr(persona_repository, "load_source_roles", None)
+    roles = role_loader(persona_id) if role_loader is not None else None
+    return build_generation_source_policy(
+        persona=persona,
+        selected_task_doc_ids=selected_task_doc_ids,
+        explicitly_allowed_persona_doc_ids=explicitly_allowed_persona_doc_ids,
+        target_persona_doc_ids=roles.target_doc_ids if roles is not None else None,
     )
 
 

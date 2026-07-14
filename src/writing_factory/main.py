@@ -12,6 +12,7 @@ from writing_factory.app import build_application
 from writing_factory.distill.models import PersonaSpec
 from writing_factory.distill.quality import run_static_quality_check
 from writing_factory.distill.serialization import render_persona_markdown
+from writing_factory.generate.source_policy import build_persona_generation_source_policy
 from writing_factory.ui.main_window import MainWindow
 from writing_factory.ui.theme import configure_application_font
 from writing_factory.ui.workers import TaskContext
@@ -168,16 +169,36 @@ def main() -> int:
                 task_id=task_id,
                 selected_doc_ids=selected_doc_ids,
                 explicitly_allowed_persona_doc_ids=explicitly_allowed_persona_doc_ids,
+                framework_generation_timeout_seconds=(
+                    app_context.get_framework_generation_timeout()
+                ),
                 resume=resume,
             )
-        except Exception:
+        except Exception as exc:
             if context.is_cancelled:
                 app_context.project_repository.mark_task_status(task_id, "cancelled")
             else:
-                app_context.project_repository.mark_task_status(task_id, "error")
+                app_context.project_repository.mark_task_status(task_id, "error", str(exc))
             raise
         app_context.project_repository.update_task_state(task_id, result)
         return result
+
+    def preview_source_selection(
+        persona_id: str,
+        selected_doc_ids: set[str],
+        explicitly_allowed_persona_doc_ids: set[str],
+    ) -> dict[str, int]:
+        policy = build_persona_generation_source_policy(
+            persona_repository=app_context.persona_repository,
+            persona_id=persona_id,
+            selected_task_doc_ids=selected_doc_ids,
+            explicitly_allowed_persona_doc_ids=explicitly_allowed_persona_doc_ids,
+        )
+        return {
+            "selected_count": len(selected_doc_ids),
+            "isolated_count": len(selected_doc_ids & policy.excluded_persona_doc_ids),
+            "usable_count": len(policy.allowed_task_doc_ids),
+        }
 
     def evaluate_generation(
         thesis_json: str,
@@ -286,6 +307,8 @@ def main() -> int:
         list_persona_versions=app_context.persona_repository.list_versions,
         get_siliconflow_concurrency=lambda: app_context.siliconflow_gate.limit,
         set_siliconflow_concurrency=app_context.set_siliconflow_concurrency,
+        get_framework_generation_timeout=app_context.get_framework_generation_timeout,
+        set_framework_generation_timeout=app_context.set_framework_generation_timeout,
         get_retrieval_option=app_context.get_retrieval_option,
         set_retrieval_option=app_context.set_retrieval_option,
         retrieve=retrieve,
@@ -314,6 +337,7 @@ def main() -> int:
         load_writing_task=app_context.project_repository.get_task,
         save_edited_draft=app_context.project_repository.save_edited_draft,
         delete_writing_tasks=app_context.project_repository.delete_tasks,
+        preview_source_selection=preview_source_selection,
     )
     application.aboutToQuit.connect(app_context.close)
     window.show()

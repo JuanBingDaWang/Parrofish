@@ -377,7 +377,15 @@ def test_generation_sources_exclude_persona_corpus_unless_explicitly_allowed() -
             style_tags=StyleTags(),
         ),
         evidence_registry=evidence,
-        source_info=[SourceInfo(doc_id="doc_0", title="旧论文", filename="old.pdf", chunk_count=1)],
+        source_info=[
+            SourceInfo(doc_id="doc_0", title="旧论文", filename="old.pdf", chunk_count=1),
+            SourceInfo(
+                doc_id="control_doc",
+                title="对照论文",
+                filename="control.pdf",
+                chunk_count=1,
+            ),
+        ],
         research_date=date.today(),
         declared_limits=["边界一", "边界二", "边界三"],
     )
@@ -388,12 +396,19 @@ def test_generation_sources_exclude_persona_corpus_unless_explicitly_allowed() -
     )
     explicit_policy = build_generation_source_policy(
         persona=persona,
-        selected_task_doc_ids={"doc_0", "new_doc"},
+        selected_task_doc_ids={"doc_0", "control_doc", "new_doc"},
         explicitly_allowed_persona_doc_ids={"doc_0"},
+        target_persona_doc_ids={"doc_0"},
+    )
+    role_aware_policy = build_generation_source_policy(
+        persona=persona,
+        selected_task_doc_ids={"doc_0", "control_doc", "new_doc"},
+        target_persona_doc_ids={"doc_0"},
     )
 
     assert default_policy.allowed_task_doc_ids == {"new_doc"}
-    assert explicit_policy.allowed_task_doc_ids == {"doc_0", "new_doc"}
+    assert role_aware_policy.allowed_task_doc_ids == {"control_doc", "new_doc"}
+    assert explicit_policy.allowed_task_doc_ids == {"doc_0", "control_doc", "new_doc"}
 
 
 def test_similarity_guard_detects_long_copy_from_persona_source() -> None:

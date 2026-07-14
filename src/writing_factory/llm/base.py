@@ -13,7 +13,7 @@ from typing import Any
 
 import httpx
 from pydantic import SecretStr
-from tenacity import Retrying, retry_if_exception_type, stop_after_attempt
+from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, stop_before_delay
 from tenacity.wait import wait_exponential_jitter
 
 from writing_factory.llm.common import (
@@ -84,6 +84,7 @@ class ServiceTransport:
         prompt_summary: Mapping[str, Any] | None = None,
         use_cache: bool = False,
         request_timeout_seconds: float | None = None,
+        request_total_timeout_seconds: float | None = None,
         request_attempts: int | None = None,
         stream_response: bool = False,
         priority: int = 10,
@@ -113,21 +114,47 @@ class ServiceTransport:
                 )
                 return cached
 
+        if request_total_timeout_seconds is not None and request_total_timeout_seconds <= 0:
+            raise ValueError("request_total_timeout_seconds must be positive")
+
         try:
             request_once = self._request_sse_once if stream_response else self._request_once
+            deadline = (
+                time.monotonic() + request_total_timeout_seconds
+                if request_total_timeout_seconds is not None
+                else None
+            )
+
+            def execute_attempt() -> dict[str, Any]:
+                attempt_timeout = request_timeout_seconds
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise RetryableServiceError(
+                            f"{self.provider} request exceeded total timeout"
+                        )
+                    attempt_timeout = (
+                        remaining
+                        if attempt_timeout is None
+                        else min(attempt_timeout, remaining)
+                    )
+                return request_once(
+                    method,
+                    path,
+                    normalized_payload,
+                    attempt_timeout,
+                    priority,
+                )
+
+            stop_policy = stop_after_attempt(max(1, request_attempts or self.max_retries))
+            if request_total_timeout_seconds is not None:
+                stop_policy |= stop_before_delay(request_total_timeout_seconds)
             response = Retrying(
-                stop=stop_after_attempt(max(1, request_attempts or self.max_retries)),
+                stop=stop_policy,
                 wait=wait_exponential_jitter(initial=0.5, max=8.0),
                 retry=retry_if_exception_type(RetryableServiceError),
                 reraise=True,
-            )(
-                request_once,
-                method,
-                path,
-                normalized_payload,
-                request_timeout_seconds,
-                priority,
-            )
+            )(execute_attempt)
         except Exception as exc:
             safe_error = (
                 exc
@@ -223,6 +250,8 @@ class ServiceTransport:
                                 f"{self.provider} returned an invalid event shape"
                             )
                         chunks.append(decoded)
+        except httpx.TimeoutException as exc:
+            raise RetryableServiceError(f"{self.provider} request timed out") from exc
         except httpx.TransportError as exc:
             raise RetryableServiceError(f"{self.provider} network error") from exc
         if not chunks:
@@ -253,6 +282,8 @@ class ServiceTransport:
                     response = self._client.request(
                         method, path, json=payload or None, **timeout_kwargs
                     )
+        except httpx.TimeoutException as exc:
+            raise RetryableServiceError(f"{self.provider} request timed out") from exc
         except httpx.TransportError as exc:
             raise RetryableServiceError(f"{self.provider} network error") from exc
 

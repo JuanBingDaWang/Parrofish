@@ -21,6 +21,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from writing_factory.ui.time_format import format_china_datetime
+
 
 class ProjectPage(QWidget):
     """Create, edit, select, and delete local writing projects."""
@@ -117,7 +119,11 @@ class ProjectPage(QWidget):
             self.table.setItem(row, 1, QTableWidgetItem(str(record.get("title", ""))))
             self.table.setItem(row, 2, QTableWidgetItem(str(record.get("description", ""))))
             self.table.setItem(row, 3, QTableWidgetItem(str(record.get("task_count", 0))))
-            self.table.setItem(row, 4, QTableWidgetItem(str(record.get("updated_at", ""))[:19]))
+            self.table.setItem(
+                row,
+                4,
+                QTableWidgetItem(format_china_datetime(record.get("updated_at"))),
+            )
 
     def _selection_changed(self) -> None:
         rows = sorted({item.row() for item in self.table.selectedItems()})

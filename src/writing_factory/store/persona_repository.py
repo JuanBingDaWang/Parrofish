@@ -28,6 +28,14 @@ class DistillationRunRecord:
     version_number: int = 1
 
 
+@dataclass(frozen=True, slots=True)
+class PersonaSourceRoles:
+    """Distinguish author target texts from optional comparison texts."""
+
+    target_doc_ids: frozenset[str]
+    control_doc_ids: frozenset[str]
+
+
 class PersonaRepository:
     """Persist every expensive map result before proceeding to reduction."""
 
@@ -417,6 +425,36 @@ class PersonaRepository:
         if row is None:
             return None
         return PersonaSpec.model_validate_json(row["spec_json"]), row["markdown"]
+
+    def load_source_roles(self, persona_id: str) -> PersonaSourceRoles | None:
+        """Load target/control roles from the latest completed distillation run.
+
+        Older profiles may predate role columns or have no completed run metadata;
+        callers must treat ``None`` as a signal to use the conservative legacy policy.
+        """
+
+        with self.database.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT target_doc_ids_json, control_doc_ids_json
+                FROM distillation_runs
+                WHERE persona_id = ? AND status = 'ready'
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                (persona_id,),
+            ).fetchone()
+        if row is None or not row["target_doc_ids_json"]:
+            return None
+        try:
+            target = frozenset(str(item) for item in json.loads(row["target_doc_ids_json"]))
+            control = frozenset(
+                str(item) for item in json.loads(row["control_doc_ids_json"] or "[]")
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not target:
+            return None
+        return PersonaSourceRoles(target_doc_ids=target, control_doc_ids=control)
 
     def load_runtime(self, persona_id: str) -> RuntimePersonaSpec | None:
         """读取不包含蒸馏证据和旧论文事实的运行时档案。"""

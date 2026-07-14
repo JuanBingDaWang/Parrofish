@@ -17,8 +17,12 @@ from writing_factory.generate.models import (
 )
 from writing_factory.kb.models import Bibliography, FusedHit, RetrievalResult
 from writing_factory.llm.models import ChatResult
+from writing_factory.orchestration.errors import PipelineNodeError
 from writing_factory.orchestration.nodes import should_continue_after_verify
-from writing_factory.orchestration.pipeline_runner import run_writing_pipeline_with_progress
+from writing_factory.orchestration.pipeline_runner import (
+    _legacy_resume_config,
+    run_writing_pipeline_with_progress,
+)
 from writing_factory.orchestration.reference_assembler import assemble_reference_list
 
 
@@ -31,6 +35,10 @@ class FakeTaskContext:
 
     def check_cancelled(self) -> None:
         return None
+
+    @property
+    def is_cancelled(self) -> bool:
+        return False
 
 
 class FakePersonaRepository:
@@ -188,12 +196,13 @@ def test_full_writing_graph_runs_offline(tmp_path: Path) -> None:
     kb_repository = FakeKnowledgeRepository()
     retriever = FakeRetriever(kb_repository)
     context = FakeTaskContext()
+    client = FakeSiliconFlow()
     result = run_writing_pipeline_with_progress(
         persona_id="persona_1",
         task_description="讨论数字人文方法",
         domain="数字人文",
         context=context,
-        siliconflow=FakeSiliconFlow(),
+        siliconflow=client,
         retriever=retriever,
         persona_repository=FakePersonaRepository(),
         kb_repository=kb_repository,
@@ -215,6 +224,9 @@ def test_full_writing_graph_runs_offline(tmp_path: Path) -> None:
     assert len(retriever.requests) == 4
     assert all(request.filters.doc_ids == {"doc_task"} for request in retriever.requests)
     assert context.progress[-1][0] == 100
+    assert client.calls[1][1]["request_timeout_seconds"] == 900.0
+    assert client.calls[1][1]["request_total_timeout_seconds"] == 900.0
+    assert client.calls[1][1]["stream"] is True
 
     resumed_client = FakeSiliconFlow()
     resumed_client.responses.clear()
@@ -235,6 +247,87 @@ def test_full_writing_graph_runs_offline(tmp_path: Path) -> None:
     )
     assert resumed["status"] == "done"
     assert resumed_client.calls == []
+
+
+def test_framework_failure_stops_and_resume_retries_failed_node(tmp_path: Path) -> None:
+    class FrameworkFailingClient(FakeSiliconFlow):
+        def chat(self, messages, **kwargs):
+            if len(self.calls) == 1:
+                self.calls.append((messages, kwargs))
+                raise TimeoutError("planned timeout")
+            return super().chat(messages, **kwargs)
+
+    kb_repository = FakeKnowledgeRepository()
+    failed_context = FakeTaskContext()
+    with pytest.raises(PipelineNodeError, match="框架生成失败.*planned timeout"):
+        run_writing_pipeline_with_progress(
+            persona_id="persona_1",
+            task_description="讨论数字人文方法",
+            domain="数字人文",
+            context=failed_context,
+            siliconflow=FrameworkFailingClient(),
+            retriever=FakeRetriever(kb_repository),
+            persona_repository=FakePersonaRepository(),
+            kb_repository=kb_repository,
+            checkpoint_dir=tmp_path,
+            kb_id="kb",
+            task_id="task_resume_framework",
+            selected_doc_ids={"doc_task"},
+        )
+
+    assert failed_context.progress[-1][0] < 100
+    assert "框架生成失败" in failed_context.progress[-1][1]
+
+    resumed_client = FakeSiliconFlow()
+    resumed_client.responses = resumed_client.responses[1:]
+    resumed = run_writing_pipeline_with_progress(
+        persona_id="persona_1",
+        task_description="讨论数字人文方法",
+        domain="数字人文",
+        context=FakeTaskContext(),
+        siliconflow=resumed_client,
+        retriever=FakeRetriever(kb_repository),
+        persona_repository=FakePersonaRepository(),
+        kb_repository=kb_repository,
+        checkpoint_dir=tmp_path,
+        kb_id="kb",
+        task_id="task_resume_framework",
+        selected_doc_ids={"doc_task"},
+        resume=True,
+    )
+
+    assert resumed["status"] == "done"
+    assert len(resumed_client.calls) == 8
+
+
+def test_legacy_terminal_error_rewinds_to_latest_healthy_pending_checkpoint() -> None:
+    terminal = SimpleNamespace(
+        values={"status": "error"},
+        next=(),
+        config={"configurable": {"checkpoint_id": "terminal"}},
+        metadata={"step": 5},
+    )
+    still_error = SimpleNamespace(
+        values={"status": "error"},
+        next=("draft_section",),
+        config={"configurable": {"checkpoint_id": "error"}},
+        metadata={"step": 2},
+    )
+    healthy = SimpleNamespace(
+        values={"status": "framework_building"},
+        next=("build_framework",),
+        config={"configurable": {"checkpoint_id": "healthy"}},
+        metadata={"step": 1},
+    )
+    graph = SimpleNamespace(
+        get_state=lambda _config: terminal,
+        get_state_history=lambda _config: [terminal, still_error, healthy],
+    )
+    thread_config = {"configurable": {"thread_id": "legacy"}}
+
+    selected = _legacy_resume_config(graph, thread_config)
+
+    assert selected == healthy.config
 
 
 def test_fact_claim_requires_source_and_inline_marker() -> None:

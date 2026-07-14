@@ -59,6 +59,8 @@ class MainWindow(QMainWindow):
         list_persona_versions: PersonaVersionLoader | None = None,
         get_siliconflow_concurrency: Callable[[], int] | None = None,
         set_siliconflow_concurrency: Callable[[int], None] | None = None,
+        get_framework_generation_timeout: Callable[[], int] | None = None,
+        set_framework_generation_timeout: Callable[[int], None] | None = None,
         get_retrieval_option: Callable[[str, bool], bool] | None = None,
         set_retrieval_option: Callable[[str, bool], None] | None = None,
         retrieve: Callable[..., Any] | None = None,
@@ -73,6 +75,8 @@ class MainWindow(QMainWindow):
         load_writing_task: Callable[[str], dict[str, object] | None] | None = None,
         save_edited_draft: Callable[..., None] | None = None,
         delete_writing_tasks: Callable[[set[str]], int] | None = None,
+        preview_source_selection: Callable[[str, set[str], set[str]], dict[str, int]]
+        | None = None,
     ) -> None:
         super().__init__()
         self._siliconflow_check = siliconflow_check
@@ -89,6 +93,10 @@ class MainWindow(QMainWindow):
         self._list_persona_versions = list_persona_versions
         self._get_siliconflow_concurrency = get_siliconflow_concurrency or (lambda: 3)
         self._set_siliconflow_concurrency = set_siliconflow_concurrency
+        self._get_framework_generation_timeout = get_framework_generation_timeout or (
+            lambda: 900
+        )
+        self._set_framework_generation_timeout = set_framework_generation_timeout
         self._get_retrieval_option = get_retrieval_option or (lambda _k, d=True: d)
         self._set_retrieval_option = set_retrieval_option
         self._retrieve = retrieve
@@ -103,6 +111,7 @@ class MainWindow(QMainWindow):
         self._load_writing_task = load_writing_task
         self._save_edited_draft = save_edited_draft
         self._delete_writing_tasks = delete_writing_tasks
+        self._preview_source_selection = preview_source_selection
         self._tasks = BackgroundTaskManager(self)
         self._check_task_id: str | None = None
         self._close_pending = False
@@ -182,6 +191,7 @@ class MainWindow(QMainWindow):
             load_writing_task=self._load_writing_task,
             save_edited_draft=self._save_edited_draft,
             delete_writing_tasks=self._delete_writing_tasks,
+            preview_source_selection=self._preview_source_selection,
             show_message=self.statusBar().showMessage,
         )
         self.pages.addWidget(self.writing_task_page)
@@ -274,6 +284,30 @@ class MainWindow(QMainWindow):
         concurrency_layout.addWidget(self.concurrency_input)
         layout.addWidget(concurrency_row)
 
+        timeout_row = QFrame()
+        timeout_row.setObjectName("serviceRow")
+        timeout_layout = QHBoxLayout(timeout_row)
+        timeout_layout.setContentsMargins(18, 14, 14, 14)
+        timeout_layout.setSpacing(16)
+        timeout_label = QLabel("框架生成超时上限")
+        timeout_label.setObjectName("providerName")
+        timeout_description = QLabel("SiliconFlow 请求总等待窗口（含重试）")
+        timeout_description.setObjectName("mutedText")
+        self.framework_timeout_input = QSpinBox()
+        self.framework_timeout_input.setRange(60, 3600)
+        self.framework_timeout_input.setSingleStep(60)
+        self.framework_timeout_input.setSuffix(" 秒")
+        self.framework_timeout_input.setValue(self._get_framework_generation_timeout())
+        self.framework_timeout_input.setToolTip(
+            "仅用于论文框架生成；超时后任务停在框架节点，可从断点继续"
+        )
+        self.framework_timeout_input.valueChanged.connect(self._framework_timeout_changed)
+        timeout_layout.addWidget(timeout_label)
+        timeout_layout.addWidget(timeout_description)
+        timeout_layout.addStretch(1)
+        timeout_layout.addWidget(self.framework_timeout_input)
+        layout.addWidget(timeout_row)
+
         mineru_row = QFrame()
         mineru_row.setObjectName("serviceRow")
         mineru_layout = QHBoxLayout(mineru_row)
@@ -336,6 +370,18 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(str(exc), 5000)
             return
         self.statusBar().showMessage(f"SiliconFlow 最大并发数已设为 {value}", 4000)
+
+    def _framework_timeout_changed(self, value: int) -> None:
+        """持久化框架生成请求的总超时上限。"""
+
+        if self._set_framework_generation_timeout is None:
+            return
+        try:
+            self._set_framework_generation_timeout(value)
+        except ValueError as exc:
+            self.statusBar().showMessage(str(exc), 5000)
+            return
+        self.statusBar().showMessage(f"框架生成超时上限已设为 {value} 秒", 4000)
 
     def _start_siliconflow_check(self) -> None:
         if self._check_task_id is not None:

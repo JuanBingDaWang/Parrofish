@@ -65,6 +65,24 @@ class ApplicationContext:
         self.runtime_settings.set("siliconflow_max_concurrency", value)
         self.distillation.set_max_parallel_tasks(value)
 
+    def get_framework_generation_timeout(self) -> int:
+        """读取框架生成请求包含重试在内的总超时秒数。"""
+
+        value = self.runtime_settings.get(
+            "framework_generation_timeout_seconds",
+            self.settings.framework_generation_timeout_seconds,
+        )
+        if isinstance(value, int) and 60 <= value <= 3600:
+            return value
+        return self.settings.framework_generation_timeout_seconds
+
+    def set_framework_generation_timeout(self, value: int) -> None:
+        """校验并持久化框架生成请求的总超时秒数。"""
+
+        if not 60 <= value <= 3600:
+            raise ValueError("框架生成超时上限必须在 60 至 3600 秒之间")
+        self.runtime_settings.set("framework_generation_timeout_seconds", value)
+
     def get_retrieval_option(self, key: str, default: bool = True) -> bool:
         """读取检索增强开关（HyDE / 查询改写），默认开启以优先写作质量。"""
 

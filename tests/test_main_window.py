@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from PyQt6.QtCore import QItemSelectionModel, Qt
+from PyQt6.QtWidgets import QScrollArea
 
 from tests.test_distill_pipeline import _persona
 from writing_factory.distill.serialization import render_persona_markdown
@@ -51,6 +52,120 @@ def test_settings_page_applies_shared_siliconflow_concurrency(qtbot) -> None:
     window.concurrency_input.setValue(6)
 
     assert changed == [6]
+
+
+def test_settings_page_persists_framework_generation_timeout(qtbot) -> None:
+    changed: list[int] = []
+    window = MainWindow(
+        lambda: ChatResult(content="OK", model="test"),
+        get_framework_generation_timeout=lambda: 1200,
+        set_framework_generation_timeout=changed.append,
+    )
+    qtbot.addWidget(window)
+
+    assert window.framework_timeout_input.value() == 1200
+    window.framework_timeout_input.setValue(1500)
+
+    assert changed == [1500]
+
+
+def test_writing_page_previews_isolated_target_sources_and_uses_scroll_regions(qtbot) -> None:
+    documents = [
+        {"doc_id": "target_a", "filename": "目标一.pdf"},
+        {"doc_id": "target_b", "filename": "目标二.pdf"},
+        {"doc_id": "control", "filename": "对照.pdf"},
+    ]
+
+    def preview(persona_id, selected, explicitly_allowed):
+        assert persona_id == "persona"
+        excluded = {"target_a", "target_b"} - explicitly_allowed
+        return {
+            "selected_count": len(selected),
+            "isolated_count": len(selected & excluded),
+            "usable_count": len(selected - excluded),
+        }
+
+    window = MainWindow(
+        lambda: ChatResult(content="OK", model="test"),
+        list_documents=lambda: documents,
+        list_personas=lambda: [{"persona_id": "persona", "name": "测试作者"}],
+        run_writing_pipeline=lambda **_kwargs: {},
+        preview_source_selection=preview,
+    )
+    qtbot.addWidget(window)
+    page = window.writing_task_page
+    page.persona_combo.setCurrentIndex(1)
+    for index in range(page.document_list.count()):
+        page.document_list.item(index).setCheckState(Qt.CheckState.Checked)
+
+    assert page.source_summary_label.text() == "已选 3 篇 · 隔离 2 篇 · 实际可用 1 篇"
+    assert page.start_button.isEnabled()
+    assert isinstance(page.main_splitter.widget(0), QScrollArea)
+    assert page.document_list.minimumHeight() >= 180
+    assert page.task_table.maximumHeight() > 1000
+    assert page.section_table.maximumHeight() > 1000
+
+    page.document_list.item(2).setCheckState(Qt.CheckState.Unchecked)
+    assert page.source_summary_label.text() == "已选 2 篇 · 隔离 2 篇 · 实际可用 0 篇"
+    assert not page.start_button.isEnabled()
+
+    page.allow_persona_sources.setChecked(True)
+    assert page.source_summary_label.text() == "已选 2 篇 · 隔离 0 篇 · 实际可用 2 篇"
+    assert page.start_button.isEnabled()
+
+
+def test_project_and_writing_times_display_as_east_eight(qtbot) -> None:
+    project = {
+        "project_id": "project",
+        "title": "测试项目",
+        "description": "",
+        "task_count": 1,
+        "updated_at": "2026-07-14T06:17:37+00:00",
+    }
+    task = {
+        "task_id": "task",
+        "title": "测试任务",
+        "status": "error",
+        "error": "超时",
+        "updated_at": "2026-07-14T06:17:37+00:00",
+    }
+    window = MainWindow(
+        lambda: ChatResult(content="OK", model="test"),
+        list_projects=lambda: [project],
+        list_writing_tasks=lambda _project_id: [task],
+    )
+    qtbot.addWidget(window)
+
+    assert window.project_page.table.item(0, 4).text() == "2026-07-14 14:17:37"
+    assert window.writing_task_page.task_table.item(0, 3).text() == "2026-07-14 14:17:37"
+
+
+def test_writing_failure_refreshes_history_without_green_full_progress(qtbot) -> None:
+    task = {
+        "task_id": "task",
+        "title": "测试任务",
+        "status": "running",
+        "error": None,
+        "updated_at": "2026-07-14T06:17:37+00:00",
+    }
+    window = MainWindow(
+        lambda: ChatResult(content="OK", model="test"),
+        list_projects=lambda: [{"project_id": "project", "title": "项目"}],
+        list_writing_tasks=lambda _project_id: [task],
+    )
+    qtbot.addWidget(window)
+    page = window.writing_task_page
+    assert page.task_table.item(0, 2).text() == "运行中"
+    page.progress_bar.setValue(100)
+    task["status"] = "error"
+    task["error"] = "框架生成超时"
+
+    page._pipeline_failed("框架生成超时")
+
+    assert page.task_table.item(0, 2).text() == "失败"
+    assert page.progress_bar.value() == 99
+    assert page.progress_bar.format() == "失败 · %p%"
+    assert "#b42318" in page.progress_bar.styleSheet()
 
 
 def test_settings_page_persists_retrieval_enhancement_switches(qtbot) -> None:

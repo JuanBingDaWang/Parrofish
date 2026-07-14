@@ -50,6 +50,7 @@ def build_framework(
     persona_repository: PersonaRepository,
     retriever: HybridRetriever,
     siliconflow: SiliconFlowClient,
+    request_timeout_seconds: float = 900.0,
     progress: ProgressCallback = _no_progress,
     check_cancelled: CancellationCheck = _no_cancellation,
 ) -> AnnotatedOutline:
@@ -145,6 +146,9 @@ def build_framework(
         max_tokens=4096,
         response_format="json_object",
         seed=42,
+        request_timeout_seconds=request_timeout_seconds,
+        request_total_timeout_seconds=request_timeout_seconds,
+        stream=True,
     )
 
     progress(85, "解析提纲结果")

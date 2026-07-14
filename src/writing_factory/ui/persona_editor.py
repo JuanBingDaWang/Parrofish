@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
 
 from writing_factory.distill.models import PersonaSpec
 from writing_factory.distill.runtime import RuntimePersonaSpec
+from writing_factory.ui.time_format import format_china_datetime
 
 PersonaLoader = Callable[[str], tuple[PersonaSpec, str] | None]
 PersonaSaver = Callable[[str, PersonaSpec], tuple[PersonaSpec, str]]
@@ -165,7 +166,7 @@ class PersonaEditorWindow(QMainWindow):
         self.version_preview.setPlainText(
             "\n".join(
                 f"v{item.get('version_number')} · {item.get('status')} · "
-                f"{str(item.get('research_date') or item.get('updated_at'))[:19]}"
+                f"{format_china_datetime(item.get('research_date') or item.get('updated_at'))}"
                 for item in versions
             )
             or "暂无版本历史"

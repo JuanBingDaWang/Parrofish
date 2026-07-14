@@ -54,6 +54,7 @@ def build_writing_graph(
     siliconflow: SiliconFlowClient,
     kb_repository: KnowledgeBaseRepository,
     checkpoint_dir: Path,
+    framework_generation_timeout_seconds: float = 900.0,
     progress: Callable[[int, str], None] | None = None,
     check_cancelled: Callable[[], None] | None = None,
 ) -> StateGraph:
@@ -75,6 +76,7 @@ def build_writing_graph(
         retriever=retriever,
         siliconflow=siliconflow,
         kb_repository=kb_repository,
+        framework_generation_timeout_seconds=framework_generation_timeout_seconds,
         progress=progress,
         check_cancelled=check_cancelled,
     )

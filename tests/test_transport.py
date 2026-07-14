@@ -145,6 +145,39 @@ def test_request_can_limit_attempts_and_override_timeout(tmp_path: Path) -> None
     assert timeout_extensions[0]["read"] == 600
 
 
+def test_total_timeout_window_prevents_another_retry(tmp_path: Path) -> None:
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(500, json={"message": "temporary"})
+
+    transport = ServiceTransport(
+        provider="test",
+        base_url="https://example.invalid/v1",
+        credential=SecretStr("private-token"),
+        database=_database(tmp_path),
+        connect_timeout_seconds=1,
+        read_timeout_seconds=1,
+        max_retries=3,
+        http_client=httpx.Client(
+            base_url="https://example.invalid/v1",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    with pytest.raises(ExternalServiceError):
+        transport.request_json(
+            "POST",
+            "/operation",
+            operation="operation",
+            request_total_timeout_seconds=0.1,
+        )
+
+    assert requests == 1
+
+
 def test_protocol_disconnect_is_a_retryable_transport_failure(tmp_path: Path) -> None:
     requests = 0
 

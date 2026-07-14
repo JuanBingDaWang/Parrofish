@@ -24,6 +24,8 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
+    QSplitter,
     QStyle,
     QTableWidget,
     QTableWidgetItem,
@@ -45,6 +47,7 @@ from writing_factory.orchestration.state import (
     PIPELINE_STATUS_TOPIC,
     PIPELINE_STATUS_VERIFYING,
 )
+from writing_factory.ui.time_format import format_china_datetime
 from writing_factory.ui.workers import BackgroundTaskManager, TaskContext
 
 logger = logging.getLogger(__name__)
@@ -74,6 +77,14 @@ _SECTION_LABELS: dict[str, str] = {
     "polishing": "▶ 打磨",
     "polished": "✓ 完成",
     "error": "✗ 错误",
+}
+
+_TASK_STATUS_LABELS: dict[str, str] = {
+    "pending": "待开始",
+    "running": "运行中",
+    "cancelled": "已取消",
+    PIPELINE_STATUS_DONE: "已完成",
+    PIPELINE_STATUS_ERROR: "失败",
 }
 
 
@@ -106,6 +117,8 @@ class WritingTaskPage(QWidget):
         load_writing_task: Callable[[str], dict[str, object] | None] | None,
         save_edited_draft: Callable[..., None] | None,
         delete_writing_tasks: Callable[[set[str]], int] | None,
+        preview_source_selection: Callable[[str, set[str], set[str]], dict[str, int]]
+        | None = None,
         show_message: Callable[[str, int], None],
     ) -> None:
         super().__init__()
@@ -120,12 +133,14 @@ class WritingTaskPage(QWidget):
         self._load_writing_task = load_writing_task
         self._save_edited_draft = save_edited_draft
         self._delete_writing_tasks = delete_writing_tasks
+        self._preview_source_selection = preview_source_selection
         self._show_message = show_message
         self._task_id: str | None = None
         self._writing_task_id: str | None = None
         self._last_result: dict[str, Any] | None = None
         self._personas: list[dict[str, object]] = []
         self._task_records: list[dict[str, object]] = []
+        self._history_refreshed_for_run = False
         self._build_ui()
 
     # ── UI construction ────────────────────────────────────────
@@ -142,6 +157,15 @@ class WritingTaskPage(QWidget):
         header.addWidget(heading)
         header.addStretch(1)
         layout.addLayout(header)
+
+        self.source_summary_label = QLabel("已选 0 篇 · 隔离 0 篇 · 实际可用 0 篇")
+        self.source_summary_label.setObjectName("mutedText")
+        self.source_summary_label.setWordWrap(True)
+        layout.addWidget(self.source_summary_label)
+
+        self.main_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.main_splitter.setChildrenCollapsible(False)
+        layout.addWidget(self.main_splitter, 1)
 
         # ── Config panel ──
         config_group = QGroupBox("任务配置")
@@ -161,6 +185,7 @@ class WritingTaskPage(QWidget):
         self.persona_combo = QComboBox()
         self.persona_combo.setMinimumWidth(300)
         self.persona_combo.setToolTip("选择一个已蒸馏的作者档案作为写作风格来源")
+        self.persona_combo.currentIndexChanged.connect(self._update_source_summary)
         self.refresh_button = QPushButton(
             self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload),
             "",
@@ -189,13 +214,15 @@ class WritingTaskPage(QWidget):
         config_layout.addRow("研究领域:", domain_row)
 
         self.document_list = QListWidget()
-        self.document_list.setMaximumHeight(112)
+        self.document_list.setMinimumHeight(180)
         self.document_list.setToolTip("勾选本任务允许作为事实与引用来源的文档")
+        self.document_list.itemChanged.connect(self._update_source_summary)
         config_layout.addRow("事实语料:", self.document_list)
         self.allow_persona_sources = QCheckBox("明确允许复用所选作者蒸馏语料作为事实来源")
         self.allow_persona_sources.setToolTip(
             "默认隔离作者旧论文；只有本任务确实需要引用它们时才开启"
         )
+        self.allow_persona_sources.stateChanged.connect(self._update_source_summary)
         config_layout.addRow("来源隔离:", self.allow_persona_sources)
 
         button_row = QHBoxLayout()
@@ -226,7 +253,13 @@ class WritingTaskPage(QWidget):
         button_row.addWidget(self.eval_button)
         config_layout.addRow("", button_row)
 
-        layout.addWidget(config_group)
+        config_scroll = QScrollArea()
+        config_scroll.setWidgetResizable(True)
+        config_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        config_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        config_scroll.setWidget(config_group)
+        config_scroll.setMinimumHeight(190)
+        self.main_splitter.addWidget(config_scroll)
 
         history_group = QGroupBox("项目任务")
         history_layout = QVBoxLayout(history_group)
@@ -248,7 +281,7 @@ class WritingTaskPage(QWidget):
         self.task_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.task_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.task_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.task_table.setMaximumHeight(150)
+        self.task_table.setMinimumHeight(92)
         self.task_table.verticalHeader().setVisible(False)
         task_header = self.task_table.horizontalHeader()
         task_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
@@ -258,7 +291,8 @@ class WritingTaskPage(QWidget):
         task_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         self.task_table.itemDoubleClicked.connect(lambda _item: self._load_selected_task())
         history_layout.addWidget(self.task_table)
-        layout.addWidget(history_group)
+        history_group.setMinimumHeight(120)
+        self.main_splitter.addWidget(history_group)
 
         # ── Progress panel ──
         self.progress_group = QGroupBox("写入进度")
@@ -280,7 +314,7 @@ class WritingTaskPage(QWidget):
         self.section_table.setHorizontalHeaderLabels(["节", "标题", "状态"])
         self.section_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.section_table.setAlternatingRowColors(True)
-        self.section_table.setMaximumHeight(200)
+        self.section_table.setMinimumHeight(84)
         self.section_table.verticalHeader().setVisible(False)
         sh = self.section_table.horizontalHeader()
         sh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
@@ -289,7 +323,8 @@ class WritingTaskPage(QWidget):
         progress_layout.addWidget(self.section_table)
 
         self.progress_group.hide()
-        layout.addWidget(self.progress_group)
+        self.progress_group.setMinimumHeight(120)
+        self.main_splitter.addWidget(self.progress_group)
 
         # ── Results panel ──
         self.results_group = QGroupBox("写作结果")
@@ -327,12 +362,18 @@ class WritingTaskPage(QWidget):
         save_row.addWidget(self.save_draft_button)
         results_layout.addLayout(save_row)
         self.results_group.hide()
-        layout.addWidget(self.results_group, 1)
+        self.results_group.setMinimumHeight(150)
+        self.main_splitter.addWidget(self.results_group)
+        self.main_splitter.setStretchFactor(0, 3)
+        self.main_splitter.setStretchFactor(1, 2)
+        self.main_splitter.setStretchFactor(2, 2)
+        self.main_splitter.setStretchFactor(3, 4)
 
         # ── Initial load ──
         self.refresh_projects()
         self._reload_personas()
         self._reload_documents()
+        self._update_source_summary()
 
     # ── Local project/task loading ─────────────────────────────
 
@@ -354,6 +395,7 @@ class WritingTaskPage(QWidget):
 
     def _reload_documents(self) -> None:
         selected = self._selected_doc_ids()
+        self.document_list.blockSignals(True)
         self.document_list.clear()
         for document in self._list_documents() or []:
             item = QListWidgetItem(
@@ -367,6 +409,8 @@ class WritingTaskPage(QWidget):
                 else Qt.CheckState.Unchecked
             )
             self.document_list.addItem(item)
+        self.document_list.blockSignals(False)
+        self._update_source_summary()
 
     def _selected_doc_ids(self) -> set[str]:
         return {
@@ -374,6 +418,52 @@ class WritingTaskPage(QWidget):
             for index in range(self.document_list.count())
             if self.document_list.item(index).checkState() == Qt.CheckState.Checked
         }
+
+    def _source_preview(self) -> dict[str, int]:
+        """Return the same source counts used by the generation policy."""
+
+        selected = self._selected_doc_ids()
+        fallback = {
+            "selected_count": len(selected),
+            "isolated_count": 0,
+            "usable_count": len(selected),
+        }
+        persona_id = self._selected_persona_id()
+        if not persona_id or self._preview_source_selection is None:
+            return fallback
+        explicitly_allowed = selected if self.allow_persona_sources.isChecked() else set()
+        return self._preview_source_selection(persona_id, selected, explicitly_allowed)
+
+    def _update_source_summary(self, *_args: object) -> None:
+        """Refresh preflight counts without starting a background task."""
+
+        try:
+            preview = self._source_preview()
+        except Exception as exc:
+            self.source_summary_label.setText(f"来源统计不可用：{exc}")
+            self.source_summary_label.setObjectName("statusError")
+            self.source_summary_label.style().unpolish(self.source_summary_label)
+            self.source_summary_label.style().polish(self.source_summary_label)
+            if self._preview_source_selection is not None and self._task_id is None:
+                self.start_button.setEnabled(False)
+            return
+        self.source_summary_label.setText(
+            f"已选 {preview['selected_count']} 篇 · "
+            f"隔离 {preview['isolated_count']} 篇 · "
+            f"实际可用 {preview['usable_count']} 篇"
+        )
+        object_name = (
+            "statusError"
+            if preview["selected_count"] and not preview["usable_count"]
+            else "mutedText"
+        )
+        self.source_summary_label.setObjectName(object_name)
+        self.source_summary_label.style().unpolish(self.source_summary_label)
+        self.source_summary_label.style().polish(self.source_summary_label)
+        if self._preview_source_selection is not None and self._task_id is None:
+            self.start_button.setEnabled(
+                self._run_writing_pipeline is not None and preview["usable_count"] > 0
+            )
 
     def _reload_task_history(self) -> None:
         project_id = self.project_combo.currentData()
@@ -391,9 +481,16 @@ class WritingTaskPage(QWidget):
             checkbox.setData(Qt.ItemDataRole.UserRole, record.get("task_id"))
             self.task_table.setItem(row, 0, checkbox)
             self.task_table.setItem(row, 1, QTableWidgetItem(str(record.get("title", ""))))
-            self.task_table.setItem(row, 2, QTableWidgetItem(str(record.get("status", ""))))
+            status = str(record.get("status", ""))
             self.task_table.setItem(
-                row, 3, QTableWidgetItem(str(record.get("updated_at", ""))[:19])
+                row,
+                2,
+                QTableWidgetItem(_TASK_STATUS_LABELS.get(status, status)),
+            )
+            self.task_table.setItem(
+                row,
+                3,
+                QTableWidgetItem(format_china_datetime(record.get("updated_at"))),
             )
             self.task_table.setItem(row, 4, QTableWidgetItem(str(record.get("error") or "")))
 
@@ -458,6 +555,17 @@ class WritingTaskPage(QWidget):
             return
         if record.get("status") == PIPELINE_STATUS_DONE:
             self._show_message("该任务已经完成，已载入稿件", 4000)
+            return
+        try:
+            source_preview = self._source_preview()
+        except Exception as exc:
+            self._show_message(f"无法检查事实来源：{exc}", 6000)
+            return
+        if source_preview["usable_count"] == 0:
+            self._show_message(
+                "该任务没有实际可用的事实语料，请调整来源选择后新建任务",
+                7000,
+            )
             return
         self._launch_pipeline(record, resume=True)
 
@@ -541,6 +649,17 @@ class WritingTaskPage(QWidget):
         if not selected_doc_ids:
             self._show_message("请至少勾选一篇事实语料", 5000)
             return
+        try:
+            source_preview = self._source_preview()
+        except Exception as exc:
+            self._show_message(f"无法检查事实来源：{exc}", 6000)
+            return
+        if source_preview["usable_count"] == 0:
+            self._show_message(
+                "所选文档均被来源隔离，请增加事实语料或明确允许复用目标语料",
+                7000,
+            )
+            return
         if self._create_writing_task is None:
             self._show_message("任务持久化服务不可用", 5000)
             return
@@ -566,12 +685,14 @@ class WritingTaskPage(QWidget):
                 selected_doc_ids if self.allow_persona_sources.isChecked() else set()
             ),
         }
+        self._reload_task_history()
         self._launch_pipeline(record, resume=False)
 
     def _launch_pipeline(self, record: dict[str, object], *, resume: bool) -> None:
         if self._run_writing_pipeline is None:
             return
         self._writing_task_id = str(record["task_id"])
+        self._history_refreshed_for_run = False
         self._set_running(True)
         if not resume:
             self._last_result = None
@@ -582,6 +703,8 @@ class WritingTaskPage(QWidget):
             self._eval_view.clear()
         self.progress_group.show()
         self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("%p%")
+        self.progress_bar.setStyleSheet("")
         self.status_label.setText("正在准备流水线…")
         self.section_table.setRowCount(0)
         self.eval_button.setEnabled(False)
@@ -618,6 +741,9 @@ class WritingTaskPage(QWidget):
         self.progress_bar.setValue(percent)
         if message:
             self.status_label.setText(message)
+        if not self._history_refreshed_for_run:
+            self._reload_task_history()
+            self._history_refreshed_for_run = True
 
     def _pipeline_succeeded(self, result: Any) -> None:
         if not isinstance(result, dict):
@@ -631,13 +757,16 @@ class WritingTaskPage(QWidget):
 
         if status == PIPELINE_STATUS_ERROR:
             self._show_message(f"写作流水线出错: {error}", 8000)
-            self.status_label.setText(f"出错: {error}")
+            self._show_pipeline_failure(str(error or "未知错误"))
+            self._reload_task_history()
             self._finish_writing()
             return
 
         # Display results
         self._display_results(result)
         self.progress_bar.setValue(100)
+        self.progress_bar.setFormat("%p%")
+        self.progress_bar.setStyleSheet("")
         self.status_label.setText("写作完成 ✓")
         self._show_message("写作流水线已完成全篇稿件的生成", 6000)
         self.eval_button.setEnabled(self._evaluate_generation is not None)
@@ -646,9 +775,20 @@ class WritingTaskPage(QWidget):
 
     def _pipeline_failed(self, message: str) -> None:
         self._show_message(f"写作流水线失败: {message}", 8000)
-        self.status_label.setText(f"失败: {message}")
+        self._show_pipeline_failure(message)
         self._reload_task_history()
         self._finish_writing()
+
+    def _show_pipeline_failure(self, message: str) -> None:
+        """Render a terminal failure without making it resemble 100% success."""
+
+        if self.progress_bar.value() >= 100:
+            self.progress_bar.setValue(99)
+        self.progress_bar.setFormat("失败 · %p%")
+        self.progress_bar.setStyleSheet(
+            "QProgressBar::chunk { background: #b42318; border-radius: 4px; }"
+        )
+        self.status_label.setText(f"失败: {message}")
 
     def _finish_writing(self) -> None:
         self._task_id = None
@@ -665,6 +805,8 @@ class WritingTaskPage(QWidget):
         self.task_input.setEnabled(not running)
         self.domain_input.setEnabled(not running)
         self.refresh_button.setEnabled(not running)
+        if not running:
+            self._update_source_summary()
 
     # ── Results display ────────────────────────────────────────
 

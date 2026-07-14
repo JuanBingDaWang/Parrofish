@@ -30,13 +30,14 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from writing_factory.generate.models import GenerationContext
-from writing_factory.generate.source_policy import build_generation_source_policy
+from writing_factory.generate.source_policy import build_persona_generation_source_policy
 from writing_factory.orchestration.graph import (
     build_writing_graph,
     close_writing_graph,
     create_initial_state,
 )
 from writing_factory.orchestration.state import (
+    PIPELINE_STATUS_DONE,
     PIPELINE_STATUS_ERROR,
     SECTION_STATUS_DRAFTED,
     SECTION_STATUS_ERROR,
@@ -116,6 +117,7 @@ def run_writing_pipeline_with_progress(
     task_id: str | None = None,
     selected_doc_ids: set[str] | None = None,
     explicitly_allowed_persona_doc_ids: set[str] | None = None,
+    framework_generation_timeout_seconds: float = 900.0,
     resume: bool = False,
 ) -> dict[str, Any]:
     """Run the full writing pipeline with progress reporting.
@@ -144,12 +146,9 @@ def run_writing_pipeline_with_progress(
     if domain:
         full_task = f"{task_description}\n研究领域：{domain}"
 
-    loaded = persona_repository.load_ready(persona_id)
-    if loaded is None:
-        raise ValueError(f"persona '{persona_id}' 未就绪")
-    audit_persona, _markdown = loaded
-    source_policy = build_generation_source_policy(
-        persona=audit_persona,
+    source_policy = build_persona_generation_source_policy(
+        persona_repository=persona_repository,
+        persona_id=persona_id,
         selected_task_doc_ids=selected_doc_ids or set(),
         explicitly_allowed_persona_doc_ids=explicitly_allowed_persona_doc_ids or set(),
     )
@@ -184,24 +183,34 @@ def run_writing_pipeline_with_progress(
     base_progress = _WEIGHT_TOPIC + _WEIGHT_FRAMEWORK
     completed_sections = 0
     current_section_done_weight = 0.0  # 0-1 within current section
+    last_reported_percent = 2
+
+    def report_progress(percent: int, message: str) -> None:
+        nonlocal last_reported_percent
+        last_reported_percent = max(0, min(100, percent))
+        context.report_progress(last_reported_percent, message)
 
     config = {"configurable": {"thread_id": resolved_task_id}}
 
     try:
-        context.report_progress(0, "初始化流水线")
+        report_progress(0, "初始化流水线")
         context.check_cancelled()
-        context.report_progress(2, "编译写作流水线图")
+        report_progress(2, "编译写作流水线图")
         graph = build_writing_graph(
             persona_repository=persona_repository,
             retriever=retriever,
             siliconflow=siliconflow,
             kb_repository=kb_repository,
             checkpoint_dir=checkpoint_dir,
-            progress=context.report_progress,
+            framework_generation_timeout_seconds=framework_generation_timeout_seconds,
+            progress=report_progress,
             check_cancelled=context.check_cancelled,
         )
         graph_input = None if resume else initial
-        for event in graph.stream(graph_input, config):
+        stream_config = _legacy_resume_config(graph, config) if resume else config
+        if stream_config is not config:
+            report_progress(last_reported_percent, "恢复升级前的失败断点")
+        for event in graph.stream(graph_input, stream_config):
             context.check_cancelled()
 
             # LangGraph streaming yields dicts like {node_name: state_updates}
@@ -214,7 +223,6 @@ def run_writing_pipeline_with_progress(
 
                 # Get status from state update
                 status = state_updates.get("status", "")
-                error = state_updates.get("error")
 
                 # ── Report progress ────────────────────────────
                 progress = _compute_progress(
@@ -261,40 +269,57 @@ def run_writing_pipeline_with_progress(
 
                 # Report to UI
                 pct = min(int(base_progress + current_section_done_weight * per_section_weight), 99)
-                context.report_progress(pct, label)
-
-                # Handle error
-                if status == PIPELINE_STATUS_ERROR:
-                    error_msg = error or "未知流水线错误"
-                    logger.error("写作流水线节点 %s 出错: %s", node_name, error_msg)
-                    # Don't abort — let the graph finish, we'll catch the final state
+                report_progress(pct, label)
 
         # ── Graph finished — collect final state ───────────────
-        context.report_progress(99, "正在获取最终结果")
+        report_progress(99, "正在获取最终结果")
 
         # Get the final state via get_state
         final_state = graph.get_state(config)
         state_dict = dict(final_state.values) if final_state else {}
         state_dict["task_id"] = resolved_task_id
+        if state_dict.get("status") != PIPELINE_STATUS_DONE:
+            detail = state_dict.get("error") or state_dict.get("status") or "最终状态为空"
+            raise RuntimeError(f"写作流水线未正常完成：{detail}")
 
-        context.report_progress(100, "流水线完成")
+        report_progress(100, "流水线完成")
         return state_dict
 
     except Exception as exc:
         if context.is_cancelled:
             raise
         logger.exception("写作流水线执行异常")
-        context.report_progress(100, f"流水线异常: {exc}")
-        return {
-            "status": PIPELINE_STATUS_ERROR,
-            "error": str(exc),
-            "persona_id": persona_id,
-            "task_description": task_description,
-            "task_id": resolved_task_id,
-        }
+        report_progress(last_reported_percent, f"已停止：{exc}")
+        raise
     finally:
         if graph is not None:
             close_writing_graph(graph)
+
+
+def _legacy_resume_config(graph, config: dict[str, Any]) -> dict[str, Any]:
+    """Rewind terminal error states written by the pre-short-circuit graph.
+
+    New node exceptions leave the latest snapshot healthy with a pending node, so
+    they use the ordinary thread config. Only legacy terminal ``error`` snapshots
+    need a historical checkpoint id to retry the first node that failed.
+    """
+
+    current = graph.get_state(config)
+    if (
+        current is None
+        or current.values.get("status") != PIPELINE_STATUS_ERROR
+        or current.next
+    ):
+        return config
+    for snapshot in graph.get_state_history(config):
+        if snapshot.values.get("status") != PIPELINE_STATUS_ERROR and snapshot.next:
+            logger.info(
+                "恢复旧版终止错误断点: step=%s next=%s",
+                snapshot.metadata.get("step"),
+                snapshot.next,
+            )
+            return snapshot.config
+    return config
 
 
 def _compute_progress(
