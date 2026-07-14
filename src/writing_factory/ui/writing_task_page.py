@@ -8,7 +8,7 @@ import logging
 import re
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QIcon, QTextCursor
@@ -42,7 +42,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from writing_factory.generate.models import GenerationOptions
+from writing_factory.generate.models import DocumentForm, GenerationOptions
 from writing_factory.orchestration.state import (
     MAX_RECOVERY_REVISIONS_PER_SECTION,
     PIPELINE_STATUS_ASSEMBLING,
@@ -111,7 +111,7 @@ class WritingTaskPage(QWidget):
         │ 状态: 起草中 (第 3/5 节)              │
         │ 节状态列表                           │
         ├─ 写入结果 ──────────────────────────┤
-        │ [论文] [提纲] [参考文献] [评估]        │
+        │ [正文] [提纲] [参考文献] [评估]        │
         └──────────────────────────────────────┘
     """
 
@@ -226,7 +226,7 @@ class WritingTaskPage(QWidget):
 
         self.task_input = QTextEdit()
         self.task_input.setPlaceholderText(
-            "描述写作任务，例如：「请写一篇关于数字人文在出版领域应用研究的论文」"
+            "描述写作任务，例如：「写一个论证数字阅读公共价值的段落」"
         )
         self.task_input.setMaximumHeight(72)
         config_layout.addRow("主题/要求:", self.task_input)
@@ -239,6 +239,14 @@ class WritingTaskPage(QWidget):
         domain_row.addWidget(self.domain_input, 1)
         domain_row.addStretch(1)
         config_layout.addRow("研究领域:", domain_row)
+
+        self.document_form_combo = QComboBox()
+        self.document_form_combo.addItem("自动识别", "auto")
+        self.document_form_combo.addItem("单个段落", "paragraph")
+        self.document_form_combo.addItem("短文 / 摘要", "short_text")
+        self.document_form_combo.addItem("论文", "paper")
+        self.document_form_combo.setToolTip("自动模式根据任务中的“段落、摘要、论文”等表达判断")
+        config_layout.addRow("文稿形态:", self.document_form_combo)
 
         self.target_length_spin = QSpinBox()
         self.target_length_spin.setRange(0, 100000)
@@ -485,7 +493,7 @@ class WritingTaskPage(QWidget):
         self.result_tabs = QTabWidget()
         self._draft_view = QPlainTextEdit()
         self._draft_view.setPlaceholderText("最终稿将在此显示…")
-        self.result_tabs.addTab(self._draft_view, "论文")
+        self.result_tabs.addTab(self._draft_view, "正文")
 
         self._outline_view = QPlainTextEdit()
         self._outline_view.setPlaceholderText("提纲将在此显示…")
@@ -546,6 +554,7 @@ class WritingTaskPage(QWidget):
             options = GenerationOptions.from_preset(
                 preset,
                 target_length_chars=max(500, self._resolved_target_length()),
+                document_form=self._resolved_document_form(),
             )
             values = (
                 options.fact_verification,
@@ -572,23 +581,45 @@ class WritingTaskPage(QWidget):
         if index >= 0 and self.quality_preset_combo.currentIndex() != index:
             self.quality_preset_combo.setCurrentIndex(index)
 
+    def _resolved_document_form(self) -> DocumentForm:
+        selected = str(self.document_form_combo.currentData() or "auto")
+        if selected != "auto":
+            return cast(DocumentForm, selected)
+        task = self.task_input.toPlainText().strip()
+        if re.search(r"(?:写|生成|起草|改写).{0,8}(?:一|1|一个|单个)?(?:个)?段(?:落|文字)?", task):
+            return "paragraph"
+        if any(marker in task for marker in ("摘要", "内容提要", "短文", "短评", "导语", "简介")):
+            return "short_text"
+        if any(marker in task for marker in ("论文", "研究报告", "长文", "专章")):
+            return "paper"
+        return "short_text"
+
     def _resolved_target_length(self) -> int:
         explicit = self.target_length_spin.value()
         if explicit:
             return explicit
         match = re.search(r"(?<!\d)(\d{3,6})\s*(?:字|字符)", self.task_input.toPlainText())
-        return int(match.group(1)) if match else 5000
+        if match:
+            return max(500, int(match.group(1)))
+        return {
+            "paragraph": 500,
+            "short_text": 1500,
+            "paper": 5000,
+        }[self._resolved_document_form()]
 
     def _generation_options(self) -> GenerationOptions:
         target = self._resolved_target_length()
+        document_form = self._resolved_document_form()
         preset = str(self.quality_preset_combo.currentData() or "strict")
         if preset != "custom":
             return GenerationOptions.from_preset(
                 preset,
                 target_length_chars=target,
+                document_form=document_form,
             )
         return GenerationOptions(
             preset="custom",
+            document_form=document_form,
             target_length_chars=target,
             fact_verification=self.fact_verification_checkbox.isChecked(),
             section_polish=self.section_polish_checkbox.isChecked(),
@@ -602,6 +633,8 @@ class WritingTaskPage(QWidget):
     def _set_generation_options(self, raw: object) -> None:
         options = GenerationOptions.model_validate(raw or {})
         self.target_length_spin.setValue(options.target_length_chars)
+        form_index = self.document_form_combo.findData(options.document_form)
+        self.document_form_combo.setCurrentIndex(max(0, form_index))
         index = self.quality_preset_combo.findData(options.preset)
         self.quality_preset_combo.setCurrentIndex(max(0, index))
         if options.preset == "custom":
@@ -1099,12 +1132,21 @@ class WritingTaskPage(QWidget):
         self._set_attempt_start(view)
 
     def _append_stream_text(self, view: QPlainTextEdit, text: str) -> None:
-        view.moveCursor(QTextCursor.MoveOperation.End)
-        view.insertPlainText(text)
-        if view is self.live_output_view:
+        if view is not self.live_output_view:
+            view.moveCursor(QTextCursor.MoveOperation.End)
+            view.insertPlainText(text)
+            view.ensureCursorVisible()
+            return
+
+        scrollbar = view.verticalScrollBar()
+        previous_scroll = scrollbar.value()
+        cursor = QTextCursor(view.document())
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText(text)
+        if self.auto_scroll_checkbox.isChecked():
             self._scroll_live_output_if_enabled()
         else:
-            view.ensureCursorVisible()
+            scrollbar.setValue(min(previous_scroll, scrollbar.maximum()))
 
     def _set_attempt_start(self, view: QPlainTextEdit) -> None:
         position = max(0, view.document().characterCount() - 1)
@@ -1114,6 +1156,11 @@ class WritingTaskPage(QWidget):
             self._live_attempt_start = position
 
     def _discard_stream_attempt(self, view: QPlainTextEdit) -> None:
+        preserve_scroll = (
+            view is self.live_output_view and not self.auto_scroll_checkbox.isChecked()
+        )
+        scrollbar = view.verticalScrollBar()
+        previous_scroll = scrollbar.value()
         start = (
             self._diagnostic_attempt_start
             if view is self.diagnostic_output_view
@@ -1126,7 +1173,14 @@ class WritingTaskPage(QWidget):
             QTextCursor.MoveMode.KeepAnchor,
         )
         cursor.removeSelectedText()
-        view.setTextCursor(cursor)
+        if view is self.live_output_view:
+            if preserve_scroll:
+                scrollbar.setValue(min(previous_scroll, scrollbar.maximum()))
+            else:
+                self._scroll_live_output_if_enabled()
+        else:
+            view.setTextCursor(cursor)
+            view.ensureCursorVisible()
 
     def _activate_live_output_once(self) -> None:
         if self._stream_auto_switched:
@@ -1307,6 +1361,7 @@ class WritingTaskPage(QWidget):
         self.allow_persona_sources.setEnabled(not running)
         self.task_input.setEnabled(not running)
         self.domain_input.setEnabled(not running)
+        self.document_form_combo.setEnabled(not running)
         self.target_length_spin.setEnabled(not running)
         self.quality_preset_combo.setEnabled(not running)
         if not running:

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -104,6 +105,7 @@ def verify_section(
         parsed = VerificationResponse.model_validate(normalized)
         if parsed.section_id != section_draft.section_id:
             raise ValueError("核对结果与当前章节不匹配")
+        _validate_verification_logic(parsed, section_draft)
         return parsed.model_dump(mode="python")
 
     # ── 3. 调用 LLM 进行核对 ────────────────────────────────────────
@@ -158,6 +160,44 @@ def verify_section(
         partial_count=partial_count,
         supported_count=supported_count,
     )
+
+
+def _validate_verification_logic(
+    response: VerificationResponse,
+    section_draft: SectionDraft,
+) -> None:
+    """Reject a failed verdict whose stated numeric mismatch is demonstrably false."""
+
+    claims = {claim.claim_id: claim for claim in section_draft.claims}
+    evidence = {
+        item.source_key: item.verbatim_excerpt for item in section_draft.evidence_pack.items
+    }
+    numeric_mismatch = re.compile(r"(?:数值|数字).{0,12}(?:偏差|不一致|不同|错误|不符)")
+    for decision in response.verified_claims:
+        if decision.verdict == "supported" or not numeric_mismatch.search(
+            decision.verifier_rationale
+        ):
+            continue
+        claim = claims.get(decision.claim_id)
+        if claim is None:
+            continue
+        claim_numbers = _numeric_tokens(claim.text)
+        evidence_numbers = _numeric_tokens(
+            "\n".join(evidence.get(key, "") for key in claim.source_keys)
+        )
+        if claim_numbers and claim_numbers.issubset(evidence_numbers):
+            raise ValueError(
+                f"claim '{decision.claim_id}' 的核验理由声称存在数值偏差，"
+                "但论断数字均能在所引原文中找到"
+            )
+
+
+def _numeric_tokens(text: str) -> set[str]:
+    without_source_keys = re.sub(r"\[S\d+\]", "", text)
+    return {
+        token.replace(",", "")
+        for token in re.findall(r"\d+(?:,\d{3})*(?:\.\d+)?%?", without_source_keys)
+    }
 
 
 def _parse_verified_claims(

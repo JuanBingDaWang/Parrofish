@@ -284,6 +284,42 @@ def test_live_output_popout_shares_document_and_controls(qtbot) -> None:
     popout.close()
 
 
+def test_inline_live_output_respects_disabled_auto_scroll(qtbot) -> None:
+    window = MainWindow(lambda: ChatResult(content="OK", model="test"))
+    qtbot.addWidget(window)
+    window.navigation.setCurrentRow(3)
+    page = window.writing_task_page
+    page.workspace_tabs.setCurrentIndex(page._progress_workspace_index)
+    page.progress_tabs.setCurrentIndex(page._live_output_tab_index)
+    window.show()
+    page._pipeline_streamed("content::测试流", "\n".join(f"第 {i} 行" for i in range(120)))
+    qtbot.waitUntil(
+        lambda: page.live_output_view.verticalScrollBar().maximum() > 0,
+        timeout=2000,
+    )
+    page.auto_scroll_checkbox.setChecked(False)
+    scrollbar = page.live_output_view.verticalScrollBar()
+    scrollbar.setValue(scrollbar.maximum() // 3)
+    preserved = scrollbar.value()
+
+    page._pipeline_streamed("content::测试流", "\n关闭自动滚动后的新内容")
+    QApplication.processEvents()
+
+    assert scrollbar.value() == preserved
+
+    page._pipeline_streamed("content::重试流", "即将被清除的失败片段")
+    scrollbar.setValue(scrollbar.maximum() // 3)
+    preserved = scrollbar.value()
+    page._pipeline_streamed("status::重试流", "本次流式输出中断，正在重试")
+    QApplication.processEvents()
+    assert scrollbar.value() == min(preserved, scrollbar.maximum())
+
+    page.auto_scroll_checkbox.setChecked(True)
+    page._pipeline_streamed("content::测试流", "\n重新跟随末尾")
+    QApplication.processEvents()
+    assert scrollbar.value() == scrollbar.maximum()
+
+
 def test_writing_quality_presets_and_automatic_length_detection(qtbot) -> None:
     window = MainWindow(lambda: ChatResult(content="OK", model="test"))
     qtbot.addWidget(window)
@@ -297,6 +333,7 @@ def test_writing_quality_presets_and_automatic_length_detection(qtbot) -> None:
     options = page._generation_options()
 
     assert options.target_length_chars == 1500
+    assert options.document_form == "short_text"
     assert not options.fact_verification
     assert not options.section_polish
     assert all(not checkbox.isEnabled() for checkbox in page._quality_checkboxes)
@@ -308,6 +345,23 @@ def test_writing_quality_presets_and_automatic_length_detection(qtbot) -> None:
     assert custom.preset == "custom"
     assert custom.fact_verification
     assert not custom.section_polish
+
+    page.document_form_combo.setCurrentIndex(page.document_form_combo.findData("auto"))
+    page.target_length_spin.setValue(0)
+    page.task_input.setPlainText("请写一个段落，说明数字阅读的公共价值")
+    paragraph = page._generation_options()
+    assert paragraph.document_form == "paragraph"
+    assert paragraph.target_length_chars == 500
+
+    page.task_input.setPlainText("生成这项研究的摘要")
+    summary = page._generation_options()
+    assert summary.document_form == "short_text"
+    assert summary.target_length_chars == 1500
+
+    page.document_form_combo.setCurrentIndex(page.document_form_combo.findData("paper"))
+    paper = page._generation_options()
+    assert paper.document_form == "paper"
+    assert paper.target_length_chars == 5000
 
 
 def test_pipeline_state_updates_sections_partial_draft_and_diagnostics(qtbot) -> None:

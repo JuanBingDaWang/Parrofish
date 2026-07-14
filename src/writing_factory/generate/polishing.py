@@ -20,6 +20,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from writing_factory.generate.models import (
+    DocumentForm,
     PolishedDraft,
     PolishedSection,
     ReferenceList,
@@ -56,6 +57,7 @@ def polish_section(
     section_heading: str,
     section_paragraphs: list[str],
     siliconflow: SiliconFlowClient,
+    document_form: DocumentForm = "paper",
     check_drift: bool = True,
     progress: ProgressCallback = _no_progress,
     check_cancelled: CancellationCheck = _no_cancellation,
@@ -93,6 +95,7 @@ def polish_section(
         section_paragraphs=section_paragraphs,
         section_heading=section_heading,
         thesis=thesis,
+        document_form=document_form,
     )
 
     progress(30, "LLM 文风打磨中")

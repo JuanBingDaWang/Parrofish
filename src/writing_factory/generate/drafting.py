@@ -152,6 +152,7 @@ def draft_section(
         revision_feedback=revision_feedback,
         prior_claims=prior_claims,
         target_length_chars=target_length_chars,
+        document_form=context.generation_options.document_form,
     )
 
     progress(50, f"调用 LLM 起草 — {outline_node.heading}")

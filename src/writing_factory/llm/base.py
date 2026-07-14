@@ -27,6 +27,8 @@ from writing_factory.store import ApiCallRecord, Database
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_STREAM_IDLE_TIMEOUT_SECONDS = 120.0
+
 
 class ServiceTransport:
     """Centralize auth, retries, cache, and privacy-preserving call records."""
@@ -53,6 +55,9 @@ class ServiceTransport:
         self.rate_limiter = RateLimiter(minimum_interval_seconds)
         self.concurrency_gate = concurrency_gate
         self.default_request_timeout_seconds = default_request_timeout_seconds
+        self.connect_timeout_seconds = connect_timeout_seconds
+        self.read_timeout_seconds = read_timeout_seconds
+        self.stream_idle_timeout_seconds = DEFAULT_STREAM_IDLE_TIMEOUT_SECONDS
         self._owns_client = http_client is None
         timeout = httpx.Timeout(
             connect=connect_timeout_seconds,
@@ -303,9 +308,19 @@ class ServiceTransport:
         """Collect one server-sent event response through the shared transport boundary."""
 
         self.rate_limiter.wait()
-        timeout_kwargs = (
-            {"timeout": request_timeout_seconds} if request_timeout_seconds is not None else {}
+        timeout_kwargs: dict[str, object] = {}
+        idle_timeout_seconds = min(
+            self.read_timeout_seconds,
+            self.stream_idle_timeout_seconds,
         )
+        if request_timeout_seconds is not None:
+            idle_timeout_seconds = min(request_timeout_seconds, idle_timeout_seconds)
+            timeout_kwargs["timeout"] = httpx.Timeout(
+                connect=min(request_timeout_seconds, self.connect_timeout_seconds),
+                read=idle_timeout_seconds,
+                write=min(request_timeout_seconds, self.read_timeout_seconds),
+                pool=min(request_timeout_seconds, self.connect_timeout_seconds),
+            )
         wall_started = time.monotonic()
         chunks: list[dict[str, Any]] = []
         done_received = False
@@ -357,6 +372,25 @@ class ServiceTransport:
                     except Exception:
                         logger.exception("SiliconFlow stream observer failed")
         except httpx.TimeoutException as exc:
+            if chunks:
+                partial = {
+                    "chunks": chunks,
+                    "stream_diagnostic": {
+                        "chunk_count": len(chunks),
+                        "content_chars": len(self._stream_content(chunks)),
+                        "finish_reason": self._last_stream_finish_reason(chunks),
+                        "idle_timeout_seconds": idle_timeout_seconds,
+                    },
+                }
+                if stream_event_callback is not None:
+                    try:
+                        stream_event_callback({"_stream_event": "incomplete"})
+                    except Exception:
+                        logger.exception("SiliconFlow stream observer failed")
+                raise IncompleteStreamError(
+                    f"{self.provider} event stream became idle",
+                    response=partial,
+                ) from exc
             raise RetryableServiceError(f"{self.provider} request timed out") from exc
         except httpx.TransportError as exc:
             raise RetryableServiceError(f"{self.provider} network error") from exc

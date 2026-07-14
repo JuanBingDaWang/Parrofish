@@ -5,9 +5,10 @@
 
 from __future__ import annotations
 
+import re
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # ---------------------------------------------------------------------------
 # 枚举与字面量类型
@@ -30,6 +31,25 @@ VerificationVerdict = Literal["supported", "partial", "unsupported"]
 CitationStyle = Literal["gb-t-7714", "apa", "mla"]
 QualityPreset = Literal["strict", "balanced", "fast_draft", "custom"]
 GenerationQualityStatus = Literal["verified_final", "unverified_draft"]
+DocumentForm = Literal["paragraph", "short_text", "paper"]
+
+
+def drafting_unit_range(
+    document_form: DocumentForm,
+    target_length_chars: int,
+) -> tuple[int, int]:
+    """Return the permitted number of leaf drafting units for one output form."""
+
+    if document_form == "paragraph":
+        return 1, 1
+    if document_form == "short_text":
+        return (1, 3) if target_length_chars <= 2500 else (2, 4)
+    if target_length_chars <= 2000:
+        return 3, 5
+    if target_length_chars <= 5000:
+        return 4, 8
+    ideal = max(6, min(14, round(target_length_chars / 750)))
+    return max(5, ideal - 2), min(16, ideal + 2)
 
 
 class GenerationOptions(BaseModel):
@@ -38,6 +58,7 @@ class GenerationOptions(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     preset: QualityPreset = Field(default="strict", description="质量预设")
+    document_form: DocumentForm = Field(default="paper", description="文稿形态")
     target_length_chars: int = Field(default=5000, ge=500, le=100000, description="目标中文字数")
     fact_verification: bool = Field(default=True, description="是否执行 LLM 事实语义核验")
     section_polish: bool = Field(default=True, description="是否执行逐节文风打磨")
@@ -53,14 +74,19 @@ class GenerationOptions(BaseModel):
         preset: QualityPreset,
         *,
         target_length_chars: int,
+        document_form: DocumentForm = "paper",
     ) -> GenerationOptions:
         """Build one of the supported user-facing quality profiles."""
 
         if preset == "strict":
-            return cls(target_length_chars=target_length_chars)
+            return cls(
+                target_length_chars=target_length_chars,
+                document_form=document_form,
+            )
         if preset == "balanced":
             return cls(
                 preset=preset,
+                document_form=document_form,
                 target_length_chars=target_length_chars,
                 section_polish=False,
                 section_drift_check=False,
@@ -72,6 +98,7 @@ class GenerationOptions(BaseModel):
         if preset == "fast_draft":
             return cls(
                 preset=preset,
+                document_form=document_form,
                 target_length_chars=target_length_chars,
                 fact_verification=False,
                 section_polish=False,
@@ -81,7 +108,11 @@ class GenerationOptions(BaseModel):
                 global_polish=False,
                 global_drift_check=False,
             )
-        return cls(preset=preset, target_length_chars=target_length_chars)
+        return cls(
+            preset=preset,
+            document_form=document_form,
+            target_length_chars=target_length_chars,
+        )
 
     @property
     def quality_status(self) -> GenerationQualityStatus:
@@ -104,11 +135,11 @@ class GenerationOptions(BaseModel):
 
 
 class ThesisStatement(BaseModel):
-    """Persona 锐化后、经 KB 可行性验证的论文论点。"""
+    """Persona 锐化后、经 KB 可行性验证的中心论旨。"""
 
     model_config = ConfigDict(frozen=True)
 
-    suggested_title: str = Field(default="", description="建议论文标题，使用简体中文")
+    suggested_title: str = Field(default="", description="建议文稿标题，使用简体中文")
     thesis_text: str = Field(description="一句话核心论点，使用简体中文")
     angle: str = Field(description="persona 选择的独特切入角度，使用简体中文")
     kb_support_assessment: str = Field(
@@ -298,11 +329,34 @@ class VerificationDecision(BaseModel):
 
     claim_id: str = Field(description="必须原样返回输入中的事实论断标识")
     verdict: VerificationVerdict = Field(description="supported / partial / unsupported")
-    verifier_rationale: str = Field(description="判定理由，使用简体中文")
+    verifier_rationale: str = Field(
+        min_length=1,
+        max_length=500,
+        description="简短判定理由，使用简体中文",
+    )
     matched_chunk_text: str | None = Field(
         default=None,
         description="用于判定的关键原文短片段；不得返回完整证据包",
     )
+
+    @field_validator("verifier_rationale")
+    @classmethod
+    def reject_repetitive_rationale(cls, value: str) -> str:
+        """Reject looping verifier text before it can enter a checkpoint or cache."""
+
+        compact = re.sub(r"\s+", "", value)
+        if len(compact) < 160:
+            return value
+        span_length = 40
+        seen: set[str] = set()
+        for start in range(len(compact) - span_length + 1):
+            span = compact[start : start + span_length]
+            if span in seen:
+                continue
+            seen.add(span)
+            if compact.count(span) >= 4:
+                raise ValueError("核验理由出现机械重复")
+        return value
 
 
 class VerificationResponse(BaseModel):
@@ -414,7 +468,7 @@ class PolishedDraft(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    title: str = Field(default="", description="论文标题")
+    title: str = Field(default="", description="文稿标题；单个段落可为空")
     sections: list[PolishedSection] = Field(description="逐节打磨后正文")
     reference_list: ReferenceList = Field(description="代码拼装的参考文献列表")
     thesis: ThesisStatement = Field(description="锚定论点")

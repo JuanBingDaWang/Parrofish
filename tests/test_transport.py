@@ -283,6 +283,94 @@ def test_sse_response_is_collected_inside_unified_transport(tmp_path: Path) -> N
     assert dict(call) == {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5}
 
 
+def test_sse_long_total_timeout_keeps_short_idle_read_timeout(tmp_path: Path) -> None:
+    seen_timeout: dict[str, float] = {}
+    body = (
+        'data: {"choices":[{"delta":{"content":"完成"},"finish_reason":"stop"}]}\n\n'
+        "data: [DONE]\n\n"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_timeout.update(request.extensions["timeout"])
+        return httpx.Response(200, text=body)
+
+    transport = ServiceTransport(
+        provider="test",
+        base_url="https://example.invalid/v1",
+        credential=SecretStr("private-token"),
+        database=_database(tmp_path),
+        connect_timeout_seconds=1,
+        read_timeout_seconds=300,
+        max_retries=1,
+        http_client=httpx.Client(
+            base_url="https://example.invalid/v1",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    transport.request_json(
+        "POST",
+        "/stream",
+        operation="stream",
+        payload={"stream": True},
+        request_timeout_seconds=900,
+        request_attempts=1,
+        stream_response=True,
+    )
+
+    assert seen_timeout["read"] == 120
+    assert seen_timeout["connect"] == 1
+
+
+def test_partial_sse_idle_timeout_is_quarantined_and_announced(tmp_path: Path) -> None:
+    class PartialThenTimeout(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+            raise httpx.ReadTimeout("planned idle timeout")
+
+    events: list[dict] = []
+    transport = ServiceTransport(
+        provider="test",
+        base_url="https://example.invalid/v1",
+        credential=SecretStr("private-token"),
+        database=_database(tmp_path),
+        connect_timeout_seconds=1,
+        read_timeout_seconds=300,
+        max_retries=1,
+        http_client=httpx.Client(
+            base_url="https://example.invalid/v1",
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    stream=PartialThenTimeout(),
+                    request=request,
+                )
+            ),
+        ),
+    )
+
+    with pytest.raises(ExternalServiceError, match="became idle"):
+        transport.request_json(
+            "POST",
+            "/stream",
+            operation="stream",
+            payload={"stream": True},
+            request_timeout_seconds=900,
+            request_attempts=1,
+            stream_response=True,
+            stream_event_callback=events.append,
+        )
+
+    assert events[-1] == {"_stream_event": "incomplete"}
+    with transport.database.connection() as connection:
+        quarantined = connection.execute(
+            "SELECT response_json FROM api_cache WHERE cache_key LIKE 'invalid:%'"
+        ).fetchone()
+    diagnostic = json.loads(quarantined["response_json"])["stream_diagnostic"]
+    assert diagnostic["idle_timeout_seconds"] == 120
+    assert diagnostic["content_chars"] == len("partial")
+
+
 def test_sse_response_without_done_marker_is_rejected(tmp_path: Path) -> None:
     body = 'data: {"choices":[{"delta":{"content":"未完成"}}]}\n\n'
     transport = ServiceTransport(

@@ -67,7 +67,7 @@ logger = logging.getLogger(__name__)
 
 _NODE_LABELS: dict[str, str] = {
     "select_topic": "选题中",
-    "build_framework": "构建论文框架",
+    "build_framework": "构建文稿框架",
     "prefetch_evidence": "并发预取并冻结章节证据",
     "draft_section": "起草章节",
     "verify_section": "核对事实",

@@ -1,4 +1,4 @@
-"""选题锐化：persona + KB 检索 → 可论证的论文论点。
+"""论旨锐化：persona + KB 检索 → 可论证的中心论旨。
 
 这是生成流水线（阶段 4）的第一步，产出 ThesisStatement。
 """
@@ -63,7 +63,7 @@ def select_topic(
         check_cancelled: 取消检查回调，被取消时抛出异常
 
     Returns:
-        ThesisStatement: 经 persona 锐化、KB 可行性验证的论文论点
+        ThesisStatement: 经 persona 锐化、KB 可行性验证的中心论旨
 
     Raises:
         ValueError: persona_id 为空或 persona 未就绪

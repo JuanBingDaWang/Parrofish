@@ -248,7 +248,7 @@ class WritingPipeline:
         context = _ctx(state)
         thesis = _thesis(state)
         if thesis is None:
-            raise ValueError("缺少已冻结的论文论点")
+            raise ValueError("缺少已冻结的中心论旨")
 
         try:
             outline = build_framework(
@@ -723,14 +723,15 @@ class WritingPipeline:
                 if stage
                 else nullcontext()
             ):
-                polished = polish_section(
+                    polished = polish_section(
                     verified_draft=verified_draft,
                     persona_spec_json=persona_spec_json,
                     thesis=thesis,
                     section_heading=cur["heading"],
                     section_paragraphs=section_draft.paragraphs,
-                    siliconflow=self.siliconflow,
-                    check_drift=options.section_drift_check,
+                        siliconflow=self.siliconflow,
+                        document_form=context.generation_options.document_form,
+                        check_drift=options.section_drift_check,
                     progress=self.progress,
                     check_cancelled=self.check_cancelled,
                 )
@@ -773,7 +774,7 @@ class WritingPipeline:
 
         thesis = _thesis(state)
         if thesis is None:
-            raise ValueError("缺少已冻结的论文论点")
+            raise ValueError("缺少已冻结的中心论旨")
 
         # 收集所有 polished sections
         polished_sections: list[PolishedSection] = []
@@ -826,8 +827,16 @@ class WritingPipeline:
             raise RuntimeError(f"引用拼装失败: {exc}") from exc
 
         # 组装最终稿
+        if context.generation_options.document_form != "paper":
+            rendered_sections = [
+                section.model_copy(update={"heading": ""}) for section in rendered_sections
+            ]
         final_draft = PolishedDraft(
-            title=(thesis.suggested_title or context.task_description.splitlines()[0][:100]),
+            title=(
+                ""
+                if context.generation_options.document_form == "paragraph"
+                else thesis.suggested_title or context.task_description.splitlines()[0][:100]
+            ),
             sections=rendered_sections,
             reference_list=reference_list,
             thesis=thesis,
@@ -966,7 +975,7 @@ class WritingPipeline:
 
         thesis = _thesis(state)
         if thesis is None:
-            raise ValueError("缺少已冻结的论文论点")
+            raise ValueError("缺少已冻结的中心论旨")
 
         outline = _outline(state)
         if outline is None:
@@ -1014,7 +1023,7 @@ class WritingPipeline:
 
         thesis = _thesis(state)
         if thesis is None:
-            raise ValueError("缺少已冻结的论文论点")
+            raise ValueError("缺少已冻结的中心论旨")
 
         options = _options(state)
         if not options.global_polish:

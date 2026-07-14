@@ -24,6 +24,7 @@ from writing_factory.generate.models import (
     StructureReview,
     TermConsistencyReport,
     ThesisStatement,
+    VerificationDecision,
     VerifiedClaim,
     VerifiedDraft,
 )
@@ -395,6 +396,40 @@ def test_outline_budget_rejects_too_many_body_units_for_short_article() -> None:
         _validate_outline_budget(outline, target_length_chars=1500)
 
 
+def test_paragraph_form_requires_one_leaf_drafting_unit() -> None:
+    thesis = ThesisStatement(
+        thesis_text="核心论点",
+        angle="测试角度",
+        kb_support_assessment="证据充足",
+        persona_id="persona_1",
+    )
+    valid = AnnotatedOutline(
+        thesis=thesis,
+        root_nodes=[OutlineNode(node_id="1", heading="正文", rhetorical_purpose="论证")],
+        kb_id="kb",
+    )
+    excessive = valid.model_copy(
+        update={
+            "root_nodes": [
+                *valid.root_nodes,
+                OutlineNode(node_id="2", heading="多余分节", rhetorical_purpose="总结"),
+            ]
+        }
+    )
+
+    _validate_outline_budget(
+        valid,
+        target_length_chars=500,
+        document_form="paragraph",
+    )
+    with pytest.raises(FrameworkOutputError, match="只允许最多 1 个"):
+        _validate_outline_budget(
+            excessive,
+            target_length_chars=500,
+            document_form="paragraph",
+        )
+
+
 def test_parent_outline_nodes_are_containers_not_duplicate_body_units(monkeypatch) -> None:
     thesis = ThesisStatement(
         thesis_text="核心论点",
@@ -602,6 +637,36 @@ def test_quality_presets_reduce_calls_without_mislabeling_fast_draft(tmp_path: P
     assert json.loads(fast["final_draft_json"])["quality_status"] == "unverified_draft"
     assert len(balanced_client.calls) == 4
     assert json.loads(balanced["final_draft_json"])["quality_status"] == "verified_final"
+
+
+def test_paragraph_form_produces_one_headingless_body_unit(tmp_path: Path) -> None:
+    repository = FakeKnowledgeRepository()
+    client = FakeSiliconFlow()
+
+    result = run_writing_pipeline_with_progress(
+        persona_id="persona_1",
+        task_description="写一个段落，说明数字人文方法的价值",
+        domain="数字人文",
+        context=FakeTaskContext(),
+        siliconflow=client,
+        retriever=FakeRetriever(repository),
+        persona_repository=FakePersonaRepository(),
+        kb_repository=repository,
+        checkpoint_dir=tmp_path,
+        kb_id="kb",
+        task_id="task_paragraph",
+        selected_doc_ids={"doc_task"},
+        generation_options=GenerationOptions(
+            document_form="paragraph",
+            target_length_chars=500,
+        ),
+    )
+
+    final = json.loads(result["final_draft_json"])
+    assert final["title"] == ""
+    assert len(final["sections"]) == 1
+    assert final["sections"][0]["heading"] == ""
+    assert any("单个段落" in message["content"] for message in client.calls[0][0])
 
 
 def test_checkpoint_progress_uses_real_sections() -> None:
@@ -1000,6 +1065,8 @@ def test_verification_contract_is_flat_and_accepts_legacy_nested_response() -> N
     decision_schema = request["response_schema"]["$defs"]["VerificationDecision"]
     assert "claim_id" in decision_schema["properties"]
     assert "claim" not in decision_schema["properties"]
+    assert decision_schema["properties"]["verifier_rationale"]["maxLength"] == 500
+    assert "无具体差异则判 supported" in messages[-1]["content"]
     assert "non_fact_claims" not in messages[-1]["content"]
 
     class LegacyClient:
@@ -1058,6 +1125,69 @@ def test_verification_contract_is_flat_and_accepts_legacy_nested_response() -> N
                 },
             }
         )
+
+
+def test_verification_rejects_looping_rationale() -> None:
+    repeated = "原文与论断中的数字和单位完全一致，不存在可以复核的具体差异。" * 8
+
+    with pytest.raises(ValueError, match="mechanical repetition|机械重复|at most 500"):
+        VerificationDecision(
+            claim_id="c1",
+            verdict="partial",
+            verifier_rationale=repeated,
+        )
+
+
+def test_verification_rejects_false_numeric_mismatch_rationale() -> None:
+    draft = SectionDraft(
+        section_id="3.2",
+        heading="产业结构",
+        paragraphs=["网络游戏收入为3029.64亿元。[S1]"],
+        claims=[
+            Claim(
+                claim_id="c1",
+                text="网络游戏收入为3029.64亿元。[S1]",
+                claim_type="fact",
+                source_keys=["S1"],
+                paragraph_index=0,
+            )
+        ],
+        evidence_pack=EvidencePack(
+            section_id="3.2",
+            items=[
+                EvidenceItem(
+                    source_key="S1",
+                    chunk_id="chunk_1",
+                    doc_id="doc_1",
+                    verbatim_excerpt="报告显示，网络游戏收入为3029.64亿元。",
+                )
+            ],
+        ),
+    )
+
+    class ContradictoryClient:
+        def chat(self, messages, **_kwargs):
+            return ChatResult(
+                content=json.dumps(
+                    {
+                        "section_id": "3.2",
+                        "verified_claims": [
+                            {
+                                "claim_id": "c1",
+                                "verdict": "partial",
+                                "verifier_rationale": (
+                                    "原文数字为3029.64，论断也是3029.64，数值有偏差。"
+                                ),
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                model="fake",
+            )
+
+    with pytest.raises(ValueError, match="声称存在数值偏差"):
+        verify_section(section_draft=draft, siliconflow=ContradictoryClient())
 
 
 def test_partial_verdict_never_routes_to_polish() -> None:

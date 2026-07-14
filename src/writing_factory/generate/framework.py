@@ -14,10 +14,12 @@ from typing import TYPE_CHECKING
 
 from writing_factory.generate.models import (
     AnnotatedOutline,
+    DocumentForm,
     GenerationContext,
     OutlineEvidence,
     OutlineNode,
     ThesisStatement,
+    drafting_unit_range,
 )
 from writing_factory.generate.prompts import framework_messages
 from writing_factory.generate.source_policy import (
@@ -177,12 +179,14 @@ def build_framework(
                 result_validator=lambda candidate: _validate_framework_result(
                     candidate,
                     target_length_chars=context.generation_options.target_length_chars,
+                    document_form=context.generation_options.document_form,
                 ),
             )
             outline = _parse_framework_result(result)
             _validate_outline_budget(
                 outline,
                 target_length_chars=context.generation_options.target_length_chars,
+                document_form=context.generation_options.document_form,
             )
             break
         except FrameworkOutputError as exc:
@@ -230,12 +234,17 @@ def _validate_framework_result(
     result: ChatResult,
     *,
     target_length_chars: int | None = None,
+    document_form: DocumentForm = "paper",
 ) -> None:
     """Validate a chat result before the transport is allowed to cache it."""
 
     outline = _parse_framework_result(result)
     if target_length_chars is not None:
-        _validate_outline_budget(outline, target_length_chars=target_length_chars)
+        _validate_outline_budget(
+            outline,
+            target_length_chars=target_length_chars,
+            document_form=document_form,
+        )
 
 
 def _parse_framework_result(result: ChatResult) -> AnnotatedOutline:
@@ -257,27 +266,21 @@ def _parse_framework_result(result: ChatResult) -> AnnotatedOutline:
         ) from exc
 
 
-def _drafting_unit_range(target_length_chars: int) -> tuple[int, int]:
-    if target_length_chars <= 2000:
-        return 3, 5
-    if target_length_chars <= 5000:
-        return 4, 8
-    ideal = max(6, min(14, round(target_length_chars / 750)))
-    return max(5, ideal - 2), min(16, ideal + 2)
-
-
 def _validate_outline_budget(
     outline: AnnotatedOutline,
     *,
     target_length_chars: int,
+    document_form: DocumentForm = "paper",
 ) -> None:
     leaves = _draftable_nodes(outline.root_nodes)
-    minimum, maximum = _drafting_unit_range(target_length_chars)
+    minimum, maximum = drafting_unit_range(document_form, target_length_chars)
     if not leaves:
         raise FrameworkOutputError("提纲没有可起草的叶子正文单元")
     if len(leaves) > maximum:
+        recommended = str(minimum) if minimum == maximum else f"{minimum}-{maximum}"
         raise FrameworkOutputError(
-            f"目标篇幅约 {target_length_chars} 字，建议安排 {minimum}-{maximum} 个正文单元，"
+            f"目标篇幅约 {target_length_chars} 字，建议安排 {recommended} 个正文单元，"
+            f"只允许最多 {maximum} 个；"
             f"当前提纲有 {len(leaves)} 个叶子正文单元"
         )
 

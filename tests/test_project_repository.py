@@ -19,7 +19,11 @@ def test_project_task_and_edited_draft_round_trip(tmp_path: Path) -> None:
         domain="出版学",
         citation_style="gb-t-7714",
         selected_doc_ids={"doc1", "doc2"},
-        generation_options={"preset": "balanced", "target_length_chars": 1500},
+        generation_options={
+            "preset": "balanced",
+            "document_form": "short_text",
+            "target_length_chars": 1500,
+        },
     )
     repository.update_task_state(task_id, {"status": "done", "task_id": task_id})
     repository.save_edited_draft(task_id, "人工编辑后的稿件")
@@ -30,6 +34,7 @@ def test_project_task_and_edited_draft_round_trip(tmp_path: Path) -> None:
     assert task["selected_doc_ids"] == {"doc1", "doc2"}
     assert task["generation_options"] == {
         "preset": "balanced",
+        "document_form": "short_text",
         "target_length_chars": 1500,
     }
     assert task["state"]["status"] == "done"
