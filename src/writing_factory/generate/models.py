@@ -167,8 +167,8 @@ class Claim(BaseModel):
         return self
 
 
-class SectionDraft(BaseModel):
-    """起草产出的单节结构化草稿。"""
+class SectionDraftOutput(BaseModel):
+    """模型负责生成的章节内容，不包含由代码冻结的证据包。"""
 
     model_config = ConfigDict(frozen=True)
 
@@ -176,26 +176,17 @@ class SectionDraft(BaseModel):
     heading: str = Field(description="本节标题")
     paragraphs: list[str] = Field(description="按序排列的段落正文")
     claims: list[Claim] = Field(description="本节所有论断，带类型与 source_key")
-    evidence_pack: EvidencePack = Field(description="本节使用的证据包")
 
     @model_validator(mode="after")
-    def validate_claim_traceability(self) -> SectionDraft:
-        """Ensure every factual claim resolves inside this immutable evidence pack."""
+    def validate_claim_locations(self) -> SectionDraftOutput:
+        """Validate model-owned claim ids, paragraph indexes, and inline markers."""
 
-        if self.section_id != self.evidence_pack.section_id:
-            raise ValueError("SectionDraft 与 EvidencePack 的 section_id 不一致")
         claim_ids = [claim.claim_id for claim in self.claims]
         if len(claim_ids) != len(set(claim_ids)):
-            raise ValueError("SectionDraft 中的 claim_id 必须唯一")
-        valid_keys = {item.source_key for item in self.evidence_pack.items}
+            raise ValueError("SectionDraftOutput 中的 claim_id 必须唯一")
         for claim in self.claims:
             if claim.paragraph_index >= len(self.paragraphs):
                 raise ValueError(f"claim '{claim.claim_id}' 的 paragraph_index 越界")
-            unknown = set(claim.source_keys) - valid_keys
-            if unknown:
-                raise ValueError(
-                    f"claim '{claim.claim_id}' 引用了本节证据包之外的 source_key: {sorted(unknown)}"
-                )
             if claim.claim_type == "fact":
                 paragraph = self.paragraphs[claim.paragraph_index]
                 missing_markers = [key for key in claim.source_keys if f"[{key}]" not in paragraph]
@@ -206,9 +197,53 @@ class SectionDraft(BaseModel):
         return self
 
 
+class SectionDraft(SectionDraftOutput):
+    """代码附回冻结 EvidencePack 后的完整单节结构化草稿。"""
+
+    evidence_pack: EvidencePack = Field(description="本节使用的证据包")
+
+    @model_validator(mode="after")
+    def validate_claim_traceability(self) -> SectionDraft:
+        """Ensure every factual claim resolves inside this immutable evidence pack."""
+
+        if self.section_id != self.evidence_pack.section_id:
+            raise ValueError("SectionDraft 与 EvidencePack 的 section_id 不一致")
+        valid_keys = {item.source_key for item in self.evidence_pack.items}
+        for claim in self.claims:
+            unknown = set(claim.source_keys) - valid_keys
+            if unknown:
+                raise ValueError(
+                    f"claim '{claim.claim_id}' 引用了本节证据包之外的 source_key: {sorted(unknown)}"
+                )
+        return self
+
+
 # ---------------------------------------------------------------------------
 # 4c — 核对
 # ---------------------------------------------------------------------------
+
+
+class VerificationDecision(BaseModel):
+    """中性核对模型对一条事实论断返回的最小判定。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    claim_id: str = Field(description="必须原样返回输入中的事实论断标识")
+    verdict: VerificationVerdict = Field(description="supported / partial / unsupported")
+    verifier_rationale: str = Field(description="判定理由，使用简体中文")
+    matched_chunk_text: str | None = Field(
+        default=None,
+        description="用于判定的关键原文短片段；不得返回完整证据包",
+    )
+
+
+class VerificationResponse(BaseModel):
+    """核对模型的最小输出；原 Claim 与计数由代码附回。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    section_id: str = Field(description="对应的章节标识")
+    verified_claims: list[VerificationDecision] = Field(description="仅包含事实论断的逐条判定")
 
 
 class VerifiedClaim(BaseModel):

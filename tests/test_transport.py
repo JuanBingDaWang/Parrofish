@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import httpx
@@ -304,6 +305,142 @@ def test_sse_response_without_done_marker_is_rejected(tmp_path: Path) -> None:
             "/stream",
             operation="stream",
             payload={"stream": True},
+            stream_response=True,
+        )
+
+    with transport.database.connection() as connection:
+        quarantined = connection.execute(
+            "SELECT operation FROM api_cache WHERE cache_key LIKE 'invalid:%'"
+        ).fetchall()
+    assert [row["operation"] for row in quarantined] == ["stream:invalid"]
+
+
+def test_invalid_completed_stream_is_quarantined_and_retried(tmp_path: Path) -> None:
+    requests = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        content = '{"bad":true}' if requests == 1 else '{"ok":true}'
+        event = json.dumps(
+            {
+                "choices": [
+                    {
+                        "delta": {"content": content},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        )
+        return httpx.Response(200, text=f"data: {event}\n\ndata: [DONE]\n\n")
+
+    events: list[dict] = []
+    transport = ServiceTransport(
+        provider="test",
+        base_url="https://example.invalid/v1",
+        credential=SecretStr("private-token"),
+        database=_database(tmp_path),
+        connect_timeout_seconds=1,
+        read_timeout_seconds=1,
+        max_retries=2,
+        http_client=httpx.Client(
+            base_url="https://example.invalid/v1",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+
+    def validate(response: dict) -> None:
+        content = response["chunks"][0]["choices"][0]["delta"]["content"]
+        if json.loads(content).get("bad"):
+            raise ValueError("planned schema rejection")
+
+    result = transport.request_json(
+        "POST",
+        "/stream",
+        operation="stream",
+        payload={"stream": True, "response_format": {"type": "json_object"}},
+        stream_response=True,
+        stream_event_callback=events.append,
+        response_validator=validate,
+    )
+
+    assert requests == 2
+    assert json.loads(result["chunks"][0]["choices"][0]["delta"]["content"]) == {
+        "ok": True
+    }
+    assert {"_stream_event": "incomplete"} in events
+    with transport.database.connection() as connection:
+        quarantined = connection.execute(
+            "SELECT operation, response_json FROM api_cache WHERE cache_key LIKE 'invalid:%'"
+        ).fetchall()
+    assert [row["operation"] for row in quarantined] == ["stream:invalid"]
+    diagnostic = json.loads(quarantined[0]["response_json"])["stream_diagnostic"]
+    assert diagnostic == {
+        "chunk_count": 1,
+        "content_chars": 12,
+        "finish_reason": "stop",
+        "validation": "failed",
+    }
+
+
+def test_sse_clean_eof_with_stop_and_complete_json_is_accepted(tmp_path: Path) -> None:
+    body = (
+        'data: {"choices":[{"delta":{"content":"{\\"ok\\":true}"},'
+        '"finish_reason":"stop"}]}\n\n'
+    )
+    events: list[dict] = []
+    transport = ServiceTransport(
+        provider="test",
+        base_url="https://example.invalid/v1",
+        credential=SecretStr("private-token"),
+        database=_database(tmp_path),
+        connect_timeout_seconds=1,
+        read_timeout_seconds=1,
+        max_retries=1,
+        http_client=httpx.Client(
+            base_url="https://example.invalid/v1",
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, text=body)),
+        ),
+    )
+
+    result = transport.request_json(
+        "POST",
+        "/stream",
+        operation="stream",
+        payload={"stream": True, "response_format": {"type": "json_object"}},
+        stream_response=True,
+        stream_event_callback=events.append,
+    )
+
+    assert result["clean_eof_without_done"] is True
+    assert events[-1] == {"_stream_event": "clean_eof"}
+
+
+def test_sse_clean_eof_rejects_unclosed_json(tmp_path: Path) -> None:
+    body = (
+        'data: {"choices":[{"delta":{"content":"{\\"ok\\":"},'
+        '"finish_reason":"stop"}]}\n\n'
+    )
+    transport = ServiceTransport(
+        provider="test",
+        base_url="https://example.invalid/v1",
+        credential=SecretStr("private-token"),
+        database=_database(tmp_path),
+        connect_timeout_seconds=1,
+        read_timeout_seconds=1,
+        max_retries=1,
+        http_client=httpx.Client(
+            base_url="https://example.invalid/v1",
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, text=body)),
+        ),
+    )
+
+    with pytest.raises(ExternalServiceError, match=r"before \[DONE\]"):
+        transport.request_json(
+            "POST",
+            "/stream",
+            operation="stream",
+            payload={"stream": True, "response_format": {"type": "json_object"}},
             stream_response=True,
         )
 

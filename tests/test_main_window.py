@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from PyQt6.QtCore import QItemSelectionModel, Qt
-from PyQt6.QtWidgets import QScrollArea
+from PyQt6.QtWidgets import QApplication, QScrollArea
 
 from tests.test_distill_pipeline import _persona
 from writing_factory.distill.serialization import render_persona_markdown
@@ -115,6 +115,12 @@ def test_writing_page_previews_isolated_target_sources_and_uses_scroll_regions(q
         and page.progress_scroll.verticalScrollBar().maximum() > 0,
         timeout=2000,
     )
+    page._pipeline_streamed("content", "实时内容")
+    qtbot.waitUntil(
+        lambda: page.progress_scroll.verticalScrollBar().value()
+        == page.progress_scroll.verticalScrollBar().maximum(),
+        timeout=2000,
+    )
 
     page.document_list.item(2).setCheckState(Qt.CheckState.Unchecked)
     assert page.source_summary_label.text() == "已选 2 篇 · 隔离 2 篇 · 实际可用 0 篇"
@@ -192,14 +198,43 @@ def test_writing_page_shows_elapsed_time_and_public_stream_only(qtbot) -> None:
     assert "模型最近活动" in page.activity_label.text()
 
     page._pipeline_streamed("content", '{"title":"')
+    assert page.progress_tabs.currentIndex() == page._live_output_tab_index
+    page.progress_tabs.setCurrentIndex(0)
     page._pipeline_streamed("content::全文结构审查", "结构清晰")
+    assert page.progress_tabs.currentIndex() == 0
+    page._pipeline_streamed("status::全文结构审查", "本次流式输出中断，正在重试")
     content = page.live_output_view.toPlainText()
     assert "正在准备流水线" in content
     assert "全文结构审查" in content
     assert "结构清晰" in content
+    assert "本次流式输出中断" in content
     page._update_elapsed_display()
     assert "本次运行 01:05" in page.elapsed_label.text()
     page._stop_run_clock()
+
+
+def test_live_output_popout_shares_document_and_controls(qtbot) -> None:
+    window = MainWindow(lambda: ChatResult(content="OK", model="test"))
+    qtbot.addWidget(window)
+    page = window.writing_task_page
+    page.live_output_view.setPlainText("第一段输出")
+
+    page._show_live_output_window()
+    popout = page._live_output_window
+    assert popout is not None
+    assert popout.isVisible()
+    assert popout.output_view.document() is page.live_output_view.document()
+    assert popout.output_view.toPlainText() == "第一段输出"
+
+    page.live_output_view.insertPlainText("\n第二段输出")
+    assert "第二段输出" in popout.output_view.toPlainText()
+    popout.auto_scroll_checkbox.setChecked(False)
+    assert not page.auto_scroll_checkbox.isChecked()
+    page.auto_scroll_checkbox.setChecked(True)
+    assert popout.auto_scroll_checkbox.isChecked()
+    page._copy_live_output()
+    assert QApplication.clipboard().text() == page.live_output_view.toPlainText()
+    popout.close()
 
 
 def test_settings_page_persists_retrieval_enhancement_switches(qtbot) -> None:

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from writing_factory.llm import MinerUClient, SiliconFlowClient
+from writing_factory.llm.common import RetryableServiceError
 from writing_factory.store import Database
 
 
@@ -133,6 +134,60 @@ def test_siliconflow_assembles_streamed_chat(settings) -> None:
     assert result.finish_reason == "stop"
     assert result.usage.total_tokens == 5
     assert observed == [("reasoning", "activity"), ("content", "完成")]
+    client.close()
+
+
+def test_siliconflow_falls_back_to_non_streaming_inside_one_timeout(settings) -> None:
+    database = Database(settings.database_path)
+    database.initialize()
+    client = SiliconFlowClient(settings, database)
+    client.transport.close()
+
+    class FallbackTransport(FakeTransport):
+        max_retries = 3
+        default_request_timeout_seconds = 900.0
+
+        def request_json(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+            self.calls.append((method, path, kwargs))
+            if kwargs["stream_response"]:
+                raise RetryableServiceError("planned stream network failure")
+            response = {
+                "model": "fallback-model",
+                "choices": [
+                    {
+                        "message": {"content": '{"ok": true}', "reasoning_content": None},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"total_tokens": 3},
+            }
+            validator = kwargs.get("response_validator")
+            if validator is not None:
+                validator(response)
+            return response
+
+    transport = FallbackTransport()
+    client.transport = transport
+    observed: list[tuple[str, str]] = []
+
+    with client.observe_stream(lambda kind, text: observed.append((kind, text))):
+        result = client.chat(
+            [{"role": "user", "content": "test"}],
+            thinking=False,
+            response_format="json_object",
+            stream=True,
+        )
+
+    assert result.content == '{"ok": true}'
+    assert len(transport.calls) == 2
+    assert transport.calls[0][2]["request_attempts"] == 2
+    assert transport.calls[0][2]["stream_response"] is True
+    assert transport.calls[1][2]["request_attempts"] == 1
+    assert transport.calls[1][2]["stream_response"] is False
+    assert transport.calls[1][2]["payload"]["stream"] is False
+    assert transport.calls[1][2]["request_total_timeout_seconds"] <= 900.0
+    assert ("status", "流式重试仍未完成，最后一次改用非流式请求") in observed
+    assert observed[-1] == ("content", '{"ok": true}')
     client.close()
 
 

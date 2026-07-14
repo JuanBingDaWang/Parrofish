@@ -17,6 +17,14 @@ class RetryableServiceError(ExternalServiceError):
     """A transient error eligible for bounded retry."""
 
 
+class IncompleteStreamError(RetryableServiceError):
+    """An SSE response ended without a trustworthy terminal state."""
+
+    def __init__(self, message: str, *, response: dict | None = None) -> None:
+        super().__init__(message)
+        self.response = response
+
+
 class RateLimiter:
     """Serialize request starts when a minimum interval is configured."""
 

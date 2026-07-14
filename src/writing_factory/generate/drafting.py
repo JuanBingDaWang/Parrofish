@@ -16,6 +16,7 @@ from writing_factory.generate.models import (
     GenerationContext,
     OutlineNode,
     SectionDraft,
+    SectionDraftOutput,
     ThesisStatement,
 )
 from writing_factory.generate.prompts import drafting_messages
@@ -153,6 +154,13 @@ def draft_section(
     progress(50, f"调用 LLM 起草 — {outline_node.heading}")
     check_cancelled()
 
+    def assemble_draft(content: str) -> SectionDraft:
+        generated = SectionDraftOutput.model_validate_json(content)
+        return SectionDraft(
+            **generated.model_dump(mode="python"),
+            evidence_pack=evidence_pack,
+        )
+
     result = siliconflow.chat(
         messages,
         thinking=False,
@@ -162,6 +170,7 @@ def draft_section(
         seed=42,
         use_cache=not revision_feedback,
         stream=True,
+        result_validator=lambda candidate: assemble_draft(candidate.content),
     )
 
     progress(85, f"解析草稿 — {outline_node.heading}")
@@ -169,9 +178,13 @@ def draft_section(
 
     # ── 5. 解析为 SectionDraft ───────────────────────────────────────
     try:
-        section_draft = SectionDraft.model_validate_json(result.content)
+        section_draft = assemble_draft(result.content)
     except Exception as exc:
-        logger.error("草稿解析失败，原始响应: %s", result.content[:500])
+        logger.error(
+            "草稿解析失败: response_chars=%d error_type=%s",
+            len(result.content),
+            type(exc).__name__,
+        )
         raise ValueError(f"LLM 返回的草稿无法解析为 SectionDraft: {exc}") from exc
 
     progress(100, f"草稿完成 — {outline_node.heading}")

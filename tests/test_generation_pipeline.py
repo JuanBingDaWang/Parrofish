@@ -24,6 +24,8 @@ from writing_factory.generate.models import (
     ThesisStatement,
     VerifiedDraft,
 )
+from writing_factory.generate.prompts import drafting_messages, verification_messages
+from writing_factory.generate.verification import verify_section
 from writing_factory.kb.models import Bibliography, FusedHit, RetrievalResult
 from writing_factory.llm.models import ChatResult
 from writing_factory.orchestration.errors import PipelineNodeError
@@ -156,17 +158,15 @@ class FakeSiliconFlow:
                     "items": [
                         {
                             "source_key": "S1",
-                            "chunk_id": "chunk_1",
-                            "doc_id": "doc_task",
-                            "verbatim_excerpt": "数字人文方法能够扩展传统文献研究的证据处理能力。",
-                            "page_start": 3,
-                            "page_end": 3,
-                            "section_heading": "研究方法",
+                            "chunk_id": "forged_chunk",
+                            "doc_id": "forged_doc",
+                            "verbatim_excerpt": "模型擅自回传的证据不得进入冻结证据包。",
                         }
                     ],
                 },
             },
             {
+                "section_id": "1",
                 "verified_claims": [
                     {
                         "claim_id": "1_c1",
@@ -232,6 +232,9 @@ def test_full_writing_graph_runs_offline(tmp_path: Path) -> None:
     assert outline["root_nodes"][0]["candidate_source_keys"] == ["S1"]
     frozen_pack = EvidencePack.model_validate_json(result["sections"][0]["evidence_pack_json"])
     assert frozen_pack.section_id == "1"
+    assert frozen_pack.items[0].chunk_id == "chunk_1"
+    assert frozen_pack.items[0].doc_id == "doc_task"
+    assert "模型擅自回传" not in frozen_pack.items[0].verbatim_excerpt
     assert result["sections"][0]["source_key_offset"] == 1
     assert len(retriever.requests) == 4
     assert all(request.filters.doc_ids == {"doc_task"} for request in retriever.requests)
@@ -547,6 +550,115 @@ def test_fact_claim_requires_source_and_inline_marker() -> None:
             claim_type="fact",
             paragraph_index=0,
         )
+
+
+def test_drafting_response_schema_excludes_frozen_evidence_pack() -> None:
+    thesis = ThesisStatement(
+        thesis_text="核心论点",
+        angle="测试角度",
+        kb_support_assessment="证据充足",
+        persona_id="persona_1",
+    )
+    node = OutlineNode(node_id="1", heading="第一节", rhetorical_purpose="提出问题")
+    evidence = EvidencePack(
+        section_id="1",
+        items=[
+            EvidenceItem(
+                source_key="S1",
+                chunk_id="chunk_1",
+                doc_id="doc_1",
+                verbatim_excerpt="冻结证据原文",
+            )
+        ],
+    )
+
+    messages = drafting_messages(
+        persona_spec_json={"name": "测试作者"},
+        thesis=thesis,
+        outline_node=node,
+        evidence_pack=evidence,
+        term_registry={},
+    )
+    request_text = messages[-1]["content"].split("任务要求_JSON\n", 1)[1].split(
+        "\n来源数据_JSON_开始",
+        1,
+    )[0]
+    request = json.loads(request_text)
+
+    assert "evidence_pack" not in request["response_schema"]["properties"]
+    assert "冻结证据原文" in messages[-1]["content"]
+
+
+def test_verification_contract_is_flat_and_accepts_legacy_nested_response() -> None:
+    draft = SectionDraft(
+        section_id="1",
+        heading="第一节",
+        paragraphs=["事实陈述。[S1]", "作者解释。"],
+        claims=[
+            Claim(
+                claim_id="fact_1",
+                text="事实陈述。",
+                claim_type="fact",
+                source_keys=["S1"],
+                paragraph_index=0,
+            ),
+            Claim(
+                claim_id="interpretation_1",
+                text="作者解释。",
+                claim_type="interpretation",
+                paragraph_index=1,
+            ),
+        ],
+        evidence_pack=EvidencePack(
+            section_id="1",
+            items=[
+                EvidenceItem(
+                    source_key="S1",
+                    chunk_id="chunk_1",
+                    doc_id="doc_1",
+                    verbatim_excerpt="事实陈述。",
+                )
+            ],
+        ),
+    )
+    messages = verification_messages(section_draft=draft)
+    request_text = messages[-1]["content"].split("任务要求_JSON\n", 1)[1].split(
+        "\n来源数据_JSON_开始",
+        1,
+    )[0]
+    request = json.loads(request_text)
+    decision_schema = request["response_schema"]["$defs"]["VerificationDecision"]
+    assert "claim_id" in decision_schema["properties"]
+    assert "claim" not in decision_schema["properties"]
+    assert "non_fact_claims" not in messages[-1]["content"]
+
+    class LegacyClient:
+        def chat(self, messages, **_kwargs):
+            return ChatResult(
+                content=json.dumps(
+                    {
+                        "section_id": "1",
+                        "verified_claims": [
+                            {
+                                "claim": draft.claims[0].model_dump(),
+                                "verdict": "supported",
+                                "verifier_rationale": "原文直接支持。",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                model="fake",
+            )
+
+    verified = verify_section(section_draft=draft, siliconflow=LegacyClient())
+
+    assert verified.unsupported_count == 0
+    assert verified.supported_count == 2
+    assert {item.claim.claim_id for item in verified.verified_claims} == {
+        "fact_1",
+        "interpretation_1",
+    }
 
     with pytest.raises(ValueError, match="缺少引用标记"):
         SectionDraft.model_validate(

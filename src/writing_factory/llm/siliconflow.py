@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -10,7 +11,11 @@ from typing import Any, Literal
 
 from writing_factory.config import Settings
 from writing_factory.llm.base import ExternalServiceError, ServiceTransport
-from writing_factory.llm.common import DynamicConcurrencyGate
+from writing_factory.llm.common import (
+    DynamicConcurrencyGate,
+    IncompleteStreamError,
+    RetryableServiceError,
+)
 from writing_factory.llm.models import (
     ChatResult,
     EmbeddingResult,
@@ -132,8 +137,16 @@ class SiliconFlowClient:
             payload["seed"] = seed
 
         def validate_response(response: dict[str, Any]) -> None:
+            parsed = self._chat_result(response, streamed=stream)
+            if response_format == "json_object":
+                try:
+                    decoded = json.loads(parsed.content)
+                except ValueError as exc:
+                    raise ValueError("SiliconFlow 返回的 JSON 对象不完整") from exc
+                if not isinstance(decoded, dict):
+                    raise ValueError("SiliconFlow 返回的 JSON 顶层必须是对象")
             if result_validator is not None:
-                result_validator(self._chat_result(response, streamed=stream))
+                result_validator(parsed)
 
         observer = _STREAM_OBSERVER.get() if stream else None
         pending_content: list[str] = []
@@ -145,10 +158,15 @@ class SiliconFlowClient:
             if observer is None:
                 return
             now = time.monotonic()
-            if chunk.get("_stream_event") == "done":
+            stream_event = chunk.get("_stream_event")
+            if stream_event in {"done", "clean_eof", "incomplete"}:
                 if pending_content:
                     observer("content", "".join(pending_content))
                     pending_content.clear()
+                if stream_event == "clean_eof":
+                    observer("status", "服务端未发送 [DONE]，完整性校验通过，已接收本次输出")
+                elif stream_event == "incomplete":
+                    observer("status", "本次流式输出中断，正在重试")
                 return
             choices = chunk.get("choices") or []
             if not choices:
@@ -174,28 +192,96 @@ class SiliconFlowClient:
                 pending_content.clear()
                 last_content_publish = now
 
-        response = self.transport.request_json(
-            "POST",
-            "/chat/completions",
-            operation="chat",
-            payload=payload,
-            model=self.settings.chat_model,
-            reasoning_effort=reasoning_effort if thinking else "disabled",
-            prompt_summary={
-                "message_count": len(messages),
-                "character_count": sum(len(item.get("content", "")) for item in messages),
-                "thinking": thinking,
-            },
-            use_cache=use_cache,
-            request_timeout_seconds=request_timeout_seconds,
-            request_total_timeout_seconds=request_total_timeout_seconds,
-            request_attempts=request_attempts,
-            stream_response=stream,
-            priority=priority,
-            response_validator=validate_response if result_validator is not None else None,
-            stream_event_callback=publish_stream_event if observer is not None else None,
+        prompt_summary = {
+            "message_count": len(messages),
+            "character_count": sum(len(item.get("content", "")) for item in messages),
+            "thinking": thinking,
+        }
+        total_timeout = (
+            request_total_timeout_seconds
+            if request_total_timeout_seconds is not None
+            else getattr(
+                self.transport,
+                "default_request_timeout_seconds",
+                self.settings.siliconflow_request_timeout_seconds,
+            )
         )
-        result = self._chat_result(response, streamed=stream)
+        deadline = time.monotonic() + total_timeout if total_timeout is not None else None
+        attempt_limit = max(
+            1,
+            request_attempts
+            if request_attempts is not None
+            else getattr(self.transport, "max_retries", self.settings.max_retries),
+        )
+        fallback_enabled = stream and attempt_limit >= 2
+        stream_attempts = attempt_limit - 1 if fallback_enabled else attempt_limit
+
+        def remaining_timeout() -> float | None:
+            if deadline is None:
+                return None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise IncompleteStreamError("siliconflow request exceeded total timeout")
+            return remaining
+
+        response_is_streamed = stream
+        try:
+            response = self.transport.request_json(
+                "POST",
+                "/chat/completions",
+                operation="chat",
+                payload=payload,
+                model=self.settings.chat_model,
+                reasoning_effort=reasoning_effort if thinking else "disabled",
+                prompt_summary=prompt_summary,
+                use_cache=use_cache,
+                request_timeout_seconds=request_timeout_seconds,
+                request_total_timeout_seconds=(
+                    remaining_timeout() if fallback_enabled else request_total_timeout_seconds
+                ),
+                request_attempts=stream_attempts,
+                stream_response=stream,
+                priority=priority,
+                response_validator=(
+                    validate_response
+                    if response_format == "json_object" or result_validator is not None
+                    else None
+                ),
+                stream_event_callback=publish_stream_event if observer is not None else None,
+            )
+        except RetryableServiceError:
+            if not fallback_enabled:
+                raise
+            if observer is not None:
+                observer("status", "流式重试仍未完成，最后一次改用非流式请求")
+            fallback_payload = dict(payload)
+            fallback_payload["stream"] = False
+            fallback_payload.pop("stream_options", None)
+            response = self.transport.request_json(
+                "POST",
+                "/chat/completions",
+                operation="chat",
+                payload=fallback_payload,
+                model=self.settings.chat_model,
+                reasoning_effort=reasoning_effort if thinking else "disabled",
+                prompt_summary={**prompt_summary, "stream_fallback": True},
+                use_cache=use_cache,
+                request_timeout_seconds=request_timeout_seconds,
+                request_total_timeout_seconds=remaining_timeout(),
+                request_attempts=1,
+                stream_response=False,
+                priority=priority,
+                response_validator=(
+                    validate_response
+                    if response_format == "json_object" or result_validator is not None
+                    else None
+                ),
+            )
+            response_is_streamed = False
+
+        result = self._chat_result(response, streamed=response_is_streamed)
+        if observer is not None and stream and not response_is_streamed and result.content:
+            observer("content", result.content)
         if result_validator is not None:
             result_validator(result)
         return result
@@ -203,7 +289,7 @@ class SiliconFlowClient:
     def _chat_result(self, response: dict[str, Any], *, streamed: bool) -> ChatResult:
         """Parse one raw provider response into the stable chat contract."""
 
-        if streamed:
+        if streamed and "chunks" in response:
             return self._streamed_chat_result(response)
         try:
             choice = response["choices"][0]

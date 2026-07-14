@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 from writing_factory.generate.models import (
     Claim,
     SectionDraft,
+    VerificationResponse,
     VerifiedClaim,
     VerifiedDraft,
 )
@@ -98,6 +99,13 @@ def verify_section(
 
     messages = verification_messages(section_draft=section_draft)
 
+    def parse_response(content: str) -> dict:
+        normalized = _normalize_verification_response(json.loads(content))
+        parsed = VerificationResponse.model_validate(normalized)
+        if parsed.section_id != section_draft.section_id:
+            raise ValueError("核对结果与当前章节不匹配")
+        return parsed.model_dump(mode="python")
+
     # ── 3. 调用 LLM 进行核对 ────────────────────────────────────────
     progress(50, "LLM 逐 claim 核对中")
     check_cancelled()
@@ -110,6 +118,7 @@ def verify_section(
         response_format="json_object",
         seed=42,
         stream=True,
+        result_validator=lambda candidate: parse_response(candidate.content),
     )
 
     progress(80, "解析核对结果")
@@ -117,10 +126,14 @@ def verify_section(
 
     # ── 4. 解析 LLM 输出 ────────────────────────────────────────────
     try:
-        data = json.loads(result.content)
-    except json.JSONDecodeError as e:
-        logger.error("核对结果 JSON 解析失败: %s，原始输出前 500 字符: %s", e, result.content[:500])
-        raise ValueError(f"核对结果 JSON 解析失败: {e}") from e
+        data = parse_response(result.content)
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.error(
+            "核对结果无法解析，响应长度=%d，错误类型=%s",
+            len(result.content),
+            type(exc).__name__,
+        )
+        raise ValueError(f"核对结果无法解析: {exc}") from exc
 
     # ── 5. 构造 VerifiedDraft ────────────────────────────────────────
     verified_claims: list[VerifiedClaim] = _parse_verified_claims(
@@ -225,3 +238,19 @@ def _parse_verified_claims(
                 )
 
     return result
+
+
+def _normalize_verification_response(data: dict) -> dict:
+    """Accept old cached nested decisions while emitting the new flat contract."""
+
+    normalized: list[dict] = []
+    for raw in data.get("verified_claims", []):
+        item = dict(raw)
+        nested_claim = item.pop("claim", None)
+        if not item.get("claim_id") and isinstance(nested_claim, dict):
+            item["claim_id"] = nested_claim.get("claim_id", "")
+        normalized.append(item)
+    return {
+        "section_id": data.get("section_id", ""),
+        "verified_claims": normalized,
+    }

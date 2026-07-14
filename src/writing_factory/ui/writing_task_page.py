@@ -10,8 +10,10 @@ from collections.abc import Callable
 from typing import Any
 
 from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QIcon, QTextCursor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QFormLayout,
@@ -32,6 +34,7 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem,
     QTabWidget,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -49,6 +52,7 @@ from writing_factory.orchestration.state import (
     PIPELINE_STATUS_TOPIC,
     PIPELINE_STATUS_VERIFYING,
 )
+from writing_factory.ui.live_output_window import LiveOutputWindow
 from writing_factory.ui.time_format import format_china_datetime
 from writing_factory.ui.workers import BackgroundTaskManager, TaskContext
 
@@ -149,6 +153,8 @@ class WritingTaskPage(QWidget):
         self._last_stream_at: float | None = None
         self._current_step = ""
         self._stream_stage = ""
+        self._stream_auto_switched = False
+        self._live_output_window: LiveOutputWindow | None = None
         self._elapsed_timer = QTimer(self)
         self._elapsed_timer.setInterval(1000)
         self._elapsed_timer.timeout.connect(self._update_elapsed_display)
@@ -347,16 +353,52 @@ class WritingTaskPage(QWidget):
         sh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         sh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         sh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        progress_layout.addWidget(self.section_table)
+
+        section_tab = QWidget()
+        section_layout = QVBoxLayout(section_tab)
+        section_layout.setContentsMargins(0, 6, 0, 0)
+        section_layout.addWidget(self.section_table)
 
         self.live_output_view = QPlainTextEdit()
         self.live_output_view.setReadOnly(True)
         self.live_output_view.setPlaceholderText("模型的实时输出将在这里逐步显示")
-        self.live_output_view.setMinimumHeight(140)
+        self.live_output_view.setMinimumHeight(110)
         self.live_output_view.document().setMaximumBlockCount(5000)
-        progress_layout.addWidget(self.live_output_view)
 
-        self.progress_group.setMinimumHeight(310)
+        live_tab = QWidget()
+        live_layout = QVBoxLayout(live_tab)
+        live_layout.setContentsMargins(0, 6, 0, 0)
+        live_toolbar = QHBoxLayout()
+        self.auto_scroll_checkbox = QCheckBox("自动滚动")
+        self.auto_scroll_checkbox.setChecked(True)
+        self.auto_scroll_checkbox.toggled.connect(self._sync_live_output_auto_scroll)
+        live_toolbar.addWidget(self.auto_scroll_checkbox)
+        live_toolbar.addStretch(1)
+
+        self.copy_live_output_button = QToolButton()
+        self.copy_live_output_button.setIcon(
+            self._theme_icon("edit-copy", QStyle.StandardPixmap.SP_FileIcon)
+        )
+        self.copy_live_output_button.setToolTip("复制全部实时输出")
+        self.copy_live_output_button.clicked.connect(self._copy_live_output)
+        live_toolbar.addWidget(self.copy_live_output_button)
+
+        self.popout_live_output_button = QToolButton()
+        self.popout_live_output_button.setIcon(
+            self._theme_icon("window-new", QStyle.StandardPixmap.SP_TitleBarNormalButton)
+        )
+        self.popout_live_output_button.setToolTip("在独立窗口中查看实时输出")
+        self.popout_live_output_button.clicked.connect(self._show_live_output_window)
+        live_toolbar.addWidget(self.popout_live_output_button)
+        live_layout.addLayout(live_toolbar)
+        live_layout.addWidget(self.live_output_view, 1)
+
+        self.progress_tabs = QTabWidget()
+        self.progress_tabs.addTab(section_tab, "章节进度")
+        self._live_output_tab_index = self.progress_tabs.addTab(live_tab, "实时输出")
+        progress_layout.addWidget(self.progress_tabs)
+
+        self.progress_group.setMinimumHeight(240)
         self.progress_scroll = QScrollArea()
         self.progress_scroll.setWidgetResizable(True)
         self.progress_scroll.setHorizontalScrollBarPolicy(
@@ -750,6 +792,7 @@ class WritingTaskPage(QWidget):
         self.status_label.setText("正在准备流水线…")
         self.section_table.setRowCount(0)
         self.live_output_view.clear()
+        self.progress_tabs.setCurrentIndex(0)
         self._start_run_clock()
         self.eval_button.setEnabled(False)
 
@@ -796,18 +839,71 @@ class WritingTaskPage(QWidget):
 
         self._last_stream_at = time.monotonic()
         event_kind, separator, stream_label = kind.partition("::")
+        stage = stream_label if separator else (self._current_step or "模型输出")
+        if event_kind == "status" and text:
+            self._activate_live_output_once()
+            self._ensure_stream_stage(stage)
+            self.live_output_view.insertPlainText(f"\n[系统] {text}\n")
+            self._scroll_live_output_if_enabled()
+            self._update_elapsed_display()
+            return
         if event_kind != "content" or not text:
             self._update_elapsed_display()
             return
-        stage = stream_label if separator else (self._current_step or "模型输出")
-        if stage != self._stream_stage:
-            if self.live_output_view.toPlainText():
-                self.live_output_view.insertPlainText("\n\n")
-            self.live_output_view.insertPlainText(f"===== {stage} =====\n")
-            self._stream_stage = stage
+        self._activate_live_output_once()
+        self._ensure_stream_stage(stage)
         self.live_output_view.insertPlainText(text)
-        self.live_output_view.ensureCursorVisible()
+        self._scroll_live_output_if_enabled()
         self._update_elapsed_display()
+
+    def _ensure_stream_stage(self, stage: str) -> None:
+        if stage == self._stream_stage:
+            return
+        if self.live_output_view.toPlainText():
+            self.live_output_view.insertPlainText("\n\n")
+        self.live_output_view.insertPlainText(f"===== {stage} =====\n")
+        self._stream_stage = stage
+
+    def _activate_live_output_once(self) -> None:
+        if self._stream_auto_switched:
+            return
+        self.progress_tabs.setCurrentIndex(self._live_output_tab_index)
+        self._stream_auto_switched = True
+        QTimer.singleShot(0, self._reveal_live_output)
+
+    def _reveal_live_output(self) -> None:
+        scrollbar = self.progress_scroll.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def _scroll_live_output_if_enabled(self) -> None:
+        if self.auto_scroll_checkbox.isChecked():
+            self.live_output_view.moveCursor(QTextCursor.MoveOperation.End)
+            self.live_output_view.ensureCursorVisible()
+
+    def _copy_live_output(self) -> None:
+        QApplication.clipboard().setText(self.live_output_view.toPlainText())
+
+    def _show_live_output_window(self) -> None:
+        if self._live_output_window is None:
+            self._live_output_window = LiveOutputWindow(
+                self.live_output_view.document(),
+                auto_scroll=self.auto_scroll_checkbox.isChecked(),
+                parent=self,
+            )
+            self._live_output_window.auto_scroll_changed.connect(
+                self.auto_scroll_checkbox.setChecked
+            )
+        self._live_output_window.show_output()
+
+    def _sync_live_output_auto_scroll(self, enabled: bool) -> None:
+        if self._live_output_window is not None:
+            self._live_output_window.set_auto_scroll(enabled)
+        if enabled:
+            self._scroll_live_output_if_enabled()
+
+    def _theme_icon(self, name: str, fallback: QStyle.StandardPixmap) -> QIcon:
+        icon = QIcon.fromTheme(name)
+        return icon if not icon.isNull() else self.style().standardIcon(fallback)
 
     def _pipeline_succeeded(self, result: Any) -> None:
         if not isinstance(result, dict):
@@ -1079,6 +1175,7 @@ class WritingTaskPage(QWidget):
         self._last_stream_at = None
         self._current_step = "正在准备流水线"
         self._stream_stage = ""
+        self._stream_auto_switched = False
         self._elapsed_timer.start()
         self._update_elapsed_display()
 

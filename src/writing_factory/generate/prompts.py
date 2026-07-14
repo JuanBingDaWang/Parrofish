@@ -23,7 +23,9 @@ from writing_factory.generate.models import (
     OutlineNode,
     PolishedSection,
     SectionDraft,
+    SectionDraftOutput,
     ThesisStatement,
+    VerificationResponse,
     VerifiedClaim,
     VerifiedDraft,
 )
@@ -345,8 +347,9 @@ def drafting_messages(
             "按 persona 的论证风格和表达习惯组织段落，但保持学术论文的第三人称规范。",
             "段落数控制在 3-8 段，每段不宜过长。",
             "source_key 在正文中使用 [S1]、[S2] 等标记，置于相关陈述之后。",
+            "只返回 section_id、heading、paragraphs、claims；不得回传 evidence_pack。",
         ],
-        "response_schema": _schema_without_titles(SectionDraft.model_json_schema()),
+        "response_schema": _schema_without_titles(SectionDraftOutput.model_json_schema()),
     }
     payload: dict[str, Any] = {
         "persona_spec": persona_spec_json,
@@ -445,25 +448,16 @@ def verification_messages(
             "判定必须严格：supported 要求论断中所有事实性内容都能在原文找到明确依据。",
             "partial 要求说明具体偏差：是添加了限定、数值偏差、还是忽略了原文条件。",
             "unsupported 要求说明为什么原文不支持。",
-            "matched_chunk_text 字段填入用于比对的关键原文片段。",
-            "interpretation 和 common 类型论断不需要核对，但需要在 verified_claims 中保留原样。",
+            "claim_id 必须原样返回，不得嵌套或改写原 Claim。",
+            "matched_chunk_text 只填用于判定的关键原文短片段，不得回传完整证据包。",
+            "只返回 fact 类型论断的判定；interpretation 和 common 由代码原样保留。",
         ],
-        "response_schema": _schema_without_titles(VerifiedDraft.model_json_schema()),
+        "response_schema": _schema_without_titles(VerificationResponse.model_json_schema()),
     }
     payload = {
         "section_id": section_draft.section_id,
         "heading": section_draft.heading,
         "fact_claims_for_verification": fact_claims_for_verification,
-        "non_fact_claims": [
-            {
-                "claim_id": c.claim_id,
-                "claim_text": c.text,
-                "claim_type": c.claim_type,
-                "paragraph_index": c.paragraph_index,
-            }
-            for c in section_draft.claims
-            if c.claim_type != "fact"
-        ],
     }
     return [
         {"role": "system", "content": VERIFICATION_SYSTEM},

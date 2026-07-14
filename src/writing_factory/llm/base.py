@@ -19,6 +19,7 @@ from tenacity.wait import wait_exponential_jitter
 from writing_factory.llm.common import (
     DynamicConcurrencyGate,
     ExternalServiceError,
+    IncompleteStreamError,
     RateLimiter,
     RetryableServiceError,
 )
@@ -168,14 +169,49 @@ class ServiceTransport:
                         if attempt_timeout is None
                         else min(attempt_timeout, remaining)
                     )
-                return request_once(
-                    method,
-                    path,
-                    normalized_payload,
-                    attempt_timeout,
-                    priority,
-                    stream_event_callback,
-                )
+                try:
+                    attempt_response = request_once(
+                        method,
+                        path,
+                        normalized_payload,
+                        attempt_timeout,
+                        priority,
+                        stream_event_callback,
+                    )
+                    if stream_response and response_validator is not None:
+                        try:
+                            response_validator(attempt_response)
+                        except Exception as exc:
+                            if stream_event_callback is not None:
+                                try:
+                                    stream_event_callback({"_stream_event": "incomplete"})
+                                except Exception:
+                                    logger.exception("SiliconFlow stream observer failed")
+                            invalid_response = dict(attempt_response)
+                            chunks = invalid_response.get("chunks")
+                            if isinstance(chunks, list):
+                                content = self._stream_content(chunks)
+                                invalid_response["stream_diagnostic"] = {
+                                    "chunk_count": len(chunks),
+                                    "content_chars": len(content),
+                                    "finish_reason": self._last_stream_finish_reason(chunks),
+                                    "validation": "failed",
+                                }
+                            raise IncompleteStreamError(
+                                f"{self.provider} returned an invalid streamed response",
+                                response=invalid_response,
+                            ) from exc
+                    return attempt_response
+                except IncompleteStreamError as exc:
+                    if exc.response is not None:
+                        self.database.quarantine_response(
+                            call_id=call_id,
+                            request_hash=request_hash,
+                            provider=self.provider,
+                            operation=operation,
+                            response=exc.response,
+                        )
+                    raise
 
             stop_policy = stop_after_attempt(max(1, request_attempts or self.max_retries))
             if total_timeout_seconds is not None:
@@ -209,7 +245,7 @@ class ServiceTransport:
             raise safe_error from exc
 
         try:
-            if response_validator is not None:
+            if response_validator is not None and not stream_response:
                 response_validator(response)
         except Exception as exc:
             self.database.quarantine_response(
@@ -324,13 +360,87 @@ class ServiceTransport:
             raise RetryableServiceError(f"{self.provider} request timed out") from exc
         except httpx.TransportError as exc:
             raise RetryableServiceError(f"{self.provider} network error") from exc
-        if not done_received:
-            raise RetryableServiceError(
-                f"{self.provider} event stream ended before [DONE]"
-            )
         if not chunks:
-            raise ExternalServiceError(f"{self.provider} returned an empty event stream")
+            raise IncompleteStreamError(
+                f"{self.provider} returned an empty event stream",
+                response={"chunks": []},
+            )
+        if not done_received:
+            finish_reason = self._last_stream_finish_reason(chunks)
+            content = self._stream_content(chunks)
+            if finish_reason == "stop" and self._stream_content_is_complete(payload, content):
+                logger.warning(
+                    "provider=%s stream ended without done but passed terminal validation "
+                    "chunks=%d content_chars=%d finish_reason=%s",
+                    self.provider,
+                    len(chunks),
+                    len(content),
+                    finish_reason,
+                )
+                if stream_event_callback is not None:
+                    try:
+                        stream_event_callback({"_stream_event": "clean_eof"})
+                    except Exception:
+                        logger.exception("SiliconFlow stream observer failed")
+                return {"chunks": chunks, "clean_eof_without_done": True}
+
+            partial = {
+                "chunks": chunks,
+                "stream_diagnostic": {
+                    "chunk_count": len(chunks),
+                    "content_chars": len(content),
+                    "finish_reason": finish_reason,
+                },
+            }
+            logger.warning(
+                "provider=%s incomplete stream chunks=%d content_chars=%d finish_reason=%s",
+                self.provider,
+                len(chunks),
+                len(content),
+                finish_reason,
+            )
+            if stream_event_callback is not None:
+                try:
+                    stream_event_callback({"_stream_event": "incomplete"})
+                except Exception:
+                    logger.exception("SiliconFlow stream observer failed")
+            raise IncompleteStreamError(
+                f"{self.provider} event stream ended before [DONE]",
+                response=partial,
+            )
         return {"chunks": chunks}
+
+    @staticmethod
+    def _last_stream_finish_reason(chunks: list[dict[str, Any]]) -> str | None:
+        for chunk in reversed(chunks):
+            choices = chunk.get("choices") or []
+            if choices and choices[0].get("finish_reason") is not None:
+                return choices[0]["finish_reason"]
+        return None
+
+    @staticmethod
+    def _stream_content(chunks: list[dict[str, Any]]) -> str:
+        parts: list[str] = []
+        for chunk in chunks:
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            content = (choices[0].get("delta") or {}).get("content")
+            if isinstance(content, str):
+                parts.append(content)
+        return "".join(parts)
+
+    @staticmethod
+    def _stream_content_is_complete(payload: Mapping[str, Any], content: str) -> bool:
+        if not content:
+            return False
+        response_format = payload.get("response_format") or {}
+        if response_format.get("type") != "json_object":
+            return True
+        try:
+            return isinstance(json.loads(content), dict)
+        except ValueError:
+            return False
 
     def _request_once(
         self,
