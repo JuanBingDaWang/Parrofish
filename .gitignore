@@ -1,0 +1,43 @@
+# Local secrets
+key_test.txt
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# Runtime data
+data/
+logs/
+*.db
+*.db-shm
+*.db-wal
+*.lance/
+
+# Local research corpora and private working files
+/叶芃/
+/出版发行研究_高被引论文/
+/这个文件不重要.docx
+
+# Large source artwork; optimized application icons live under src/
+/icon.png
+
+# Local Windows packaging work and output
+/packaging/build/
+/packaging/work/
+/packaging/output/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
