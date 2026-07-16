@@ -124,7 +124,7 @@ def task_document_filter(context: GenerationContext) -> MetadataFilter:
     """Build the mandatory retrieval filter from the persisted task policy."""
 
     allowed = set(context.allowed_doc_ids)
-    if not allowed:
+    if not allowed and not context.generation_options.use_web_search:
         raise ValueError("写作任务没有可用的事实来源白名单")
     excluded = set(context.excluded_persona_doc_ids)
     overlap = allowed & excluded

@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from writing_factory.ui.help_ui import create_help_button
 from writing_factory.ui.time_format import format_china_datetime
 
 
@@ -58,6 +59,8 @@ class ProjectPage(QWidget):
         title = QLabel("项目")
         title.setObjectName("pageTitle")
         header.addWidget(title)
+        self.help_button = create_help_button("project", self)
+        header.addWidget(self.help_button)
         header.addStretch(1)
         self.new_button = QPushButton(
             self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon), "新建"

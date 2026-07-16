@@ -4,7 +4,7 @@
 
 设计铁律（§3）本步骤遵守情况：
 - #5 "不让作者校验自己"：核对使用中性角色，不加载 persona，不传入 persona 上下文。
-- #2 "事实先冻结、文风最后加"：核对只检查事实性论断（fact 类型），不碰 interpretation/common。
+- #2 "事实先冻结、文风最后加"：核对事实性论断；旧 common 论断不再自动放行。
 - #4 "引用由代码拼装不由模型敲"：核对不产生新引用，只比对已有的 source_key → chunk 原文。
 """
 
@@ -75,21 +75,28 @@ def verify_section(
     non_fact_claims = [c for c in section_draft.claims if c.claim_type != "fact"]
 
     if not fact_claims:
-        logger.info("本节无 fact 类型论断，跳过核对，所有 claim 原样保留。")
+        logger.info("本节无 fact 类型论断，执行 interpretation/common 结构安全门。")
+        verified_claims = [
+            VerifiedClaim(
+                claim=c,
+                verdict="unsupported" if c.claim_type == "common" else "supported",
+                verifier_rationale=(
+                    "common 仅为兼容旧断点保留；请把该论断改为带来源的 fact，"
+                    "或改写为不依赖外部事实的 interpretation。"
+                    if c.claim_type == "common"
+                    else "interpretation 类型论断无需事实核对，原样保留。"
+                ),
+                matched_chunk_text=None,
+            )
+            for c in non_fact_claims
+        ]
+        unsupported = sum(item.verdict == "unsupported" for item in verified_claims)
         return VerifiedDraft(
             section_id=section_draft.section_id,
-            verified_claims=[
-                VerifiedClaim(
-                    claim=c,
-                    verdict="supported",
-                    verifier_rationale=f"{c.claim_type} 类型论断无需核对，原样保留。",
-                    matched_chunk_text=None,
-                )
-                for c in non_fact_claims
-            ],
-            unsupported_count=0,
+            verified_claims=verified_claims,
+            unsupported_count=unsupported,
             partial_count=0,
-            supported_count=len(non_fact_claims),
+            supported_count=len(non_fact_claims) - unsupported,
         )
 
     progress(10, f"核对 {len(fact_claims)} 条 fact 论断")
@@ -104,7 +111,7 @@ def verify_section(
         normalized = _normalize_verification_response(json.loads(content))
         parsed = VerificationResponse.model_validate(normalized)
         if parsed.section_id != section_draft.section_id:
-            raise ValueError("核对结果与当前章节不匹配")
+            raise ValueError("核对结果与当前内容单元不匹配")
         _validate_verification_logic(parsed, section_draft)
         return parsed.model_dump(mode="python")
 
@@ -120,6 +127,7 @@ def verify_section(
         response_format="json_object",
         seed=42,
         stream=True,
+        step_id="writing.verify",
         result_validator=lambda candidate: parse_response(candidate.content),
     )
 
@@ -267,12 +275,24 @@ def _parse_verified_claims(
                         matched_chunk_text=None,
                     )
                 )
-            else:
+            elif c.claim_type == "interpretation":
                 result.append(
                     VerifiedClaim(
                         claim=c,
                         verdict="supported",
                         verifier_rationale=f"{c.claim_type} 类型论断无需核对，原样保留。",
+                        matched_chunk_text=None,
+                    )
+                )
+            else:
+                result.append(
+                    VerifiedClaim(
+                        claim=c,
+                        verdict="unsupported",
+                        verifier_rationale=(
+                            "common 仅为兼容旧断点保留；请改为带来源的 fact，"
+                            "或改写为 interpretation。"
+                        ),
                         matched_chunk_text=None,
                     )
                 )

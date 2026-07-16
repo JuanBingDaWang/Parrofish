@@ -12,6 +12,8 @@ from writing_factory.distill.academic import (
     AttributionScope,
     Specificity,
 )
+from writing_factory.distill.composition_models import CompositionDNA
+from writing_factory.distill.options import LEGACY_DISTILLATION_OPTIONS, DistillationOptions
 
 UnitScore = Annotated[float, Field(ge=-1.0, le=1.0)]
 Confidence = Literal["high", "medium", "low", "inferred"]
@@ -220,8 +222,6 @@ class MentalModel(BaseModel):
         if self.academic_validation is not None:
             if not self.academic_validation.eligible:
                 raise ValueError("Academic mental model did not pass recurrence validation")
-        elif not self.validation.passed:
-            raise ValueError("Mental model must pass all three Nüwa validations")
         return self
 
 
@@ -330,10 +330,18 @@ class PersonaSpec(BaseModel):
     output_language: Literal["zh-CN"] = Field(
         default="zh-CN", description="档案全部可读字段采用的输出语言"
     )
+    distillation_options: DistillationOptions = Field(
+        default_factory=lambda: LEGACY_DISTILLATION_OPTIONS,
+        description="本版本实际启用的蒸馏质量步骤",
+    )
     mental_models: list[MentalModel] = Field(min_length=3, max_length=7)
     academic_conventions: list[MentalModel] = Field(default_factory=list)
     decision_heuristics: list[DecisionHeuristic] = Field(default_factory=list)
     expression_dna: ExpressionDNA
+    composition_dna: CompositionDNA = Field(
+        default_factory=CompositionDNA,
+        description="按非虚构文体组织的全文、章节、段落、句群与过渡规律",
+    )
     core_tensions: list[CoreTension] = Field(default_factory=list)
     school_divergences: list[SchoolDivergence] = Field(default_factory=list)
     values: list[str] = Field(default_factory=list)
@@ -351,6 +359,15 @@ class PersonaSpec(BaseModel):
         identifiers = [model.name.strip().casefold() for model in self.mental_models]
         if len(identifiers) != len(set(identifiers)):
             raise ValueError("Mental model names must be unique")
+        if self.distillation_options.preset == "legacy":
+            if any(
+                model.academic_validation is None and not model.validation.passed
+                for model in self.mental_models
+            ):
+                raise ValueError("历史完整档案的核心模型必须通过三重验证")
+        elif self.mode == "person" and self.distillation_options.cross_document_validation:
+            if any(model.academic_validation is None for model in self.mental_models):
+                raise ValueError("跨文档质量模式必须保存代码汇总的验证记录")
         return self
 
 
@@ -359,14 +376,14 @@ class ReduceMentalModel(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    candidate_id: str | None = Field(default=None, description="学术蒸馏 v2 中必须复制已选候选标识")
+    candidate_id: str | None = Field(default=None, description="新版蒸馏中必须复制已选候选标识")
     name: str = Field(description="心智模型的简体中文名称")
     description: str = Field(description="该认知操作如何运行的简体中文描述")
     evidence_ids: list[str] = Field(min_length=2, description="至少跨两个领域的登记证据标识")
     applicability: str = Field(description="适用问题和使用条件，使用简体中文")
     limits: str = Field(description="失效条件和适用边界，使用简体中文")
     generative: bool = Field(description="是否能生成对新问题的可检验推断")
-    exclusive: bool = Field(description="是否具有作者区分度而非通用学术常识")
+    exclusive: bool = Field(description="是否具有作者区分度而非通用非虚构写作惯例")
     generative_rationale: str = Field(description="生成力判断理由，使用简体中文")
     exclusivity_rationale: str = Field(description="排他性判断理由，使用简体中文")
 
@@ -410,12 +427,12 @@ class ReduceInformationGap(BaseModel):
 
 
 class AcademicSupplementResult(BaseModel):
-    """学术 v2 在代码选模后仅需模型补充的档案组成部分。"""
+    """新版在代码选模后仅需模型补充的档案组成部分。"""
 
     model_config = ConfigDict(frozen=True)
 
     decision_heuristics: list[ReduceHeuristic] = Field(
-        default_factory=list, max_length=8, description="归并后的学术写作启发式"
+        default_factory=list, max_length=8, description="归并后的非虚构写作启发式"
     )
     style_tags: StyleTags = Field(description="七个量化表达风格轴")
     taboo_words: list[LexicalMarker] = Field(
@@ -458,7 +475,7 @@ class ReduceResult(BaseModel):
     academic_conventions: list[ReduceMentalModel] = Field(
         default_factory=list,
         max_length=7,
-        description="有证据但不进入核心列表的领域或通用学术惯例",
+        description="有证据但不进入核心列表的领域或通用非虚构写作惯例",
     )
     decision_heuristics: list[ReduceHeuristic] = Field(
         default_factory=list, description="降级或归并后的决策启发"

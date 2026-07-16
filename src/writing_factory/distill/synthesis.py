@@ -9,6 +9,7 @@ from datetime import date
 from pydantic import ValidationError
 
 from writing_factory.distill.academic import CandidateRecord, CandidateRegistry
+from writing_factory.distill.composition_models import CompositionDNA
 from writing_factory.distill.expression import ExpressionStatistics
 from writing_factory.distill.extraction import StructuredDistillationError
 from writing_factory.distill.language import (
@@ -39,7 +40,9 @@ from writing_factory.distill.models import (
     TripleValidation,
 )
 from writing_factory.distill.prompts import academic_supplement_messages, reduce_messages
+from writing_factory.distill.reference_aliases import GapReferenceAliases
 from writing_factory.llm import SiliconFlowClient
+from writing_factory.llm.models import ChatResult
 
 
 class CandidateBundleBuilder:
@@ -195,10 +198,13 @@ class PersonaSynthesizer:
         research_date: date,
         academic_registry: CandidateRegistry | None = None,
         control_source_info: tuple[SourceInfo, ...] = (),
+        composition_dna: CompositionDNA | None = None,
     ) -> PersonaSpec:
         """Run reduce with one repair attempt and build the authoritative spec."""
 
         registry, gap_registry, bundle = CandidateBundleBuilder().build(map_results, units)
+        gap_aliases = GapReferenceAliases.from_registry(gap_registry)
+        prompt_bundle = gap_aliases.encode_bundle(bundle)
         if academic_registry is not None:
             return self._synthesize_academic(
                 persona_id=persona_id,
@@ -206,22 +212,44 @@ class PersonaSynthesizer:
                 mode=mode,
                 registry=registry,
                 gap_registry=gap_registry,
-                bundle=bundle,
+                gap_aliases=gap_aliases,
+                bundle=prompt_bundle,
                 source_info=source_info,
                 expression=expression,
                 research_date=research_date,
                 academic_registry=academic_registry,
                 control_source_info=control_source_info,
+                composition_dna=composition_dna,
             )
         messages = reduce_messages(
             name=name,
             mode=mode,
-            candidate_bundle=bundle,
+            candidate_bundle=prompt_bundle,
             expression=expression,
             source_info=source_info,
             output_language=self.output_language,
             academic_registry=academic_registry,
         )
+
+        def assemble_result(result: ChatResult) -> PersonaSpec:
+            reduced = ReduceResult.model_validate(json.loads(result.content))
+            validate_reduce_language(reduced, self.output_language)
+            reduced = self._decode_reduce_gap_references(reduced, gap_aliases)
+            return self._assemble(
+                persona_id=persona_id,
+                name=name,
+                mode=mode,
+                reduced=reduced,
+                registry=registry,
+                gap_registry=gap_registry,
+                source_info=source_info,
+                expression=expression,
+                research_date=research_date,
+                academic_registry=academic_registry,
+                control_source_info=control_source_info,
+                composition_dna=composition_dna,
+            )
+
         last_error = "未知校验错误"
         for attempt in range(self.max_attempts):
             active_messages = messages
@@ -231,39 +259,29 @@ class PersonaSynthesizer:
                     {
                         "role": "user",
                         "content": (
+                            f"这是第 {attempt + 1}/{self.max_attempts} 次修正。"
                             "上一次提案违反了契约。请返回修正后的完整 JSON 对象，不要解释。"
                             f"校验错误：{last_error}"
                         ),
                     },
                 ]
-            result = self.siliconflow.chat(
-                active_messages,
-                thinking=academic_registry is None,
-                reasoning_effort="high",
-                temperature=0.0,
-                max_tokens=8192,
-                seed=17,
-                response_format="json_object",
-                use_cache=True,
-                request_attempts=2,
-                stream=True,
-            )
             try:
-                reduced = ReduceResult.model_validate(json.loads(result.content))
-                validate_reduce_language(reduced, self.output_language)
-                return self._assemble(
-                    persona_id=persona_id,
-                    name=name,
-                    mode=mode,
-                    reduced=reduced,
-                    registry=registry,
-                    gap_registry=gap_registry,
-                    source_info=source_info,
-                    expression=expression,
-                    research_date=research_date,
-                    academic_registry=academic_registry,
-                    control_source_info=control_source_info,
+                result = self.siliconflow.chat(
+                    active_messages,
+                    thinking=academic_registry is None,
+                    reasoning_effort="high",
+                    temperature=0.0,
+                    max_tokens=8192,
+                    seed=17,
+                    response_format="json_object",
+                    use_cache=attempt == 0,
+                    request_attempts=2,
+                    stream=True,
+                    result_validator=lambda value: assemble_result(value),
+                    step_id="distill.reduce",
+                    report_stream_error=False,
                 )
+                return assemble_result(result)
             except (
                 json.JSONDecodeError,
                 ValidationError,
@@ -283,12 +301,14 @@ class PersonaSynthesizer:
         mode: PersonaMode,
         registry: dict[str, PersonaEvidence],
         gap_registry: dict[str, dict[str, object]],
+        gap_aliases: GapReferenceAliases,
         bundle: dict[str, object],
         source_info: tuple[SourceInfo, ...],
         expression: ExpressionStatistics,
         research_date: date,
         academic_registry: CandidateRegistry,
         control_source_info: tuple[SourceInfo, ...],
+        composition_dna: CompositionDNA | None,
     ) -> PersonaSpec:
         """代码装配模型，只让短 Reduce 补充非模型字段。"""
 
@@ -299,6 +319,27 @@ class PersonaSynthesizer:
             output_language=self.output_language,
             academic_registry=academic_registry,
         )
+
+        def assemble_result(result: ChatResult) -> PersonaSpec:
+            supplement = AcademicSupplementResult.model_validate(json.loads(result.content))
+            validate_academic_supplement_language(supplement)
+            supplement = self._decode_supplement_gap_references(supplement, gap_aliases)
+            reduced = self._merge_academic_selection(academic_registry, supplement)
+            return self._assemble(
+                persona_id=persona_id,
+                name=name,
+                mode=mode,
+                reduced=reduced,
+                registry=registry,
+                gap_registry=gap_registry,
+                source_info=source_info,
+                expression=expression,
+                research_date=research_date,
+                academic_registry=academic_registry,
+                control_source_info=control_source_info,
+                composition_dna=composition_dna,
+            )
+
         last_error = "未知校验错误"
         for attempt in range(self.max_attempts):
             active_messages = messages
@@ -308,39 +349,28 @@ class PersonaSynthesizer:
                     {
                         "role": "user",
                         "content": (
+                            f"这是第 {attempt + 1}/{self.max_attempts} 次修正。"
                             "上一次补充结果违反契约。请返回修正后的完整 JSON，不要解释。"
                             f"校验错误：{last_error}"
                         ),
                     },
                 ]
-            result = self.siliconflow.chat(
-                active_messages,
-                thinking=False,
-                temperature=0.0,
-                max_tokens=10000,
-                seed=19,
-                response_format="json_object",
-                use_cache=True,
-                request_attempts=2,
-                stream=False,
-            )
             try:
-                supplement = AcademicSupplementResult.model_validate(json.loads(result.content))
-                validate_academic_supplement_language(supplement)
-                reduced = self._merge_academic_selection(academic_registry, supplement)
-                return self._assemble(
-                    persona_id=persona_id,
-                    name=name,
-                    mode=mode,
-                    reduced=reduced,
-                    registry=registry,
-                    gap_registry=gap_registry,
-                    source_info=source_info,
-                    expression=expression,
-                    research_date=research_date,
-                    academic_registry=academic_registry,
-                    control_source_info=control_source_info,
+                result = self.siliconflow.chat(
+                    active_messages,
+                    thinking=False,
+                    temperature=0.0,
+                    max_tokens=10000,
+                    seed=19,
+                    response_format="json_object",
+                    use_cache=attempt == 0,
+                    request_attempts=2,
+                    stream=False,
+                    result_validator=lambda value: assemble_result(value),
+                    step_id="distill.academic_supplement",
+                    report_stream_error=False,
                 )
+                return assemble_result(result)
             except (
                 json.JSONDecodeError,
                 ValidationError,
@@ -349,7 +379,43 @@ class PersonaSynthesizer:
             ) as exc:
                 last_error = str(exc)[:3000]
         raise StructuredDistillationError(
-            f"学术档案补充在 {self.max_attempts} 次尝试后失败：{last_error}"
+            f"作者档案补充在 {self.max_attempts} 次尝试后失败：{last_error}"
+        )
+
+    @staticmethod
+    def _decode_reduce_gap_references(
+        reduced: ReduceResult,
+        aliases: GapReferenceAliases,
+    ) -> ReduceResult:
+        return reduced.model_copy(
+            update={
+                "information_gaps": [
+                    item.model_copy(
+                        update={
+                            "supporting_gap_ids": aliases.decode(item.supporting_gap_ids)
+                        }
+                    )
+                    for item in reduced.information_gaps
+                ]
+            }
+        )
+
+    @staticmethod
+    def _decode_supplement_gap_references(
+        supplement: AcademicSupplementResult,
+        aliases: GapReferenceAliases,
+    ) -> AcademicSupplementResult:
+        return supplement.model_copy(
+            update={
+                "information_gaps": [
+                    item.model_copy(
+                        update={
+                            "supporting_gap_ids": aliases.decode(item.supporting_gap_ids)
+                        }
+                    )
+                    for item in supplement.information_gaps
+                ]
+            }
         )
 
     @staticmethod
@@ -421,6 +487,7 @@ class PersonaSynthesizer:
         research_date: date,
         academic_registry: CandidateRegistry | None,
         control_source_info: tuple[SourceInfo, ...],
+        composition_dna: CompositionDNA | None,
     ) -> PersonaSpec:
         self._validate_all_references(
             reduced,
@@ -476,7 +543,9 @@ class PersonaSynthesizer:
             taboo_words = []
             tics = []
         return PersonaSpec(
-            schema_version=2 if academic_registry is not None else 1,
+            schema_version=(
+                3 if composition_dna is not None else 2 if academic_registry is not None else 1
+            ),
             id=persona_id,
             name=name,
             mode=mode,
@@ -491,6 +560,7 @@ class PersonaSynthesizer:
                 tics=tics,
                 style_rules=style_rules,
             ),
+            composition_dna=composition_dna or CompositionDNA(),
             core_tensions=tensions,
             school_divergences=reduced.school_divergences,
             values=reduced.values,
@@ -508,7 +578,7 @@ class PersonaSynthesizer:
         registry: dict[str, PersonaEvidence],
         record: CandidateRecord | None,
     ) -> MentalModel:
-        """学术 v2 使用登记表证据和验证，旧档案继续使用 Reduce 字段。"""
+        """新版使用登记表证据和验证，旧档案继续使用 Reduce 字段。"""
 
         evidence_ids = record.candidate.evidence_ids if record is not None else item.evidence_ids
         evidence = self._resolve(evidence_ids, registry)

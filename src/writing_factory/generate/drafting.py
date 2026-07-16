@@ -19,6 +19,7 @@ from writing_factory.generate.models import (
     SectionDraftOutput,
     ThesisStatement,
 )
+from writing_factory.generate.persona_context import persona_context_for_genre
 from writing_factory.generate.prompts import drafting_messages
 from writing_factory.generate.source_policy import (
     enforce_retrieval_safety,
@@ -110,7 +111,7 @@ def draft_section(
     persona_spec = persona_repository.load_runtime(context.persona_id)
     if persona_spec is None:
         raise ValueError(f"persona '{context.persona_id}' 未就绪")
-    persona_json = persona_spec.model_dump(mode="json")
+    persona_json = persona_context_for_genre(persona_spec, context.generation_options.genre)
 
     # ── 2–3. 检索并冻结证据，或复用上游并发预取的冻结结果 ────────────
     if evidence_pack is None:
@@ -130,7 +131,7 @@ def draft_section(
         progress(30, f"使用已冻结证据包 — {outline_node.heading}")
         check_cancelled()
         if evidence_pack.section_id != outline_node.node_id:
-            raise ValueError("冻结证据包与当前提纲节点不匹配")
+            raise ValueError("冻结证据包与当前内容单元不匹配")
     logger.info(
         "证据包锁定: node=%s, %d items",
         outline_node.node_id,
@@ -153,6 +154,8 @@ def draft_section(
         prior_claims=prior_claims,
         target_length_chars=target_length_chars,
         document_form=context.generation_options.document_form,
+        genre=context.generation_options.genre,
+        conceptual_only=context.generation_options.evidence_mode == "conceptual_only",
     )
 
     progress(50, f"调用 LLM 起草 — {outline_node.heading}")
@@ -178,7 +181,7 @@ def draft_section(
                     "content": (
                         "上一次草稿未通过结构与证据边界校验。请从头返回完整 JSON，"
                         f"只能使用这些 source_key：{allowed_keys}。"
-                        "不得沿用其他章节的引用键，不要解释或续写残片。"
+                        "不得沿用其他内容单元的引用键，不要解释或续写残片。"
                         f"上一次校验错误：{str(last_error)[:600]}"
                     ),
                 },
@@ -195,6 +198,7 @@ def draft_section(
                 use_cache=not revision_feedback and attempt == 1,
                 stream=True,
                 request_attempts=2,
+                step_id="writing.draft",
                 result_validator=lambda candidate: assemble_draft(candidate.content),
             )
             break
@@ -205,7 +209,7 @@ def draft_section(
                 raise
 
     if result is None:
-        raise ValueError("LLM 未返回可用的章节草稿")
+        raise ValueError("LLM 未返回可用的内容单元草稿")
 
     progress(85, f"解析草稿 — {outline_node.heading}")
     check_cancelled()
@@ -252,6 +256,8 @@ def build_evidence_pack_for_section(
         query=section_query,
         top_k=8,
         filters=task_document_filter(context),
+        use_rewrite=context.generation_options.use_query_rewrite,
+        use_hyde=context.generation_options.use_hyde,
         use_rerank=True,
     )
     retrieval_result = retriever.search(
@@ -289,7 +295,7 @@ def _build_evidence_pack(
 
     每个 hit 成为一条 EvidenceItem，source_key 从 S1 开始递增。
     """
-    candidates: list[tuple[str, str, str, int | None, int | None, str | None]] = []
+    candidates: list[tuple] = []
     items = list(seed_items or [])
     seen_chunk_ids: set[str] = {item.chunk_id for item in items}
     for hit in retrieval_result.hits:
@@ -311,6 +317,11 @@ def _build_evidence_pack(
                         chunk.page_start,
                         chunk.page_end,
                         chunk.section_heading,
+                        "local",
+                        None,
+                        None,
+                        None,
+                        None,
                     )
                 )
         elif hit.chunk_id not in seen_chunk_ids:
@@ -323,10 +334,27 @@ def _build_evidence_pack(
                     hit.page_start,
                     hit.page_end,
                     hit.section_heading,
+                    "web" if hit.source == "web" else "local",
+                    hit.title,
+                    hit.url,
+                    hit.site_name,
+                    hit.date_published,
                 )
             )
 
-    for i, (chunk_id, doc_id, text, page_start, page_end, heading) in enumerate(
+    for i, (
+        chunk_id,
+        doc_id,
+        text,
+        page_start,
+        page_end,
+        heading,
+        source_type,
+        title,
+        url,
+        site_name,
+        date_published,
+    ) in enumerate(
         candidates[: max(0, 8 - len(items))], 1
     ):
         source_key = f"S{source_key_offset + i}"
@@ -339,6 +367,11 @@ def _build_evidence_pack(
                 page_start=page_start,
                 page_end=page_end,
                 section_heading=heading,
+                source_type=source_type,
+                title=title,
+                url=url,
+                site_name=site_name,
+                date_published=date_published,
             )
         )
 
@@ -358,6 +391,11 @@ def _outline_evidence_items(outline_node: OutlineNode) -> list[EvidenceItem]:
             page_start=item.page_start,
             page_end=item.page_end,
             section_heading=item.section_heading,
+            source_type=item.source_type,
+            title=item.title,
+            url=item.url,
+            site_name=item.site_name,
+            date_published=item.date_published,
         )
         for item in outline_node.candidate_evidence
     ]

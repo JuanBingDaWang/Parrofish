@@ -130,14 +130,21 @@ class Database:
         operation: str,
         response: Mapping[str, Any],
     ) -> str:
-        """Retain an invalid raw response under a key normal cache reads cannot hit."""
+        """Retain only diagnostics for an invalid response outside the usable cache."""
 
         quarantine_key = f"invalid:{request_hash}:{call_id}:{uuid4().hex}"
+        diagnostic = response.get("stream_diagnostic")
+        quarantined: dict[str, Any] = {
+            "quarantined": True,
+            "response_keys": sorted(str(key) for key in response),
+        }
+        if isinstance(diagnostic, Mapping):
+            quarantined["stream_diagnostic"] = dict(diagnostic)
         self.set_cached_response(
             quarantine_key,
             provider,
             f"{operation}:invalid",
-            response,
+            quarantined,
         )
         return quarantine_key
 

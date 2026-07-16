@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from writing_factory.config import Settings, load_settings
+from writing_factory.chat import AuthorChatService, ChatRepository
+from writing_factory.config import CredentialStore, KeyringCredentialStore, Settings, load_settings
 from writing_factory.config.logging import configure_logging, shutdown_logging
 from writing_factory.distill.academic_pipeline import AcademicDistillationEngine
+from writing_factory.distill.composition import CompositionDistiller
 from writing_factory.distill.extraction import PersonaMapExtractor
 from writing_factory.distill.fidelity import FidelityService, PersonaFidelityEvaluator
 from writing_factory.distill.service import DistillationService
@@ -21,8 +23,9 @@ from writing_factory.kb.retrieval import (
     HybridRetriever,
     SparseRetriever,
 )
-from writing_factory.llm import MinerUClient, SiliconFlowClient
+from writing_factory.llm import BochaClient, MinerUClient, SiliconFlowClient
 from writing_factory.llm.common import DynamicConcurrencyGate
+from writing_factory.llm.settings_service import ApplicationSettingsService
 from writing_factory.store import Database, ProjectRepository, RuntimeSettingsRepository
 from writing_factory.store.bm25_index import BM25Index
 from writing_factory.store.kb_repository import KnowledgeBaseRepository
@@ -40,6 +43,8 @@ class ApplicationContext:
     siliconflow_gate: DynamicConcurrencyGate
     siliconflow: SiliconFlowClient
     mineru: MinerUClient
+    bocha: BochaClient
+    settings_service: ApplicationSettingsService
     repository: KnowledgeBaseRepository
     ingestion: IngestionService
     dense_retriever: DenseRetriever
@@ -47,6 +52,8 @@ class ApplicationContext:
     hybrid_retriever: HybridRetriever
     persona_repository: PersonaRepository
     project_repository: ProjectRepository
+    chat_repository: ChatRepository
+    author_chat: AuthorChatService
     distillation: DistillationService
     fidelity: FidelityService
     default_kb_id: str
@@ -56,6 +63,7 @@ class ApplicationContext:
 
         self.siliconflow.close()
         self.mineru.close()
+        self.bocha.close()
         shutdown_logging()
 
     def set_siliconflow_concurrency(self, value: int) -> None:
@@ -66,7 +74,7 @@ class ApplicationContext:
         self.distillation.set_max_parallel_tasks(value)
 
     def get_siliconflow_request_timeout(self) -> int:
-        """读取所有 SiliconFlow 逻辑请求共享的单次超时秒数。"""
+        """读取每次 SiliconFlow 尝试独立拥有的超时秒数。"""
 
         legacy = self.runtime_settings.get(
             "framework_generation_timeout_seconds",
@@ -78,12 +86,76 @@ class ApplicationContext:
         return self.settings.siliconflow_request_timeout_seconds
 
     def set_siliconflow_request_timeout(self, value: int) -> None:
-        """校验、持久化并立即应用全局 SiliconFlow 请求超时。"""
+        """校验、持久化并立即应用全局 SiliconFlow 单次尝试上限。"""
 
         if not 60 <= value <= 3600:
             raise ValueError("SiliconFlow 单次请求超时上限必须在 60 至 3600 秒之间")
         self.runtime_settings.set("siliconflow_request_timeout_seconds", value)
         self.siliconflow.set_request_timeout(value)
+
+    def get_siliconflow_total_timeout(self) -> int:
+        """读取决定能否启动下一次尝试的全局软预算。"""
+
+        value = self.runtime_settings.get(
+            "siliconflow_total_timeout_seconds",
+            self.settings.siliconflow_total_timeout_seconds,
+        )
+        if isinstance(value, int) and 60 <= value <= 21600:
+            return value
+        return self.settings.siliconflow_total_timeout_seconds
+
+    def set_siliconflow_total_timeout(self, value: int) -> None:
+        """持久化整项调用软预算；不截断已经启动的尝试。"""
+
+        if not 60 <= value <= 21600:
+            raise ValueError("SiliconFlow 整项调用总预算必须在 60 至 21600 秒之间")
+        self.runtime_settings.set("siliconflow_total_timeout_seconds", value)
+        self.siliconflow.set_total_timeout(value)
+
+    def get_siliconflow_stream_idle_timeout(self) -> int:
+        """读取流式响应中两个有效数据块之间允许的最长间隔。"""
+
+        value = self.runtime_settings.get(
+            "siliconflow_stream_idle_timeout_seconds",
+            self.settings.siliconflow_stream_idle_timeout_seconds,
+        )
+        if isinstance(value, int) and 30 <= value <= 1800:
+            return value
+        return self.settings.siliconflow_stream_idle_timeout_seconds
+
+    def set_siliconflow_stream_idle_timeout(self, value: int) -> None:
+        """持久化并立即应用流式空闲超时。"""
+
+        if not 30 <= value <= 1800:
+            raise ValueError("SiliconFlow 流式空闲超时必须在 30 至 1800 秒之间")
+        self.runtime_settings.set("siliconflow_stream_idle_timeout_seconds", value)
+        self.siliconflow.set_stream_idle_timeout(value)
+
+    def get_author_chat_recent_rounds(self) -> int:
+        """Return the persisted number of verbatim recent chat rounds."""
+
+        value = self.runtime_settings.get("author_chat_recent_rounds", 6)
+        return value if isinstance(value, int) and 1 <= value <= 20 else 6
+
+    def set_author_chat_recent_rounds(self, value: int) -> None:
+        """Persist the rolling chat memory window."""
+
+        if not 1 <= value <= 20:
+            raise ValueError("作者对话最近轮数必须在 1 至 20 之间")
+        self.runtime_settings.set("author_chat_recent_rounds", value)
+
+    def get_web_search_result_count(self) -> int:
+        """Return the shared number of Bocha results requested per search."""
+
+        value = self.runtime_settings.get("bocha_search_result_count", 5)
+        return value if isinstance(value, int) and 1 <= value <= 20 else 5
+
+    def set_web_search_result_count(self, value: int) -> None:
+        """Persist the result count shared by author chat and writing tasks."""
+
+        if not 1 <= value <= 20:
+            raise ValueError("博查每次联网检索条目数必须在 1 至 20 之间")
+        self.runtime_settings.set("bocha_search_result_count", value)
 
     def get_retrieval_option(self, key: str, default: bool = True) -> bool:
         """读取检索增强开关（HyDE / 查询改写），默认开启以优先写作质量。"""
@@ -97,16 +169,22 @@ class ApplicationContext:
         self.runtime_settings.set(f"retrieval_{key}", bool(enabled))
 
 
-def build_application(settings: Settings | None = None) -> ApplicationContext:
+def build_application(
+    settings: Settings | None = None,
+    *,
+    credential_store: CredentialStore | None = None,
+) -> ApplicationContext:
     """Build the application from centralized settings."""
 
-    resolved = settings or load_settings()
+    secret_store = credential_store or KeyringCredentialStore()
+    resolved = settings or load_settings(credential_store=secret_store)
     resolved.ensure_runtime_directories()
     configure_logging(
         resolved.log_dir,
         (
             resolved.siliconflow_api_key.get_secret_value(),
             resolved.mineru_api_token.get_secret_value(),
+            resolved.bocha_api_key.get_secret_value(),
         ),
     )
     database = Database(resolved.database_path)
@@ -130,21 +208,57 @@ def build_application(settings: Settings | None = None) -> ApplicationContext:
         if isinstance(stored_timeout, int) and 60 <= stored_timeout <= 3600
         else resolved.siliconflow_request_timeout_seconds
     )
+    stored_total_timeout = runtime_settings.get(
+        "siliconflow_total_timeout_seconds",
+        resolved.siliconflow_total_timeout_seconds,
+    )
+    total_timeout = (
+        stored_total_timeout
+        if isinstance(stored_total_timeout, int) and 60 <= stored_total_timeout <= 21600
+        else resolved.siliconflow_total_timeout_seconds
+    )
+    stored_idle_timeout = runtime_settings.get(
+        "siliconflow_stream_idle_timeout_seconds",
+        resolved.siliconflow_stream_idle_timeout_seconds,
+    )
+    idle_timeout = (
+        stored_idle_timeout
+        if isinstance(stored_idle_timeout, int) and 30 <= stored_idle_timeout <= 1800
+        else resolved.siliconflow_stream_idle_timeout_seconds
+    )
     siliconflow_gate = DynamicConcurrencyGate(concurrency)
     siliconflow = SiliconFlowClient(
         resolved,
         database,
         siliconflow_gate,
         request_timeout_seconds=request_timeout,
+        total_timeout_seconds=total_timeout,
+        stream_idle_timeout_seconds=idle_timeout,
     )
     mineru = MinerUClient(resolved, database)
+    bocha = BochaClient(resolved, database)
     repository = KnowledgeBaseRepository(database)
     default_kb_id = repository.ensure_default()
     vectors = LanceVectorIndex(resolved.lancedb_path)
     bm25 = BM25Index(repository)
+    dense_retriever = DenseRetriever(repository, vectors, siliconflow)
+    sparse_retriever = SparseRetriever(bm25)
+    hybrid_retriever = HybridRetriever(repository, vectors, bm25, siliconflow)
     persona_repository = PersonaRepository(database)
     project_repository = ProjectRepository(database)
     project_repository.ensure_default(default_kb_id)
+    settings_service = ApplicationSettingsService(
+        settings=resolved,
+        repository=runtime_settings,
+        credential_store=secret_store,
+        siliconflow=siliconflow,
+        mineru=mineru,
+        bocha=bocha,
+        kb_repository=repository,
+        vectors=vectors,
+        kb_id=default_kb_id,
+        on_retrieval_configuration_changed=hybrid_retriever.clear_cache,
+    )
     ingestion = IngestionService(
         resolved,
         repository,
@@ -174,6 +288,19 @@ def build_application(settings: Settings | None = None) -> ApplicationContext:
         map_concurrency=concurrency,
         output_language=resolved.distillation_output_language,
         academic_engine=academic_engine,
+        composition_distiller=CompositionDistiller(siliconflow, persona_repository),
+    )
+    chat_repository = ChatRepository(database)
+    author_chat = AuthorChatService(
+        repository=chat_repository,
+        persona_repository=persona_repository,
+        kb_repository=repository,
+        retriever=hybrid_retriever,
+        siliconflow=siliconflow,
+        bocha=bocha,
+        kb_id=default_kb_id,
+        recent_rounds=lambda: _recent_chat_rounds(runtime_settings),
+        web_search_result_count=lambda: _web_search_result_count(runtime_settings),
     )
     return ApplicationContext(
         settings=resolved,
@@ -182,13 +309,17 @@ def build_application(settings: Settings | None = None) -> ApplicationContext:
         siliconflow_gate=siliconflow_gate,
         siliconflow=siliconflow,
         mineru=mineru,
+        bocha=bocha,
+        settings_service=settings_service,
         repository=repository,
         ingestion=ingestion,
-        dense_retriever=DenseRetriever(repository, vectors, siliconflow),
-        sparse_retriever=SparseRetriever(bm25),
-        hybrid_retriever=HybridRetriever(repository, vectors, bm25, siliconflow),
+        dense_retriever=dense_retriever,
+        sparse_retriever=sparse_retriever,
+        hybrid_retriever=hybrid_retriever,
         persona_repository=persona_repository,
         project_repository=project_repository,
+        chat_repository=chat_repository,
+        author_chat=author_chat,
         distillation=distillation,
         fidelity=FidelityService(
             persona_repository,
@@ -196,3 +327,13 @@ def build_application(settings: Settings | None = None) -> ApplicationContext:
         ),
         default_kb_id=default_kb_id,
     )
+
+
+def _recent_chat_rounds(repository: RuntimeSettingsRepository) -> int:
+    value = repository.get("author_chat_recent_rounds", 6)
+    return value if isinstance(value, int) and 1 <= value <= 20 else 6
+
+
+def _web_search_result_count(repository: RuntimeSettingsRepository) -> int:
+    value = repository.get("bocha_search_result_count", 5)
+    return value if isinstance(value, int) and 1 <= value <= 20 else 5

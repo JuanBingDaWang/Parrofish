@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from writing_factory.ui.help_ui import create_help_button
 from writing_factory.ui.retrieval_panel import RetrievalPanel
 from writing_factory.ui.time_format import format_china_datetime
 from writing_factory.ui.workers import (
@@ -88,6 +89,7 @@ class KnowledgeBasePage(QWidget):
         toolbar = QHBoxLayout()
         heading = QLabel("知识库")
         heading.setObjectName("pageTitle")
+        self.help_button = create_help_button("knowledge", self)
         self.import_button = QPushButton(
             self.style().standardIcon(QStyle.StandardPixmap.SP_DialogOpenButton),
             "批量导入",
@@ -102,6 +104,7 @@ class KnowledgeBasePage(QWidget):
         self.delete_button.clicked.connect(self.start_deletion)
         self.delete_button.setEnabled(False)
         toolbar.addWidget(heading)
+        toolbar.addWidget(self.help_button)
         toolbar.addStretch(1)
         toolbar.addWidget(self.delete_button)
         toolbar.addWidget(self.import_button)

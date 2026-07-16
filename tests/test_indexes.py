@@ -44,6 +44,21 @@ def test_lancedb_replaces_one_document_and_filters_allowed_docs(tmp_path: Path) 
     assert index.has_document("doc_a")
 
 
+def test_lancedb_rebuild_switches_vector_dimension_atomically(tmp_path: Path) -> None:
+    index = LanceVectorIndex(tmp_path / "lance")
+    first = _child("chunk_a", "doc_a", "旧模型向量")
+    second = _child("chunk_b", "doc_b", "新模型向量")
+    index.replace_document("doc_a", [first], [[1.0, 0.0, 0.0]])
+
+    index.rebuild([second], [[0.0, 1.0]], model_id="provider/new-embedding")
+
+    hits = index.search([0.0, 1.0], allowed_doc_ids={"doc_b"}, limit=5)
+    assert [hit.chunk_id for hit in hits] == ["chunk_b"]
+    assert not index.has_document("doc_a")
+    reopened = LanceVectorIndex(tmp_path / "lance")
+    assert reopened.embedding_model == "provider/new-embedding"
+
+
 def test_bm25_rebuilds_from_ready_sqlite_chunks(settings, tmp_path: Path) -> None:
     database = Database(settings.database_path)
     database.initialize()

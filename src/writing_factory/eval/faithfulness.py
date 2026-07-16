@@ -100,6 +100,7 @@ class FaithfulnessEvaluator:
                 max_tokens=8192,
                 seed=42,
                 stream=True,
+                step_id="evaluation.claim_decomposition",
             )
             raw = (result.content or "").strip()
             # Parse: each line is one claim (skip empty lines)
@@ -147,6 +148,7 @@ class FaithfulnessEvaluator:
                 max_tokens=8192,
                 seed=42,
                 stream=True,
+                step_id="evaluation.claim_support",
             )
             return self._parse_check_result(claim, result.content or "")
         except Exception:

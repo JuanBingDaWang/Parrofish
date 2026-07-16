@@ -21,6 +21,7 @@ from writing_factory.generate.models import (
     ThesisStatement,
     drafting_unit_range,
 )
+from writing_factory.generate.persona_context import persona_context_for_genre
 from writing_factory.generate.prompts import framework_messages
 from writing_factory.generate.source_policy import (
     enforce_retrieval_safety,
@@ -28,6 +29,7 @@ from writing_factory.generate.source_policy import (
 )
 from writing_factory.kb.models import RetrievalRequest
 from writing_factory.llm.models import ChatResult
+from writing_factory.nonfiction import NonfictionGenre
 
 if TYPE_CHECKING:
     from writing_factory.kb.retrieval import HybridRetriever
@@ -51,6 +53,167 @@ def _no_progress(_percent: int, _message: str) -> None:
 
 def _no_cancellation() -> None:
     pass
+
+
+def build_template_framework(
+    *,
+    context: GenerationContext,
+    thesis: ThesisStatement,
+) -> AnnotatedOutline:
+    """Build a deterministic minimum outline when LLM framework generation is disabled."""
+
+    document_form = context.generation_options.document_form
+    if document_form == "paragraph":
+        nodes = [
+            OutlineNode(
+                node_id="1",
+                heading="",
+                rhetorical_purpose="围绕中心论旨直接完成用户指定的单个段落",
+            )
+        ]
+    elif document_form == "short_text":
+        nodes = [
+            OutlineNode(
+                node_id="1",
+                heading="正文",
+                rhetorical_purpose="围绕创作意图完成符合目标文体的紧凑短篇文本",
+            )
+        ]
+    else:
+        minimum_units, _maximum_units = drafting_unit_range(
+            document_form,
+            context.generation_options.target_length_chars,
+        )
+        nodes = _genre_template_nodes(context.generation_options.genre, minimum_units)
+    return AnnotatedOutline(
+        thesis=thesis,
+        root_nodes=nodes,
+        term_registry={},
+        kb_id=context.kb_id,
+    )
+
+
+def _genre_template_nodes(genre: NonfictionGenre, unit_count: int) -> list[OutlineNode]:
+    """Return a conservative long-form fallback shaped by nonfiction genre."""
+
+    blueprints: dict[NonfictionGenre, list[tuple[str, str, str]]] = {
+        "academic_paper": [
+            ("问题提出", "界定研究问题、范围与中心论点", ""),
+            ("概念与视角", "说明关键概念和分析路径", "递进"),
+            ("证据与分析", "使用冻结证据展开核心论证", "递进"),
+            ("辨析与边界", "处理反例、异议和适用边界", "转折与限定"),
+            ("结论", "汇总论证并回扣中心论点", "归纳与收束"),
+        ],
+        "research_report": [
+            ("问题与范围", "交代调研目的、对象和范围", ""),
+            ("资料与方法", "说明材料来源和分析方法", "递进"),
+            ("主要发现", "分层呈现受证据支持的发现", "从方法到结果"),
+            ("分析与建议", "解释发现并提出边界明确的建议", "从事实到解释"),
+            ("结论", "概括发现、限制和后续问题", "归纳与收束"),
+        ],
+        "policy_brief": [
+            ("核心结论", "先给出决策者最需要知道的判断", ""),
+            ("问题与影响", "界定问题、受影响对象和紧迫性", "从结论回到问题"),
+            ("证据与选项", "呈现证据、可选方案及其权衡", "分析与比较"),
+            ("行动建议", "提出责任明确、可执行的建议", "从比较到选择"),
+            ("实施要点", "说明条件、风险和检查点", "细化与限定"),
+        ],
+        "commentary": [
+            ("判断与切口", "明确观点及其现实切口", ""),
+            ("背景与依据", "提供理解判断所需的事实和背景", "从判断到依据"),
+            ("分析展开", "解释因果、机制或价值冲突", "递进"),
+            ("异议与边界", "回应可能的反方意见并限定结论", "转折与限定"),
+            ("结语", "回扣判断并说明其意义", "归纳与收束"),
+        ],
+        "review": [
+            ("对象与尺度", "介绍评价对象并明确评价标准", ""),
+            ("核心特征", "分析对象最重要的内容与形式特征", "从标准到分析"),
+            ("贡献与意义", "说明其价值及所在脉络", "递进"),
+            ("局限与争议", "给出有依据的批评和边界", "转折与限定"),
+            ("总体评价", "形成克制、完整的综合判断", "综合与收束"),
+        ],
+        "popular_science": [
+            ("问题切入", "从读者可感知的问题或误区切入", ""),
+            ("概念解释", "用准确而易懂的方式建立基础概念", "从问题到解释"),
+            ("机制与证据", "说明现象如何发生及证据边界", "递进"),
+            ("常见误解", "澄清容易混淆的判断", "对照与纠偏"),
+            ("意义与延伸", "说明知识的现实意义和适用边界", "拓展与收束"),
+        ],
+        "speech": [
+            ("开场", "建立听众连接并提出主线", ""),
+            ("核心信息", "用清晰、可记忆的层次展开主要观点", "递进"),
+            ("例证与解释", "用事实或例子增强理解和可信度", "具体化"),
+            ("回应与转折", "处理听众疑问并推进主线", "转折与递进"),
+            ("收束", "回扣主线并形成清晰结束或行动指向", "总结与号召"),
+        ],
+        "public_article": [
+            ("切口", "用明确问题或现象建立阅读动机", ""),
+            ("背景", "补充理解问题所需的事实和概念", "从现象到背景"),
+            ("解释", "分层说明机制、影响或争议", "递进"),
+            ("辨析", "回应误解并给出必要限定", "转折与限定"),
+            ("结语", "回到读者关切并完成收束", "回扣与收束"),
+        ],
+        "news_analysis": [
+            ("核心事实", "先交代最重要且已经确认的信息", ""),
+            ("背景脉络", "补充事件发生的历史和制度背景", "从事实到背景"),
+            ("多方视角", "区分不同主体的立场和证据", "并列与比较"),
+            ("影响分析", "解释可能影响并区分事实与推测", "从事实到分析"),
+            ("不确定性", "说明尚不能确定之处和后续观察点", "限定与收束"),
+        ],
+        "instructional": [
+            ("目标与前提", "说明读者将完成什么以及需要哪些条件", ""),
+            ("准备", "列出必要材料、概念和风险", "从目标到准备"),
+            ("执行步骤", "按依赖关系给出可操作步骤", "顺序与递进"),
+            ("检查与排错", "提供验收标准和常见问题处理", "反馈与纠偏"),
+            ("完成与延伸", "确认结果并给出下一步方向", "总结与延伸"),
+        ],
+        "summary": [
+            ("目的与范围", "交代原材料的主题、目的和边界", ""),
+            ("核心信息", "忠实压缩最重要的信息", "从范围到要点"),
+            ("关键依据", "保留支撑核心信息的必要依据", "解释与支撑"),
+            ("限定条件", "保留原材料中的重要限制", "限定"),
+            ("结论", "忠实呈现原材料的结论或意义", "归纳与收束"),
+        ],
+    }
+    fallback = [
+        ("目的与问题", "明确文本目的、受众和中心信息", ""),
+        ("必要背景", "提供理解中心信息所需的事实和概念", "递进"),
+        ("核心展开", "按用户要求组织证据、解释或建议", "递进"),
+        ("边界与补充", "处理限制、异议或注意事项", "转折与限定"),
+        ("收束", "回扣中心信息并完成沟通目的", "归纳与收束"),
+    ]
+    blueprint = blueprints.get(genre, fallback)
+    fitted = _fit_blueprint(blueprint, unit_count)
+    return [
+        OutlineNode(
+            node_id=str(index),
+            heading=heading,
+            rhetorical_purpose=purpose,
+            relation_to_previous=relation,
+        )
+        for index, (heading, purpose, relation) in enumerate(fitted, start=1)
+    ]
+
+
+def _fit_blueprint(
+    blueprint: list[tuple[str, str, str]],
+    unit_count: int,
+) -> list[tuple[str, str, str]]:
+    if unit_count <= len(blueprint):
+        if unit_count == 1:
+            return [blueprint[0]]
+        return [*blueprint[: unit_count - 1], blueprint[-1]]
+    middle = list(blueprint[1:-1])
+    while len(middle) < unit_count - 2:
+        index = len(middle) + 1
+        middle.append(
+            (
+                f"深入展开（{index}）",
+                "使用冻结证据展开一个服务于中心信息的内容单元",
+                "递进",
+            )
+        )
+    return [blueprint[0], *middle[: unit_count - 2], blueprint[-1]]
 
 
 def build_framework(
@@ -100,38 +263,42 @@ def build_framework(
     persona_spec = persona_repository.load_runtime(context.persona_id)
     if persona_spec is None:
         raise ValueError(f"persona '{context.persona_id}' 未就绪")
-    persona_json = persona_spec.model_dump(mode="json")
+    persona_json = persona_context_for_genre(persona_spec, context.generation_options.genre)
 
-    progress(15, "广域检索证据")
+    progress(15, "准备内容规划依据")
     check_cancelled()
 
     # ── 2. 广域检索 ──────────────────────────────────────────────────
     # 用论点 + 任务描述拼接检索查询，扩大覆盖面
-    framework_query = f"{thesis.thesis_text}\n{thesis.angle}\n{context.task_description}"
-    retrieval_request = RetrievalRequest(
-        kb_id=context.kb_id,
-        query=framework_query,
-        top_k=12,
-        filters=task_document_filter(context),
-        use_rerank=True,
-    )
-    retrieval_result = retriever.search(
-        retrieval_request,
-        progress=progress,
-        check_cancelled=check_cancelled,
-    )
-    enforce_retrieval_safety(retrieval_result, siliconflow)
+    if context.generation_options.evidence_mode == "conceptual_only":
+        node_retrieval_results = []
+        progress(30, "已跳过知识库检索")
+    else:
+        framework_query = f"{thesis.thesis_text}\n{thesis.angle}\n{context.task_description}"
+        retrieval_request = RetrievalRequest(
+            kb_id=context.kb_id,
+            query=framework_query,
+            top_k=12,
+            filters=task_document_filter(context),
+            use_rewrite=context.generation_options.use_query_rewrite,
+            use_hyde=context.generation_options.use_hyde,
+            use_rerank=True,
+        )
+        retrieval_result = retriever.search(
+            retrieval_request,
+            progress=progress,
+            check_cancelled=check_cancelled,
+        )
+        enforce_retrieval_safety(retrieval_result, siliconflow)
 
-    progress(30, "汇总检索结果")
-    check_cancelled()
-
-    # ── 3. 格式化检索结果 ────────────────────────────────────────────
-    node_retrieval_results = _format_broad_retrieval(retrieval_result)
-    logger.info(
-        "框架检索完成: %d hits → %d 节点检索块",
-        len(retrieval_result.hits),
-        len(node_retrieval_results),
-    )
+        progress(30, "汇总检索结果")
+        check_cancelled()
+        node_retrieval_results = _format_broad_retrieval(retrieval_result)
+        logger.info(
+            "框架检索完成: %d hits → %d 节点检索块",
+            len(retrieval_result.hits),
+            len(node_retrieval_results),
+        )
 
     progress(40, "构造框架提示词")
     check_cancelled()
@@ -147,11 +314,18 @@ def build_framework(
     # ── 5. 校验并解析为 AnnotatedOutline ─────────────────────────────
     outline: AnnotatedOutline | None = None
     last_error: FrameworkOutputError | None = None
-    for attempt, max_tokens in enumerate(FRAMEWORK_OUTPUT_TOKEN_LIMITS, start=1):
+    profile_getter = getattr(siliconflow, "step_config", None)
+    base_tokens = (
+        profile_getter("writing.framework").max_tokens
+        if callable(profile_getter)
+        else FRAMEWORK_OUTPUT_TOKEN_LIMITS[0]
+    )
+    token_limits = tuple(min(131072, base_tokens * multiplier) for multiplier in (1, 2, 4))
+    for attempt, max_tokens in enumerate(token_limits, start=1):
         check_cancelled()
         progress(
             50,
-            f"调用 LLM 构建提纲（第 {attempt}/3 次，最多 {max_tokens} tokens）",
+            f"调用 LLM 构建内容规划（第 {attempt}/3 次，最多 {max_tokens} tokens）",
         )
         active_messages = messages
         if last_error is not None:
@@ -176,6 +350,8 @@ def build_framework(
                 response_format="json_object",
                 seed=42,
                 stream=True,
+                step_id="writing.framework",
+                step_max_tokens_multiplier=2 ** (attempt - 1),
                 result_validator=lambda candidate: _validate_framework_result(
                     candidate,
                     target_length_chars=context.generation_options.target_length_chars,
@@ -183,6 +359,7 @@ def build_framework(
                 ),
             )
             outline = _parse_framework_result(result)
+            outline = outline.model_copy(update={"thesis": thesis, "kb_id": context.kb_id})
             _validate_outline_budget(
                 outline,
                 target_length_chars=context.generation_options.target_length_chars,
@@ -197,7 +374,7 @@ def build_framework(
                 max_tokens,
                 str(exc)[:600],
             )
-            if attempt == len(FRAMEWORK_OUTPUT_TOKEN_LIMITS):
+            if attempt == len(token_limits):
                 raise ValueError(
                     "LLM 连续三次未返回完整有效的 AnnotatedOutline JSON："
                     f"{exc}"
@@ -206,19 +383,23 @@ def build_framework(
     if outline is None:
         raise ValueError("LLM 未返回可用的 AnnotatedOutline")
 
-    progress(85, "提纲 JSON 校验完成")
+    progress(85, "内容规划 JSON 校验完成")
     check_cancelled()
 
-    progress(88, "按提纲节点检索候选证据")
-    outline = _attach_node_evidence(
-        outline=outline,
-        context=context,
-        retriever=retriever,
-        siliconflow=siliconflow,
-        check_cancelled=check_cancelled,
-    )
+    if context.generation_options.evidence_mode == "conceptual_only":
+        outline = _clear_outline_evidence(outline)
+        progress(88, "无事实构思模式已冻结空候选证据")
+    else:
+        progress(88, "按内容单元检索候选证据")
+        outline = _attach_node_evidence(
+            outline=outline,
+            context=context,
+            retriever=retriever,
+            siliconflow=siliconflow,
+            check_cancelled=check_cancelled,
+        )
 
-    progress(100, "提纲构建完成")
+    progress(100, "内容规划完成")
     node_count = len(outline.root_nodes)
     total_nodes = _count_all_nodes(outline.root_nodes)
     logger.info(
@@ -275,13 +456,13 @@ def _validate_outline_budget(
     leaves = _draftable_nodes(outline.root_nodes)
     minimum, maximum = drafting_unit_range(document_form, target_length_chars)
     if not leaves:
-        raise FrameworkOutputError("提纲没有可起草的叶子正文单元")
+        raise FrameworkOutputError("内容规划没有可起草的叶子正文单元")
     if len(leaves) > maximum:
         recommended = str(minimum) if minimum == maximum else f"{minimum}-{maximum}"
         raise FrameworkOutputError(
             f"目标篇幅约 {target_length_chars} 字，建议安排 {recommended} 个正文单元，"
             f"只允许最多 {maximum} 个；"
-            f"当前提纲有 {len(leaves)} 个叶子正文单元"
+            f"当前内容规划有 {len(leaves)} 个叶子正文单元"
         )
 
 
@@ -303,6 +484,11 @@ def _format_broad_retrieval(retrieval_result) -> list[dict[str, object]]:
                 "page_end": hit.page_end,
                 "section_heading": hit.section_heading,
                 "rerank_score": hit.rerank_score,
+                "source_type": "web" if hit.source == "web" else "local",
+                "title": hit.title,
+                "url": hit.url,
+                "site_name": hit.site_name,
+                "date_published": hit.date_published,
             }
         )
 
@@ -322,6 +508,21 @@ def _count_all_nodes(nodes: list) -> int:
         if hasattr(node, "children") and node.children:
             total += _count_all_nodes(node.children)
     return total
+
+
+def _clear_outline_evidence(outline: AnnotatedOutline) -> AnnotatedOutline:
+    """Freeze an evidence-free outline even if the model invented candidate keys."""
+
+    def clear(node: OutlineNode) -> OutlineNode:
+        return node.model_copy(
+            update={
+                "candidate_source_keys": [],
+                "candidate_evidence": [],
+                "children": [clear(child) for child in node.children],
+            }
+        )
+
+    return outline.model_copy(update={"root_nodes": [clear(node) for node in outline.root_nodes]})
 
 
 def _attach_node_evidence(
@@ -351,6 +552,8 @@ def _attach_node_evidence(
                 query=(f"{outline.thesis.thesis_text}\n{node.heading}\n{node.rhetorical_purpose}"),
                 top_k=6,
                 filters=task_document_filter(context),
+                use_rewrite=context.generation_options.use_query_rewrite,
+                use_hyde=context.generation_options.use_hyde,
                 use_rerank=True,
             )
             retrieval_result = retriever.search(
@@ -388,6 +591,11 @@ def _attach_node_evidence(
                     page_start=chunk.page_start,
                     page_end=chunk.page_end,
                     section_heading=chunk.section_heading,
+                    source_type="web" if getattr(chunk, "source", None) == "web" else "local",
+                    title=getattr(chunk, "title", None),
+                    url=getattr(chunk, "url", None),
+                    site_name=getattr(chunk, "site_name", None),
+                    date_published=getattr(chunk, "date_published", None),
                 )
             )
             next_key += 1

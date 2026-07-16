@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import httpx
@@ -322,6 +325,154 @@ def test_sse_long_total_timeout_keeps_short_idle_read_timeout(tmp_path: Path) ->
     assert seen_timeout["connect"] == 1
 
 
+def test_sse_request_closes_promptly_when_background_task_is_cancelled(
+    tmp_path: Path,
+) -> None:
+    class PlannedCancellation(RuntimeError):
+        pass
+
+    class BlockingStream(httpx.SyncByteStream):
+        def __init__(self) -> None:
+            self.started = threading.Event()
+            self.closed = threading.Event()
+
+        def __iter__(self):
+            self.started.set()
+            while not self.closed.wait(0.01):
+                pass
+            return
+            yield b""  # pragma: no cover
+
+        def close(self) -> None:
+            self.closed.set()
+
+    stream = BlockingStream()
+    cancelled = threading.Event()
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(200, stream=stream, request=request)
+
+    def check_cancelled() -> None:
+        if cancelled.is_set():
+            raise PlannedCancellation("planned cancellation")
+
+    transport = ServiceTransport(
+        provider="test",
+        base_url="https://example.invalid/v1",
+        credential=SecretStr("private-token"),
+        database=_database(tmp_path),
+        connect_timeout_seconds=1,
+        read_timeout_seconds=300,
+        max_retries=3,
+        http_client=httpx.Client(
+            base_url="https://example.invalid/v1",
+            transport=httpx.MockTransport(handler),
+        ),
+    )
+    timer = threading.Timer(0.15, cancelled.set)
+    started_at = time.monotonic()
+    timer.start()
+    try:
+        with pytest.raises(PlannedCancellation, match="planned cancellation"):
+            transport.request_json(
+                "POST",
+                "/stream",
+                operation="stream",
+                payload={"stream": True},
+                request_attempts=3,
+                stream_response=True,
+                use_cache=True,
+                check_cancelled=check_cancelled,
+            )
+    finally:
+        timer.cancel()
+
+    assert stream.started.is_set()
+    assert stream.closed.is_set()
+    assert time.monotonic() - started_at < 1.0
+    assert requests == 1
+    with transport.database.connection() as connection:
+        call = connection.execute(
+            "SELECT status, error_type FROM api_calls ORDER BY created_at DESC"
+        ).fetchone()
+        cache_count = connection.execute("SELECT count(*) FROM api_cache").fetchone()[0]
+    assert dict(call) == {"status": "cancelled", "error_type": "PlannedCancellation"}
+    assert cache_count == 0
+
+
+def test_non_stream_request_closes_promptly_without_affecting_retry_policy(
+    tmp_path: Path,
+) -> None:
+    class PlannedCancellation(RuntimeError):
+        pass
+
+    request_started = threading.Event()
+    release_handler = threading.Event()
+
+    class SlowHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            request_started.set()
+            release_handler.wait(timeout=5)
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), SlowHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    cancelled = threading.Event()
+
+    def check_cancelled() -> None:
+        if cancelled.is_set():
+            raise PlannedCancellation("planned non-stream cancellation")
+
+    transport = ServiceTransport(
+        provider="test",
+        base_url=f"http://127.0.0.1:{server.server_port}",
+        credential=SecretStr("private-token"),
+        database=_database(tmp_path),
+        connect_timeout_seconds=1,
+        read_timeout_seconds=300,
+        max_retries=3,
+    )
+    timer = threading.Timer(0.15, cancelled.set)
+    started_at = time.monotonic()
+    timer.start()
+    try:
+        with pytest.raises(PlannedCancellation, match="non-stream cancellation"):
+            transport.request_json(
+                "POST",
+                "/operation",
+                operation="operation",
+                payload={"input": "test"},
+                request_attempts=3,
+                use_cache=True,
+                check_cancelled=check_cancelled,
+            )
+    finally:
+        timer.cancel()
+        release_handler.set()
+        transport.close()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=1)
+
+    assert request_started.is_set()
+    assert time.monotonic() - started_at < 1.5
+    with transport.database.connection() as connection:
+        calls = connection.execute(
+            "SELECT status, error_type FROM api_calls ORDER BY created_at"
+        ).fetchall()
+        cache_count = connection.execute("SELECT count(*) FROM api_cache").fetchone()[0]
+    assert [dict(row) for row in calls] == [
+        {"status": "cancelled", "error_type": "PlannedCancellation"}
+    ]
+    assert cache_count == 0
+
+
 def test_partial_sse_idle_timeout_is_quarantined_and_announced(tmp_path: Path) -> None:
     class PartialThenTimeout(httpx.SyncByteStream):
         def __iter__(self):
@@ -366,9 +517,57 @@ def test_partial_sse_idle_timeout_is_quarantined_and_announced(tmp_path: Path) -
         quarantined = connection.execute(
             "SELECT response_json FROM api_cache WHERE cache_key LIKE 'invalid:%'"
         ).fetchone()
-    diagnostic = json.loads(quarantined["response_json"])["stream_diagnostic"]
+    quarantined_payload = json.loads(quarantined["response_json"])
+    diagnostic = quarantined_payload["stream_diagnostic"]
     assert diagnostic["idle_timeout_seconds"] == 120
     assert diagnostic["content_chars"] == len("partial")
+    assert "partial" not in quarantined["response_json"]
+    assert "chunks" not in quarantined_payload
+
+
+def test_sse_keepalives_do_not_extend_valid_event_idle_timeout(tmp_path: Path) -> None:
+    class ValidChunkThenKeepalives(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+            for _ in range(4):
+                time.sleep(0.03)
+                yield b": keepalive\n\n"
+
+    events: list[dict] = []
+    transport = ServiceTransport(
+        provider="test",
+        base_url="https://example.invalid/v1",
+        credential=SecretStr("private-token"),
+        database=_database(tmp_path),
+        connect_timeout_seconds=1,
+        read_timeout_seconds=1,
+        max_retries=1,
+        http_client=httpx.Client(
+            base_url="https://example.invalid/v1",
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    stream=ValidChunkThenKeepalives(),
+                    request=request,
+                )
+            ),
+        ),
+    )
+
+    with pytest.raises(ExternalServiceError, match="became idle"):
+        transport.request_json(
+            "POST",
+            "/stream",
+            operation="stream",
+            payload={"stream": True},
+            request_timeout_seconds=1,
+            request_attempts=1,
+            stream_response=True,
+            stream_idle_timeout_seconds=0.05,
+            stream_event_callback=events.append,
+        )
+
+    assert events[-1] == {"_stream_event": "incomplete"}
 
 
 def test_sse_response_without_done_marker_is_rejected(tmp_path: Path) -> None:
@@ -462,13 +661,16 @@ def test_invalid_completed_stream_is_quarantined_and_retried(tmp_path: Path) -> 
             "SELECT operation, response_json FROM api_cache WHERE cache_key LIKE 'invalid:%'"
         ).fetchall()
     assert [row["operation"] for row in quarantined] == ["stream:invalid"]
-    diagnostic = json.loads(quarantined[0]["response_json"])["stream_diagnostic"]
+    quarantined_payload = json.loads(quarantined[0]["response_json"])
+    diagnostic = quarantined_payload["stream_diagnostic"]
     assert diagnostic == {
         "chunk_count": 1,
         "content_chars": 12,
         "finish_reason": "stop",
         "validation": "failed",
     }
+    assert '{"bad":true}' not in quarantined[0]["response_json"]
+    assert "chunks" not in quarantined_payload
 
 
 def test_sse_clean_eof_with_stop_and_complete_json_is_accepted(tmp_path: Path) -> None:

@@ -3,18 +3,27 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
 
 from PyQt6.QtCore import QItemSelectionModel, Qt
-from PyQt6.QtWidgets import QApplication, QScrollArea
+from PyQt6.QtWidgets import QApplication, QLineEdit, QScrollArea
 
 from tests.test_distill_pipeline import _persona
+from writing_factory.distill.fidelity_models import (
+    FidelityStageProgress,
+    encode_fidelity_progress,
+)
 from writing_factory.distill.serialization import render_persona_markdown
 from writing_factory.kb.models import FusedHit, IngestResult, RetrievalResult
+from writing_factory.llm.configuration import STEP_DEFINITIONS
 from writing_factory.llm.models import ChatResult, TokenUsage
+from writing_factory.ui.help_ui import PageHelpDialog
 from writing_factory.ui.main_window import MainWindow
+from writing_factory.ui.quality_steps_help import QUALITY_STEP_HELP, QualityStepsHelpDialog
+from writing_factory.ui.settings_dialogs import ProviderSettingsDialog, StepSettingsDialog
 
 
 def test_connection_button_runs_check_in_background(qtbot) -> None:
@@ -69,6 +78,133 @@ def test_settings_page_persists_global_siliconflow_request_timeout(qtbot) -> Non
     assert changed == [1500]
 
 
+def test_settings_page_persists_total_budget_and_stream_idle_timeout(qtbot) -> None:
+    total_changed: list[int] = []
+    idle_changed: list[int] = []
+    window = MainWindow(
+        lambda: ChatResult(content="OK", model="test"),
+        get_siliconflow_total_timeout=lambda: 2400,
+        set_siliconflow_total_timeout=total_changed.append,
+        get_siliconflow_stream_idle_timeout=lambda: 150,
+        set_siliconflow_stream_idle_timeout=idle_changed.append,
+    )
+    qtbot.addWidget(window)
+
+    assert window.siliconflow_total_timeout_input.value() == 2400
+    assert window.siliconflow_stream_idle_timeout_input.value() == 150
+    window.siliconflow_total_timeout_input.setValue(3000)
+    window.siliconflow_stream_idle_timeout_input.setValue(180)
+
+    assert total_changed == [3000]
+    assert idle_changed == [180]
+
+
+def test_settings_page_persists_author_chat_recent_rounds(qtbot) -> None:
+    changed: list[int] = []
+    window = MainWindow(
+        lambda: ChatResult(content="OK", model="test"),
+        get_author_chat_recent_rounds=lambda: 6,
+        set_author_chat_recent_rounds=changed.append,
+    )
+    qtbot.addWidget(window)
+
+    assert window.settings_page.chat_recent_rounds_input.value() == 6
+    window.settings_page.chat_recent_rounds_input.setValue(8)
+
+    assert changed == [8]
+
+
+def test_settings_page_persists_shared_bocha_result_count(qtbot) -> None:
+    changed: list[int] = []
+    window = MainWindow(
+        lambda: ChatResult(content="OK", model="test"),
+        get_web_search_result_count=lambda: 5,
+        set_web_search_result_count=changed.append,
+    )
+    qtbot.addWidget(window)
+
+    assert window.settings_page.web_result_count_input.value() == 5
+    window.settings_page.web_result_count_input.setValue(8)
+
+    assert changed == [8]
+
+
+def test_settings_page_lists_all_steps_and_independent_editors(qtbot) -> None:
+    window = MainWindow(lambda: ChatResult(content="OK", model="test"))
+    qtbot.addWidget(window)
+    page = window.settings_page
+
+    assert sum(table.rowCount() for table in page.step_tables.values()) == len(STEP_DEFINITIONS)
+    summary_header = page.step_tables["distill"].horizontalHeaderItem(1).text()
+    assert summary_header.startswith("设置摘要\n温度")
+    assert "思考｜强度" in summary_header
+    assert "上限｜请求｜重试｜单次｜总预算" in summary_header
+    assert page.model_value_labels["embedding"].text() == "BAAI/bge-m3"
+    assert page.model_value_labels["reranker"].text() == "BAAI/bge-reranker-v2-m3"
+
+    definition = next(item for item in STEP_DEFINITIONS if item.step_id == "writing.draft")
+    step_dialog = StepSettingsDialog(
+        page.backend,
+        definition,
+        on_changed=page.refresh,
+        parent=page,
+    )
+    qtbot.addWidget(step_dialog)
+    step_dialog.temperature_input.setValue(0.9)
+    step_dialog.thinking_combo.setCurrentIndex(step_dialog.thinking_combo.findData(True))
+    step_dialog.effort_combo.setCurrentIndex(step_dialog.effort_combo.findData("max"))
+    step_dialog.max_tokens_input.setValue(12288)
+    step_dialog.stream_checkbox.setChecked(False)
+    step_dialog.retry_input.setValue(4)
+    step_dialog.timeout_input.setValue(1800)
+    step_dialog.total_timeout_input.setValue(4200)
+    step_dialog._save()
+
+    saved = page.backend.get_step_config("writing.draft")
+    assert saved.temperature == 0.9
+    assert saved.thinking is True
+    assert saved.reasoning_effort == "max"
+    assert saved.max_tokens == 12288
+    assert not saved.stream
+    assert saved.retry_count == 4
+    assert saved.timeout_seconds == 1800
+    assert saved.total_timeout_seconds == 4200
+
+    provider_dialog = ProviderSettingsDialog(page.backend, "siliconflow", page)
+    qtbot.addWidget(provider_dialog)
+    assert provider_dialog.secret_input.echoMode() == QLineEdit.EchoMode.Password
+    provider_dialog.secret_input.setText("local-test-secret")
+    provider_dialog.base_url_input.setText("https://example.invalid/v1")
+    provider_dialog._save()
+    snapshot = page.backend.provider_snapshot("siliconflow")
+    assert snapshot["configured"] is True
+    assert snapshot["base_url"] == "https://example.invalid/v1"
+
+
+def test_settings_credentials_help_explains_api_signup_and_allows_its_links(qtbot) -> None:
+    window = MainWindow(lambda: ChatResult(content="OK", model="test"))
+    qtbot.addWidget(window)
+    page = window.settings_page
+    dialog = PageHelpDialog("credentials", page)
+    qtbot.addWidget(dialog)
+
+    html = dialog.browser.toHtml()
+    plain_text = dialog.browser.toPlainText()
+    assert page.credentials_help_button.accessibleName() == "API 获取与配置帮助"
+    assert page.credentials_help_button.toolTip() == "查看API 获取与配置功能介绍和操作教程"
+    assert dialog.browser.openExternalLinks()
+    assert "https://cloud.siliconflow.cn/i/j7F36Uco" in html
+    assert "https://mineru.net/" in html
+    assert "https://open.bochaai.com/" in html
+    assert "以 sk- 开头" in plain_text
+    assert "API 密钥和 Token 相当于账号密码" in plain_text
+    assert "每次联网检索条目数" in plain_text
+
+    ordinary_help = PageHelpDialog("settings", page)
+    qtbot.addWidget(ordinary_help)
+    assert not ordinary_help.browser.openExternalLinks()
+
+
 def test_writing_page_previews_isolated_target_sources_and_uses_scroll_regions(qtbot) -> None:
     documents = [
         {"doc_id": "target_a", "filename": "目标一.pdf"},
@@ -99,6 +235,10 @@ def test_writing_page_previews_isolated_target_sources_and_uses_scroll_regions(q
         page.document_list.item(index).setCheckState(Qt.CheckState.Checked)
 
     assert page.source_summary_label.text() == "已选 3 篇 · 隔离 2 篇 · 实际可用 1 篇"
+    document_row, _role = page.config_layout.getWidgetPosition(page.document_list)
+    summary_row, _role = page.config_layout.getWidgetPosition(page.source_summary_label)
+    isolation_row, _role = page.config_layout.getWidgetPosition(page.allow_persona_sources)
+    assert document_row < summary_row < isolation_row
     assert page.start_button.isEnabled()
     assert page.main_splitter.orientation() == Qt.Orientation.Horizontal
     assert page.main_splitter.widget(0) is page.history_scroll
@@ -109,7 +249,18 @@ def test_writing_page_previews_isolated_target_sources_and_uses_scroll_regions(q
     assert page.document_list.minimumHeight() >= 180
     assert page.task_table.maximumHeight() > 1000
     assert page.section_table.maximumHeight() > 1000
-    window.navigation.setCurrentRow(3)
+    conceptual_index = page.evidence_mode_combo.findData("conceptual_only")
+    page.evidence_mode_combo.setCurrentIndex(conceptual_index)
+    assert page.source_summary_label.text().startswith("无事实构思")
+    assert not page.document_list.isEnabled()
+    assert not page.allow_persona_sources.isEnabled()
+    assert not page.citation_display_combo.isEnabled()
+    assert page.start_button.isEnabled()
+    assert page._generation_options().evidence_mode == "conceptual_only"
+    page.evidence_mode_combo.setCurrentIndex(
+        page.evidence_mode_combo.findData("knowledge_grounded")
+    )
+    window.navigation.setCurrentRow(4)
     window.resize(960, 640)
     window.show()
     qtbot.waitUntil(
@@ -120,8 +271,10 @@ def test_writing_page_previews_isolated_target_sources_and_uses_scroll_regions(q
     assert page.progress_tabs.isVisible()
     page._pipeline_streamed("content", "实时内容")
     qtbot.waitUntil(
-        lambda: page.progress_scroll.verticalScrollBar().value()
-        == page.progress_scroll.verticalScrollBar().maximum(),
+        lambda: (
+            page.progress_scroll.verticalScrollBar().value()
+            == page.progress_scroll.verticalScrollBar().maximum()
+        ),
         timeout=2000,
     )
 
@@ -132,6 +285,15 @@ def test_writing_page_previews_isolated_target_sources_and_uses_scroll_regions(q
     page.allow_persona_sources.setChecked(True)
     assert page.source_summary_label.text() == "已选 2 篇 · 隔离 0 篇 · 实际可用 2 篇"
     assert page.start_button.isEnabled()
+
+    for index in range(page.document_list.count()):
+        page.document_list.item(index).setCheckState(Qt.CheckState.Unchecked)
+    page.allow_persona_sources.setChecked(False)
+    assert not page.start_button.isEnabled()
+    page.web_search_checkbox.setChecked(True)
+    assert "已启用联网检索" in page.source_summary_label.text()
+    assert page.start_button.isEnabled()
+    assert page._generation_options().use_web_search
 
 
 def test_loading_checkpoint_tracks_current_section(qtbot) -> None:
@@ -173,6 +335,140 @@ def test_loading_checkpoint_tracks_current_section(qtbot) -> None:
 
     assert page._current_section_index == 1
     assert page.section_table.currentRow() == 1
+
+
+def test_selecting_history_task_loads_only_its_persisted_outputs(qtbot) -> None:
+    records = [
+        {
+            "task_id": "done_task",
+            "title": "测试：段落",
+            "status": "done",
+            "updated_at": "2026-07-14T15:44:06+00:00",
+        },
+        {
+            "task_id": "partial_task",
+            "title": "摘要：数字出版研究综述",
+            "status": "running",
+            "updated_at": "2026-07-14T14:45:51+00:00",
+        },
+        {
+            "task_id": "empty_task",
+            "title": "尚未起草",
+            "status": "running",
+            "updated_at": "2026-07-14T14:40:00+00:00",
+        },
+    ]
+    polished_section = json.dumps(
+        {
+            "section_id": "1",
+            "heading": "已经完成的第一节",
+            "polished_text": "这是摘要任务已经持久化的部分正文。",
+        },
+        ensure_ascii=False,
+    )
+    states = {
+        "done_task": {
+            "status": "done",
+            "sections": [],
+            "final_draft_json": json.dumps(
+                {
+                    "title": "旧任务成稿",
+                    "sections": [{"heading": "", "polished_text": "旧任务正文"}],
+                },
+                ensure_ascii=False,
+            ),
+            "outline_json": json.dumps(
+                {"root_nodes": [{"heading": "旧任务规划", "children": []}]},
+                ensure_ascii=False,
+            ),
+            "reference_list_json": json.dumps(
+                {"style": "gb-t-7714", "items": [{"citation_text": "旧任务来源"}]},
+                ensure_ascii=False,
+            ),
+        },
+        "partial_task": {
+            "status": "drafting",
+            "sections": [
+                {
+                    "section_id": "1",
+                    "heading": "第一节",
+                    "status": "polished",
+                    "polished_section_json": polished_section,
+                }
+            ],
+        },
+        "empty_task": {"status": "drafting", "sections": []},
+    }
+    evaluations = {
+        "done_task": {"traceability": 1.0, "judge_rationale": "旧任务评估"},
+    }
+    loads: list[str] = []
+    saved: list[tuple[str, str, str]] = []
+
+    def load_task(task_id: str):
+        loads.append(task_id)
+        record = next(item for item in records if item["task_id"] == task_id)
+        return {
+            **record,
+            "task_description": "测试要求",
+            "domain": "",
+            "selected_doc_ids": set(),
+            "allowed_persona_doc_ids": set(),
+            "generation_options": {},
+            "state": states[task_id],
+            "evaluation": evaluations.get(task_id),
+        }
+
+    window = MainWindow(
+        lambda: ChatResult(content="OK", model="test"),
+        list_projects=lambda: [{"project_id": "project", "title": "项目"}],
+        list_writing_tasks=lambda _project_id: records,
+        load_writing_task=load_task,
+        save_edited_draft=lambda task_id, draft, outline: saved.append((task_id, draft, outline)),
+    )
+    qtbot.addWidget(window)
+    page = window.writing_task_page
+    page.workspace_tabs.setCurrentIndex(page._results_workspace_index)
+
+    page.task_table.selectRow(0)
+
+    assert loads == ["done_task"]
+    assert "旧任务正文" in page._draft_view.toPlainText()
+    assert "旧任务规划" in page._outline_view.toPlainText()
+    assert "旧任务来源" in page._ref_view.toPlainText()
+    assert "旧任务评估" in page._eval_view.toPlainText()
+    assert page.workspace_tabs.currentIndex() == page._results_workspace_index
+    assert page.results_group.title() == "写作结果 · 测试：段落"
+
+    page.task_table.selectRow(1)
+
+    assert loads == ["done_task", "partial_task"]
+    assert "摘要任务已经持久化" in page._draft_view.toPlainText()
+    assert "旧任务正文" not in page._draft_view.toPlainText()
+    assert page._outline_view.toPlainText() == ""
+    assert page._ref_view.toPlainText() == ""
+    assert page._eval_view.toPlainText() == ""
+    assert page.results_group.title() == "写作结果 · 摘要：数字出版研究综述"
+
+    page.task_table.selectRow(2)
+
+    assert loads == ["done_task", "partial_task", "empty_task"]
+    assert page._draft_view.toPlainText() == ""
+    assert page._draft_view.placeholderText() == "该任务尚未生成正文"
+    assert page._writing_task_id == "empty_task"
+    assert page._displayed_task_id == "empty_task"
+    assert page.save_draft_button.isEnabled()
+
+    page._draft_view.setPlainText("新任务人工稿")
+    page._save_draft()
+    assert saved == [("empty_task", "新任务人工稿", "")]
+
+    _select_additional_row(page.task_table, 0)
+    assert not page.save_draft_button.isEnabled()
+    page._displayed_task_id = "done_task"
+    page._save_draft()
+    assert saved == [("empty_task", "新任务人工稿", "")]
+    assert "任务标识不一致" in window.statusBar().currentMessage()
 
 
 def test_project_and_writing_times_display_as_east_eight(qtbot) -> None:
@@ -232,6 +528,101 @@ def test_writing_failure_refreshes_history_without_green_full_progress(qtbot) ->
     assert "#b42318" in page.progress_bar.styleSheet()
 
 
+def test_writing_cancellation_discards_current_call_but_keeps_completed_output(qtbot) -> None:
+    window = MainWindow(lambda: ChatResult(content="OK", model="test"))
+    qtbot.addWidget(window)
+    page = window.writing_task_page
+    page._pipeline_streamed("content::完整调用", "已经完整完成")
+    page._pipeline_streamed("complete::完整调用", "done")
+    page._pipeline_streamed("content::当前调用", "不应保留的残片")
+
+    page._pipeline_failed("任务已取消")
+
+    text = page.live_output_view.toPlainText()
+    assert "已经完整完成" in text
+    assert "不应保留的残片" not in text
+    assert "当前不完整输出未保存" in text
+    assert page.progress_bar.format() == "已停止 · %p%"
+    assert page.status_label.text() == "已停止 · 当前不完整输出未保存"
+
+
+def test_writing_failure_focuses_failed_stage_and_keeps_reason(qtbot) -> None:
+    window = MainWindow(lambda: ChatResult(content="OK", model="test"))
+    qtbot.addWidget(window)
+    page = window.writing_task_page
+    page._pipeline_streamed("content::内容单元起草 · 第三节", "不完整草稿残片")
+
+    page._pipeline_streamed(
+        "error::内容单元起草 · 第三节",
+        "SectionDraft 缺少合法 source_key",
+    )
+    page._pipeline_failed("SectionDraft 缺少合法 source_key")
+
+    text = page.live_output_view.toPlainText()
+    assert page.workspace_tabs.currentIndex() == page._progress_workspace_index
+    assert page.progress_tabs.currentWidget() is page.live_output_view.parentWidget()
+    assert "不完整草稿残片" not in text
+    assert "[失败原因] SectionDraft 缺少合法 source_key" in text
+    assert page.progress_bar.format() == "失败 · %p%"
+
+
+def test_writing_retry_discards_only_the_failed_attempt_fragment(qtbot) -> None:
+    window = MainWindow(lambda: ChatResult(content="OK", model="test"))
+    qtbot.addWidget(window)
+    page = window.writing_task_page
+    stage = "内容单元起草 · 第三节"
+    page._pipeline_streamed(f"content::{stage}", "第一次不完整片段")
+
+    page._pipeline_streamed(
+        f"attempt_reset::{stage}",
+        "第 1/2 次流式尝试未完整结束：连接停滞",
+    )
+    page._pipeline_streamed(f"content::{stage}", "第二次完整内容")
+
+    text = page.live_output_view.toPlainText()
+    assert "第一次不完整片段" not in text
+    assert "第 1/2 次流式尝试未完整结束" in text
+    assert "第二次完整内容" in text
+
+
+def test_author_chat_retry_discards_partial_answer_and_shows_attempt_reason(qtbot) -> None:
+    window = MainWindow(lambda: ChatResult(content="OK", model="test"))
+    qtbot.addWidget(window)
+    page = window.author_chat_page
+    page.transcript.start_turn("测试问题", "测试作者")
+    page.transcript.append_stream("第一次不完整回答")
+    page.transcript.flush_stream()
+
+    page._streamed(
+        "attempt_reset::作者对话回答",
+        "第 1/2 次流式尝试未完整结束：连接停滞",
+    )
+
+    assert "第一次不完整回答" not in page.transcript.toPlainText()
+    assert "第 1/2 次流式尝试未完整结束" in page.progress_label.text()
+
+
+def test_cancelled_persona_is_presented_as_unfinished(qtbot) -> None:
+    window = MainWindow(
+        lambda: ChatResult(content="OK", model="test"),
+        list_personas=lambda: [
+            {
+                "persona_id": "cancelled_persona",
+                "name": "未完成作者",
+                "mode": "person",
+                "status": "failed",
+                "error_type": "TaskCancelled",
+            }
+        ],
+        resume_persona=lambda _persona_id, _context: None,
+    )
+    qtbot.addWidget(window)
+
+    assert window.persona_page.profile_table.item(0, 4).text() == "未完成"
+    window.persona_page.profile_table.selectRow(0)
+    assert window.persona_page.continue_button.isEnabled()
+
+
 def test_writing_page_shows_elapsed_time_and_public_stream_only(qtbot) -> None:
     window = MainWindow(lambda: ChatResult(content="OK", model="test"))
     qtbot.addWidget(window)
@@ -287,7 +678,7 @@ def test_live_output_popout_shares_document_and_controls(qtbot) -> None:
 def test_inline_live_output_respects_disabled_auto_scroll(qtbot) -> None:
     window = MainWindow(lambda: ChatResult(content="OK", model="test"))
     qtbot.addWidget(window)
-    window.navigation.setCurrentRow(3)
+    window.navigation.setCurrentRow(4)
     page = window.writing_task_page
     page.workspace_tabs.setCurrentIndex(page._progress_workspace_index)
     page.progress_tabs.setCurrentIndex(page._live_output_tab_index)
@@ -324,16 +715,41 @@ def test_writing_quality_presets_and_automatic_length_detection(qtbot) -> None:
     window = MainWindow(lambda: ChatResult(content="OK", model="test"))
     qtbot.addWidget(window)
     page = window.writing_task_page
+    assert [checkbox.text() for checkbox in page._quality_checkboxes] == [
+        "HyDE",
+        "查询改写",
+        "选题锐化",
+        "内容规划",
+        "事实核验",
+        "单元打磨",
+        "打磨防漂移",
+        "术语审查",
+        "结构审查",
+        "全局打磨",
+        "全局防漂移",
+    ]
+    for index, checkbox in enumerate(page._quality_checkboxes):
+        layout_index = page.quality_grid.indexOf(checkbox)
+        row, column, _row_span, _column_span = page.quality_grid.getItemPosition(layout_index)
+        assert (row, column) == (index // 3, index % 3)
+    assert all(checkbox.isChecked() for checkbox in page._quality_checkboxes)
+
+    page.quality_preset_combo.setCurrentIndex(page.quality_preset_combo.findData("balanced"))
+    assert all(checkbox.isChecked() for checkbox in page._quality_checkboxes[:5])
+    assert all(not checkbox.isChecked() for checkbox in page._quality_checkboxes[5:])
+
     page.task_input.setPlainText("写一篇1500字左右的数字出版综述")
     page.target_length_spin.setValue(0)
-    page.quality_preset_combo.setCurrentIndex(
-        page.quality_preset_combo.findData("fast_draft")
-    )
+    page.quality_preset_combo.setCurrentIndex(page.quality_preset_combo.findData("fast_draft"))
 
     options = page._generation_options()
 
     assert options.target_length_chars == 1500
     assert options.document_form == "short_text"
+    assert not options.use_hyde
+    assert not options.use_query_rewrite
+    assert not options.topic_refinement
+    assert not options.framework_generation
     assert not options.fact_verification
     assert not options.section_polish
     assert all(not checkbox.isEnabled() for checkbox in page._quality_checkboxes)
@@ -345,6 +761,21 @@ def test_writing_quality_presets_and_automatic_length_detection(qtbot) -> None:
     assert custom.preset == "custom"
     assert custom.fact_verification
     assert not custom.section_polish
+
+    page._set_generation_options(
+        {
+            **custom.model_dump(mode="json"),
+            "use_hyde": False,
+            "use_query_rewrite": True,
+            "topic_refinement": False,
+            "framework_generation": True,
+        }
+    )
+    restored = page._generation_options()
+    assert not restored.use_hyde
+    assert restored.use_query_rewrite
+    assert not restored.topic_refinement
+    assert restored.framework_generation
 
     page.document_form_combo.setCurrentIndex(page.document_form_combo.findData("auto"))
     page.target_length_spin.setValue(0)
@@ -362,6 +793,19 @@ def test_writing_quality_presets_and_automatic_length_detection(qtbot) -> None:
     paper = page._generation_options()
     assert paper.document_form == "paper"
     assert paper.target_length_chars == 5000
+
+    page.genre_combo.setCurrentIndex(page.genre_combo.findData("auto"))
+    page.citation_display_combo.setCurrentIndex(
+        page.citation_display_combo.findData("internal_only")
+    )
+    page.task_input.setPlainText("面向社区居民写一篇演讲稿，介绍数字阅读服务")
+    speech = page._generation_options()
+    assert speech.genre == "speech"
+    assert speech.citation_display == "internal_only"
+
+    page.genre_combo.setCurrentIndex(page.genre_combo.findData("academic_paper"))
+    academic = page._generation_options()
+    assert academic.genre == "academic_paper"
 
 
 def test_pipeline_state_updates_sections_partial_draft_and_diagnostics(qtbot) -> None:
@@ -405,22 +849,40 @@ def test_pipeline_state_updates_sections_partial_draft_and_diagnostics(qtbot) ->
     assert page._resume_progress(state) > 14
 
 
-def test_settings_page_persists_retrieval_enhancement_switches(qtbot) -> None:
-    stored = {"use_hyde": False, "use_rewrite": True}
-    changed: list[tuple[str, bool]] = []
+def test_retrieval_enhancement_switches_are_task_scoped(qtbot) -> None:
     window = MainWindow(
         lambda: ChatResult(content="OK", model="test"),
-        get_retrieval_option=lambda key, default: stored.get(key, default),
-        set_retrieval_option=lambda key, value: changed.append((key, value)),
     )
     qtbot.addWidget(window)
 
-    assert not window.hyde_checkbox.isChecked()
-    assert window.rewrite_checkbox.isChecked()
-    window.hyde_checkbox.click()
-    window.rewrite_checkbox.click()
+    assert not hasattr(window, "hyde_checkbox")
+    assert not hasattr(window, "rewrite_checkbox")
+    assert window.writing_task_page.hyde_checkbox.isChecked()
+    assert window.writing_task_page.query_rewrite_checkbox.isChecked()
 
-    assert changed == [("use_hyde", True), ("use_rewrite", False)]
+
+def test_quality_steps_help_and_closed_combos_ignore_wheel(qtbot) -> None:
+    window = MainWindow(lambda: ChatResult(content="OK", model="test"))
+    qtbot.addWidget(window)
+    page = window.writing_task_page
+    dialog = QualityStepsHelpDialog(page)
+    qtbot.addWidget(dialog)
+
+    assert dialog.table.rowCount() == len(QUALITY_STEP_HELP) == 11
+    assert dialog.table.item(0, 0).text() == "HyDE"
+    assert dialog.table.item(10, 0).text() == "全局防漂移"
+    assert "预计耗时" == dialog.table.horizontalHeaderItem(2).text()
+    assert page.quality_help_button.accessibleName() == "质量步骤说明"
+
+    ignored = False
+
+    class FakeWheelEvent:
+        def ignore(self) -> None:
+            nonlocal ignored
+            ignored = True
+
+    page.project_combo.wheelEvent(FakeWheelEvent())  # type: ignore[arg-type]
+    assert ignored
 
 
 def test_document_import_updates_table_without_blocking(qtbot, tmp_path: Path) -> None:
@@ -630,10 +1092,11 @@ def test_persona_page_distills_checked_sources_in_background(qtbot) -> None:
     profiles: list[dict[str, object]] = []
     received: list[tuple[str, str, set[str]]] = []
 
-    def distill(name, mode, doc_ids, control_doc_ids, domain, context):
+    def distill(name, mode, doc_ids, control_doc_ids, domain, options, context):
         received.append((name, mode, doc_ids))
         assert control_doc_ids == set()
         assert domain == ""
+        assert options.preset == "balanced"
         context.report_progress(60, "归并")
         time.sleep(0.05)
         profiles.append(
@@ -666,21 +1129,71 @@ def test_persona_page_distills_checked_sources_in_background(qtbot) -> None:
     page = window.persona_page
     page.name_input.setText("叶芃")
 
+    assert "目标 6–12 篇" in page.corpus_recommendation_label.text()
+    assert "对照 4–8 篇同领域、同文体文本" in page.corpus_recommendation_label.text()
     assert page.distill_button.isEnabled()
     page.start_distillation()
     qtbot.waitUntil(lambda: page.profile_table.rowCount() == 1, timeout=2000)
 
     assert received == [("叶芃", "person", {"doc_one"})]
     assert page.profile_table.item(0, 1).text() == "叶芃"
-    assert page.profile_table.item(0, 5).text() == "3"
+    assert page.profile_table.item(0, 6).text() == "3"
     qtbot.waitUntil(lambda: window._tasks.active_count == 0, timeout=2000)
+
+
+def test_persona_page_stream_output_uses_side_workspace_and_task_can_stop(qtbot) -> None:
+    started = threading.Event()
+
+    def distill(_name, _mode, _docs, _controls, _domain, _options, context):
+        started.set()
+        context.report_stream("content::未完成 Map", "不应保留的残片")
+        while True:
+            context.check_cancelled()
+            time.sleep(0.01)
+
+    window = MainWindow(
+        lambda: ChatResult(content="OK", model="test"),
+        list_documents=lambda: [
+            {
+                "doc_id": "doc_one",
+                "filename": "论文.pdf",
+                "status": "ready",
+                "chunk_count": 4,
+            }
+        ],
+        distill_persona=distill,
+    )
+    qtbot.addWidget(window)
+    window.resize(960, 640)
+    window.show()
+    window.navigation.setCurrentRow(2)
+    page = window.persona_page
+    page.name_input.setText("待停止作者")
+
+    assert page.content_splitter.orientation() == Qt.Orientation.Horizontal
+    assert page.tables_splitter.orientation() == Qt.Orientation.Vertical
+    qtbot.mouseClick(page.distill_button, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(started.is_set, timeout=1000)
+
+    assert page.output_panel.isVisible()
+    assert page.source_table.isVisible()
+    assert page.profile_table.isVisible()
+    assert page.source_table.height() >= page.source_table.minimumHeight()
+    qtbot.mouseClick(page.stop_button, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: window._tasks.active_count == 0, timeout=2000)
+
+    assert not page.stop_button.isEnabled()
+    assert page.distill_button.isEnabled()
+    assert "蒸馏已停止" in window.statusBar().currentMessage()
+    assert "不应保留的残片" not in page.output_panel.output_view.toPlainText()
 
 
 def test_topic_mode_ignores_checked_control_sources_and_domain(qtbot) -> None:
     received: list[tuple[set[str], set[str], str]] = []
 
-    def distill(_name, _mode, doc_ids, control_doc_ids, domain, _context):
+    def distill(_name, _mode, doc_ids, control_doc_ids, domain, options, _context):
         received.append((doc_ids, control_doc_ids, domain))
+        assert options.preset == "balanced"
         return SimpleNamespace(persona=SimpleNamespace(mental_models=[1, 2, 3]))
 
     documents = [
@@ -741,11 +1254,64 @@ def test_persona_fidelity_check_runs_in_background_and_refreshes_score(qtbot) ->
     assert page.evaluate_button.isEnabled()
     qtbot.mouseClick(page.evaluate_button, Qt.MouseButton.LeftButton)
     assert not page.evaluate_button.isEnabled()
-    qtbot.waitUntil(lambda: page.profile_table.item(0, 6).text() == "88/100", timeout=2000)
+    qtbot.waitUntil(lambda: page.profile_table.item(0, 7).text() == "88/100", timeout=2000)
 
     assert received == ["persona_one"]
     assert page.evaluate_button.isEnabled()
     qtbot.waitUntil(lambda: window._tasks.active_count == 0, timeout=2000)
+
+
+def test_persona_fidelity_checkbox_resume_keeps_stage_times_and_failure(qtbot) -> None:
+    profiles = [
+        {
+            "persona_id": "persona_resume",
+            "name": "叶芃",
+            "mode": "person",
+            "status": "ready",
+            "model_count": 3,
+            "fidelity_score": None,
+            "fidelity_checkpoint_count": 2,
+            "research_date": "2026-07-12",
+        }
+    ]
+
+    def evaluate(_persona_id, context):
+        events = (
+            FidelityStageProgress("design", "restored", 61_000),
+            FidelityStageProgress("answer", "restored", 2_000),
+            FidelityStageProgress("judge", "started", 0),
+            FidelityStageProgress("judge", "failed", 3_000),
+        )
+        for percent, event in zip((32, 64, 68, 96), events, strict=True):
+            context.report_progress(percent, encode_fidelity_progress(event))
+        raise ValueError("中性评判返回结构不符合评分 Schema")
+
+    window = MainWindow(
+        lambda: ChatResult(content="OK", model="test"),
+        evaluate_persona=evaluate,
+        list_personas=lambda: profiles,
+    )
+    qtbot.addWidget(window)
+    window.show()
+    page = window.persona_page
+    assert page.profile_table.item(0, 7).text() == "未检 · 可续 2/3"
+
+    page.profile_table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+    assert page.evaluate_button.isEnabled()
+    assert page.evaluate_button.text() == "继续自检"
+    qtbot.mouseClick(page.evaluate_button, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: window._tasks.active_count == 0, timeout=2000)
+
+    index = page.output_panel.call_combo.findData("档案自检")
+    assert index >= 0
+    page.output_panel.call_combo.setCurrentIndex(index)
+    assert "[失败原因] 中性评判返回结构不符合评分 Schema" in (
+        page.output_panel.output_view.toPlainText()
+    )
+    timing = page.fidelity_timing_label.text()
+    assert "设计问题：已恢复 01:01" in timing
+    assert "盲测回答：已恢复 00:02" in timing
+    assert "中性评判：失败 00:03" in timing
 
 
 def _select_additional_row(table, row: int) -> None:

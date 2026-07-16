@@ -9,6 +9,7 @@ Iron law compliance:
 from __future__ import annotations
 
 import logging
+import re
 from typing import TYPE_CHECKING
 
 from writing_factory.generate.models import (
@@ -64,13 +65,15 @@ def assemble_reference_list(
             dedup[item.doc_id] = {
                 "source_keys": [],
                 "first_chunk_id": item.chunk_id,
+                "first_item": item,
             }
         dedup[item.doc_id]["source_keys"].append(item.source_key)
 
     # 4. Build formatted ReferenceItems
     items: list[ReferenceItem] = []
     for doc_id, info in dedup.items():
-        bib = bibs.get(doc_id)
+        first_item: EvidenceItem = info["first_item"]
+        bib = bibs.get(doc_id) or _web_bibliography(first_item)
         source_keys = info["source_keys"]
         # Sort source_keys naturally: [S1], [S2], [S10] → [S1], [S2], [S10]
         source_keys.sort(key=_source_key_sort_key)
@@ -87,6 +90,7 @@ def assemble_reference_list(
                 citation_text=citation_text,
                 doc_id=doc_id,
                 chunk_id=info["first_chunk_id"],
+                url=first_item.url,
             )
         )
 
@@ -94,6 +98,24 @@ def assemble_reference_list(
     items.sort(key=lambda ri: _source_key_sort_key(ri.source_key.split(",")[0].strip()))
 
     return ReferenceList(items=items, style=citation_style)
+
+
+def _web_bibliography(item: EvidenceItem):
+    """Build code-owned webpage metadata for CSL formatting."""
+
+    if item.source_type != "web" or not item.url:
+        return None
+    from writing_factory.kb.models import Bibliography
+
+    year_match = re.search(r"(?:19|20)\d{2}", item.date_published or "")
+    return Bibliography(
+        author=item.site_name or None,
+        title=item.title or "未命名网页",
+        year=int(year_match.group(0)) if year_match else None,
+        publisher_or_journal=item.site_name or None,
+        document_type="web",
+        extra={"url": item.url},
+    )
 
 
 def render_final_citation_markers(

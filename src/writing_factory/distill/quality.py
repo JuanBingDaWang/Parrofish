@@ -46,17 +46,37 @@ def run_static_quality_check(spec: PersonaSpec) -> StaticQualityReport:
         output_language = True
     except OutputLanguageError:
         output_language = False
-    model_validation = all(
-        (
-            model.academic_validation.eligible
-            if model.academic_validation is not None
-            else model.validation.passed
+    options = spec.distillation_options
+    if options.preset == "legacy":
+        model_validation = all(
+            (
+                model.academic_validation.eligible
+                if model.academic_validation is not None
+                else model.validation.passed
+            )
+            and len({item.doc_id for item in model.cross_domain_evidence}) >= 2
+            for model in spec.mental_models
         )
-        and len({item.doc_id for item in model.cross_domain_evidence}) >= 2
-        for model in spec.mental_models
-    )
+    elif options.cross_document_validation and spec.mode == "person":
+        model_validation = all(
+            model.academic_validation is not None
+            and model.academic_validation.eligible
+            and len({item.doc_id for item in model.cross_domain_evidence}) >= 2
+            for model in spec.mental_models
+        )
+    else:
+        model_validation = all(
+            len({item.doc_id for item in model.cross_domain_evidence}) >= 2
+            for model in spec.mental_models
+        )
     runtime = build_runtime_persona(spec).model_dump(mode="json")
     runtime_text = str(runtime)
+    source_doc_ids = {item.doc_id for item in spec.source_info}
+    composition_patterns = [
+        pattern
+        for profile in spec.composition_dna.genre_profiles
+        for pattern in profile.patterns
+    ] + list(spec.composition_dna.cross_genre_patterns)
     checks = {
         "mental_model_count": 3 <= len(spec.mental_models) <= 7,
         "triple_validation": model_validation,
@@ -67,6 +87,11 @@ def run_static_quality_check(spec: PersonaSpec) -> StaticQualityReport:
             for key in ("evidence_id", "chunk_id", "source_info", "research_context")
         ),
         "expression_fingerprint": spec.expression_dna.sentence_fingerprint.character_count > 0,
+        "composition_evidence_traceability": all(
+            evidence.doc_id in source_doc_ids
+            for pattern in composition_patterns
+            for evidence in pattern.evidence
+        ),
         "honest_boundaries": len(spec.declared_limits) >= 3,
         "source_transparency": bool(spec.source_info),
         "topic_divergence": spec.mode != "topic" or bool(spec.school_divergences),
@@ -81,6 +106,14 @@ def run_static_quality_check(spec: PersonaSpec) -> StaticQualityReport:
         warnings.append("人物模式来源文档少于 2 份，跨文档稳定性有限")
     if not spec.expression_dna.style_rules:
         warnings.append("表达风格规则为空，后续 Voice Check 风险较高")
+    if not spec.composition_dna.genre_profiles:
+        warnings.append("尚无可复用的谋篇 DNA；生成框架将仅依据任务和心智模型")
+    if not options.cross_document_validation:
+        warnings.append("本版本未运行跨文档复现与聚类，核心模型仅作为基础候选使用")
+    if not options.generative_validation:
+        warnings.append("本版本未运行留出语料生成力验证")
+    if not options.exclusivity_validation:
+        warnings.append("本版本未运行对照语料排他性验证，不宣称作者独特性")
     warnings.extend(
         f"信息不足（{gap.dimension}）：{gap.description}；{gap.unresolved_reason}"
         for gap in spec.information_gaps

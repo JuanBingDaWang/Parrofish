@@ -1,72 +1,193 @@
-# 写作工厂 2.0
+<div align="center">
 
-面向人文社科论文写作的本地桌面应用。阶段 0–8 已贯通：文档入库与混合检索、人物 / 主题 PersonaSpec 蒸馏、带事实硬门的五阶段写作循环、代码引用拼装、长文一致性、评估与注入防御，以及可恢复、可编辑的 PyQt6 项目工作流。
+<img src="src/writing_factory/assets/icons/parrofish-256.png" alt="Parrofish Logo" width="132" />
 
-## 开发环境
+# Parrofish
 
-- Python 3.12
-- `uv`
-- Windows / UTF-8
+**蒸馏作者的思维、谋篇与表达，结合本地知识库与可选联网检索完成可追溯的非虚构创作。**
 
-依赖源已在 `pyproject.toml` 固定为清华镜像。首次安装：
+把“作者怎样思考和表达”与“文章使用哪些事实和证据”严格分开。
+
+![Release](https://img.shields.io/badge/release-v0.1.1-167d6b?style=flat-square)
+![Platform](https://img.shields.io/badge/platform-Windows%20x64-2563eb?style=flat-square&logo=windows)
+![Python](https://img.shields.io/badge/Python-3.12-3776ab?style=flat-square&logo=python&logoColor=white)
+![PyQt](https://img.shields.io/badge/UI-PyQt6-41cd52?style=flat-square)
+[![License](https://img.shields.io/badge/license-GPL--3.0--or--later-1f2937?style=flat-square)](LICENSE)
+
+[下载 Windows 版](../../releases/latest) · [快速开始](#快速开始) · [可信写作边界](#可信写作边界)
+
+</div>
+
+> [!IMPORTANT]
+> 当前 `v0.1.1` 面向 Windows 10/11 x64。Parrofish 不是离线模型：文档解析使用 MinerU，文字生成、向量化和重排使用 SiliconFlow；可选联网检索使用博查 Web Search API。调用可能产生对应服务的额度消耗。
+
+## Parrofish 是什么
+
+Parrofish 是一个面向研究者、编辑、评论者和专业内容创作者的桌面应用。它支持学术论文、研究报告、政策简报、评论、书评、科普、演讲、公众文章、新闻分析、教程、摘要，以及用户明确指定的其他非虚构文本。
+
+它不是一个只会模仿语气的“仿写器”，也不是把资料一次性塞进提示词的聊天壳。Parrofish 将创作拆成两条彼此隔离的通道：
+
+- **作者档案负责形式**：怎样提出问题、组织论证、安排结构、转换段落和选择表达。
+- **事实通道负责内容**：本地知识库与用户明确启用的联网检索决定文章可以使用哪些事实、证据和引用。
+
+作者与事实通道只在写作流水线中汇合。作者语料默认不能充当新任务的事实来源，蒸馏证据锚点也不会混入生成上下文；未勾选联网时不会发起博查请求。
+
+## 界面预览
+
+<table>
+<tr>
+<td width="50%"><img src="docs/images/knowledge-base.png" alt="Parrofish 知识库页面" /><br><sub>知识库：批量入库、混合检索与来源定位</sub></td>
+<td width="50%"><img src="docs/images/author-profile.png" alt="Parrofish 作者档案页面" /><br><sub>作者档案：目标/对照语料、人物/主题蒸馏与版本管理</sub></td>
+</tr>
+<tr>
+<td width="50%"><img src="docs/images/author-chat.png" alt="Parrofish 作者对话页面" /><br><sub>作者对话：可选知识库与联网检索、流式 Markdown、历史摘要</sub></td>
+<td width="50%"><img src="docs/images/writing-task.png" alt="Parrofish 写作任务页面" /><br><sub>写作任务：文体、篇幅、本地/联网事实来源和质量步骤均可配置</sub></td>
+</tr>
+</table>
+
+## 核心能力
+
+| 模块 | 能力 |
+|---|---|
+| 本地知识库 | 批量导入 PDF、Word、PPT 和 UTF-8 TXT；保留页码、章节、字符区间与父子切片；使用向量检索、BM25/jieba、RRF 和 rerank 组合检索。 |
+| 可选联网检索 | 作者对话和写作任务可按次启用博查 Web Search；结果保留标题、URL、站点与发布时间，未勾选时完全不调用。 |
+| 作者蒸馏 | 从多篇目标语料提炼心智模型、表达 DNA 与跨文档规律；支持四种质量模式、精确续跑、增量升级、对照语料、留出检验、矛盾保留和信息不足重判。 |
+| 谋篇 DNA | 按文体分析全文、章节、段落、句群和过渡五个尺度，不把论文、演讲、评论等平均成同一个固定模板。 |
+| 专业写作 | 支持知识库事实写作与 0 语料的无事实构思；按“创作意图 → 内容规划 → 证据锁定与起草 → 中性核对 → 文风打磨 → 全局一致性”生成可编辑稿件。 |
+| 事实与引用 | 事实论断必须绑定本地文档或联网网页来源；核对不通过则修订或终止；参考文献由代码按 GB/T 7714 拼装，而不是让模型手写。 |
+| 作者对话 | 固定作者档案版本进行探索性对话；默认以通用知识辅助作者认知与表达，也可切换严格证据；支持可选知识库、联网检索、流式 Markdown、会话历史与滚动摘要。 |
+| 可恢复任务 | 蒸馏 Map、结构画像、内容单元、核对结果和聊天消息逐步持久化；长任务失败后可从已完成断点继续。 |
+| 可观测配置 | 实时查看模型流式输出和当前步骤耗时；统一设置并发、超时与模型，并可单独配置每个文字生成步骤。 |
+
+## 工作流
+
+```mermaid
+flowchart LR
+    A[作者目标语料] --> B[Map / Reduce 蒸馏]
+    B --> C[完整审计档案]
+    C --> D[无证据运行时投影]
+
+    E[事实资料] --> F[MinerU 解析与结构化切片]
+    F --> G[向量 + BM25 双索引]
+    G --> H[混合检索与重排]
+
+    N[博查联网检索] --> O[网页标题 / URL / 摘要]
+
+    D --> I[写作流水线]
+    H --> I
+    O --> I
+    I --> J[逐单元起草]
+    J --> K[中性事实核对]
+    K --> L[文风打磨与一致性检查]
+    L --> M[可编辑稿件 + 可追溯引用]
+```
+
+## 快速开始
+
+### 普通用户
+
+1. 在 [Releases](../../releases/latest) 下载 `Parrofish-Setup-<版本>-x64.exe`。
+2. 运行安装程序。Parrofish 按用户安装，不需要管理员权限，卸载时会保留用户数据。
+3. 打开“设置”，配置 SiliconFlow API 与 MinerU API；需要联网检索时再配置博查 API。
+4. 在“知识库”批量导入事实资料，等待状态变为“可检索”。
+5. 如需使用作者模型，在“作者档案”选择目标语料和可选对照语料后运行蒸馏。
+6. 使用“作者对话”探索问题，或在“写作任务”中创建可恢复的正式创作任务；按需勾选博查联网检索。
+
+发行页同时提供以下文件：
+
+| 文件 | 用途 |
+|---|---|
+| `Parrofish-Setup-<版本>-x64.exe` | 推荐给普通用户的安装版；应用程序不显示控制台窗口。 |
+| `Parrofish-Portable-<版本>-x64.zip` | 解压后运行 `Parrofish.exe` 的免安装版。 |
+| `Parrofish-Source-<版本>.zip` | 对应版本的干净源码包。 |
+| `SHA256SUMS.txt` | 用于核对下载文件完整性。 |
+
+### API 获取
+
+- [SiliconFlow 注册入口](https://cloud.siliconflow.cn/i/j7F36Uco)：注册并登录后进入“API 密钥”，创建并复制以 `sk-` 开头的密钥。
+- [MinerU 官网](https://mineru.net/)：登录后进入“API → API 管理”，创建并复制 Token。
+- [博查 AI 开放平台](https://open.bochaai.com/)：注册并进入控制台创建 API Key；只有任务中勾选联网时才会调用。
+
+密钥请只粘贴到 Parrofish 设置页。软件通过系统凭据库保存密钥，不会把它们写入普通配置文件；不要在 Issue、日志或截图中公开密钥。
+
+## 从源码运行
+
+### 环境要求
+
+- Windows 10/11 x64
+- Python `3.12`
+- [`uv`](https://docs.astral.sh/uv/)
+
+项目已经配置清华 PyPI 镜像。在仓库根目录执行：
 
 ```powershell
 uv sync --all-groups --index-url https://pypi.tuna.tsinghua.edu.cn/simple
-```
-
-项目根目录的 `key_test.txt` 使用两行原始 token：第一行为 SiliconFlow API key，第二行为 MinerU API token。该文件已被 Git 忽略。生产环境可改用 `SILICONFLOW_API_KEY` 和 `MINERU_API_TOKEN` 环境变量。
-
-## 运行
-
-```powershell
 uv run writing-factory
 ```
 
-知识库页支持一次多选 PDF、Word、PPT 和 UTF-8 TXT，并在单个后台任务中按顺序入库，避免并发占用 MinerU 配额。PDF/Word/PPT 通过 MinerU 解析，TXT 使用本地兜底 loader；导入文件会复制到内容寻址的本地托管目录。当前按文件名生成默认书目标题，不弹出书目确认对话框。
-
-作者档案页可分别勾选目标语料和可选的同领域对照语料，运行可恢复的两级学术蒸馏：切片 Map 先按论文归并，再做跨论文聚类、留出生成力检验和对照排他性检验。同一批语料只生成一个顶层档案，新蒸馏结果作为版本保存。核心列表保留 3–7 个模型并优先选择作者个性化模型；通用模型仅在不足 3 个时补位，其余进入“通用学术惯例”，部分通过验证的候选确定性降级为启发式。表达统计由本地代码计算，矛盾与信息不足不会被自动补造。付费的 Nüwa 保真度自检只在用户点击“自检”后运行，并由独立的出题、作答和中性评分调用组成。
-
-双击档案可查看和编辑完整审计 JSON、Markdown、无证据运行时投影及版本历史。生成阶段只允许使用运行时投影，蒸馏证据锚点和旧论文来源不会随作者模型传入；若写作任务没有明确授权，作者语料也会从新任务事实来源中排除。设置页的 SiliconFlow 最大并发数统一约束 chat、embedding 和 rerank 请求，并持久化到本地 SQLite。
-
-运行数据位于被 Git 忽略的 `data/`：SQLite 保存规范文本、精确字符区间、蒸馏断点和 PersonaSpec，LanceDB 保存 bge-m3 向量，BM25 在启动或语料变化后通过 SQLite 文本和 jieba 分词确定性重建。长推理调用通过统一客户端读取 SSE 流，并在每个 Map 单元完成后立即提交断点。
-
-知识库页底部提供非阻塞的检索测试面板。阶段 3 默认并发执行查询改写与 HyDE，将原查询、去重后的子查询和 HyDE 文本合并成一次 embedding 批请求；随后对 bge-m3 与 BM25/jieba 的多路结果累计 RRF，扩展父级上下文，再用 bge-reranker-v2-m3 重排。元数据过滤在 SQLite 先解析成统一的允许范围，同时约束稠密与稀疏检索。返回父块时始终保留精确的 `matched_child_ids`，供后续事实核对和引用拼装回到原始小块。知识库内容变化会改变检索缓存指纹，不会复用旧结果。查询改写与 HyDE 可在设置页分别关闭，所有 SiliconFlow 调用仍受同一个全局并发数约束。
-
-项目页用于创建和管理论文项目。写作任务页选择项目、作者档案和本任务事实语料后启动生成；作者蒸馏语料默认从事实白名单排除，确需引用时必须显式开启复用选项。流水线按“选题 → 框架 → 逐节证据锁定与起草 → 中性核对 → 文风打磨 → 全局一致性”运行，每个 `fact` 论断必须绑定本节真实 child chunk 和正文引用标记。核对存在 `partial` 或 `unsupported` 时会循环修订，达到上限仍不通过则终止，不会进入成稿。
-
-每个任务使用独立 LangGraph SQLite checkpoint，并在业务数据库保存配置、状态、成稿和评估结果。停止任务后可从项目任务列表继续；双击任务可载入结果，论文和提纲允许人工编辑并保存。参考文献只收集正文实际使用且核对通过的来源，通过 citeproc-py 按 GB/T 7714 生成。
-
-评估页同时给出代码计算的引用可溯性、幻觉率、证据上下文忠实度和中立 LLM Judge 结果。检索文本进入任何生成 prompt 前先经过注入检测，并始终位于明确的数据边界内；检测或评估服务失败时按失败闭合处理，不会伪装成安全或合格结果。
-
-## 测试
+运行离线测试：
 
 ```powershell
 uv run pytest
 ```
 
-真实 SiliconFlow smoke test 默认跳过，显式启用：
+真实 SiliconFlow、MinerU 与博查集成测试默认跳过，只有显式设置对应的 `RUN_LIVE_*` 环境变量后才会调用远程服务和消耗额度。
 
-```powershell
-$env:RUN_LIVE_API_TESTS="1"
-uv run pytest tests/integration/test_siliconflow_live.py
-```
+Windows 发行版构建说明见 [packaging/README.md](packaging/README.md)。
 
-完整 MinerU 入库测试需要指定本地文件和能命中正文的查询：
+## 可信写作边界
 
-```powershell
-$env:RUN_LIVE_INGEST_TESTS="1"
-$env:LIVE_INGEST_FILE="C:\path\paper.pdf"
-$env:LIVE_INGEST_QUERY="文档中的关键词"
-uv run pytest tests/integration/test_stage1_live.py
-```
+Parrofish 的生成链遵守八条设计铁律：
 
-阶段 3 的真实语料回归只调用 SiliconFlow，不调用 MinerU。查询必填，预期文件名可选：
+1. **职责分离**：作者档案只管思维、谋篇与表达；本地知识库和明确启用的联网检索只管事实、证据与引用。
+2. **先检索，后写作**：每个内容单元先锁定证据，再允许模型起草。
+3. **事实论断必须有来源**：没有证据的内容只能作为明确标注的解释、推断或待核实项。
+4. **先冻结事实，最后加入文风**：事实核对通过后才进行表达打磨，不能为了“像作者”而改坏事实。
+5. **不让作者校验自己**：事实核对使用不带作者档案的中性角色。
+6. **引用由代码拼装**：模型只返回内部来源键，正式引文和参考文献由程序生成。
+7. **证据必须可追溯**：本地引用回到真实文档、页码和精确小块；联网引用保留网页标题、URL、站点与发布时间，并明确其证据是搜索摘要。
+8. **生成阶段只读**：不可信文档和网页摘要进入上下文时，模型没有执行代码、写文件、自主联网或操作外部系统的工具。
 
-```powershell
-$env:RUN_LIVE_RETRIEVAL_TESTS="1"
-$env:LIVE_RETRIEVAL_QUERY="你的检索问题"
-$env:LIVE_RETRIEVAL_EXPECTED_FILENAME="应命中的文件名片段"
-uv run pytest tests/integration/test_stage3_live.py
-```
+> [!WARNING]
+> 作者档案是特定语料与调研截止日期下的结构化模型，不等同于真人，不代表作者未公开的想法，也无法捕捉直觉和灵感。用户应尊重著作权、隐私、署名规范与所在机构的学术诚信要求。
 
-上述集成测试默认跳过，因为它们需要本地语料、外部服务或付费额度；普通 `pytest` 始终运行全部离线测试。
+## 数据与隐私
+
+- 项目、知识库、作者档案、聊天记录、任务断点和稿件默认保存在本机 `%LOCALAPPDATA%\Parrofish`。
+- 用户选择的文档内容和提示词会按功能需要发送给 MinerU 或 SiliconFlow；勾选联网检索时，查询还会发送给博查。Parrofish 不是端到端离线软件。
+- 目标作者语料默认从新任务的事实来源中隔离，只有用户明确授权时才允许复用。
+- 知识库文本、联网搜索摘要和历史消息均按不可信数据处理，进入提示词前经过边界标记与注入检测。
+- 卸载应用不会自动删除用户数据，避免误删知识库和长任务断点。
+
+## 技术栈
+
+| 层级 | 技术 |
+|---|---|
+| 桌面界面 | PyQt6 + QThread worker |
+| 数据与断点 | SQLite + LangGraph SQLite checkpointer |
+| 稠密检索 | LanceDB + SiliconFlow embedding |
+| 稀疏检索 | BM25 + jieba |
+| 重排 | SiliconFlow rerank |
+| 文档解析 | MinerU API |
+| 联网检索 | 博查 Web Search API（可选） |
+| 引用格式 | citeproc-py，默认 GB/T 7714-2015 |
+| 模型调用 | 统一 SiliconFlow 客户端，支持流式输出、缓存、重试、超时、并发和用量日志 |
+
+代码按 `config / llm / store / kb / distill / generate / orchestration / eval / ui` 分层。所有业务模块通过统一外部服务客户端调用 SiliconFlow、MinerU 与博查，不在各处散落裸 HTTP 请求。
+
+## 致谢
+
+- 作者蒸馏方法论参考 [Nüwa](https://github.com/alchaincyf/nuwa-skill)，Parrofish 运行时不依赖 Nüwa 本体。
+- 文档解析由 [MinerU](https://mineru.net/) API 提供。
+- LLM、embedding 与 rerank 通过 [SiliconFlow](https://siliconflow.cn/) API 调用。
+- 可选 Web Search 通过 [博查 AI 开放平台](https://open.bochaai.com/) API 调用。
+
+## 许可证
+
+Parrofish 源代码采用 [GNU General Public License v3.0 or later](LICENSE)，SPDX 标识符为 `GPL-3.0-or-later`。
+
+用户导入的文档、知识库、作者档案、项目数据和使用本软件生成的内容，不会仅因使用 Parrofish 而适用 GPL；这些内容的权利仍由其原权利人或用户依法享有。用户仍需自行确保导入语料和生成内容的使用符合法律及原始授权。
+
+第三方依赖继续适用各自的许可证。Parrofish 名称和图标用于标识本项目，GPL 不授予以其名义发布修改版或造成官方背书误解的商标性权利。
+
+Copyright (C) 2026 叶芃 <yp.work@foxmail.com>

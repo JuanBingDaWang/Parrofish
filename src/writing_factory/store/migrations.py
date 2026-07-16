@@ -325,6 +325,81 @@ MIGRATIONS: tuple[str, ...] = (
     ALTER TABLE writing_tasks
         ADD COLUMN generation_options_json TEXT NOT NULL DEFAULT '{}';
     """,
+    """
+    CREATE TABLE IF NOT EXISTS chat_conversations (
+        conversation_id TEXT PRIMARY KEY,
+        kb_id TEXT NOT NULL,
+        persona_id TEXT,
+        persona_name TEXT NOT NULL,
+        persona_version INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        knowledge_mode TEXT NOT NULL DEFAULT 'none'
+            CHECK (knowledge_mode IN ('none', 'all', 'selected')),
+        selected_doc_ids_json TEXT NOT NULL DEFAULT '[]',
+        allowed_persona_doc_ids_json TEXT NOT NULL DEFAULT '[]',
+        target_persona_doc_ids_json TEXT NOT NULL DEFAULT '[]',
+        runtime_persona_json TEXT NOT NULL,
+        summary_text TEXT NOT NULL DEFAULT '',
+        summary_through_sequence INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_chat_conversations_updated
+        ON chat_conversations(updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_chat_conversations_persona
+        ON chat_conversations(persona_id, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS chat_messages (
+        message_id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL
+            REFERENCES chat_conversations(conversation_id) ON DELETE CASCADE,
+        sequence INTEGER NOT NULL,
+        role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+        content TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'complete'
+            CHECK (status IN ('complete', 'interrupted', 'error')),
+        sources_json TEXT NOT NULL DEFAULT '[]',
+        verification_json TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE (conversation_id, sequence)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation
+        ON chat_messages(conversation_id, sequence);
+    """,
+    """
+    ALTER TABLE distillation_runs
+        ADD COLUMN quality_options_json TEXT NOT NULL DEFAULT '{}';
+    """,
+    """
+    ALTER TABLE chat_conversations
+        ADD COLUMN answer_policy TEXT NOT NULL DEFAULT 'general_assisted'
+        CHECK (answer_policy IN ('general_assisted', 'strict_evidence'));
+    """,
+    """
+    ALTER TABLE chat_conversations
+        ADD COLUMN use_web_search INTEGER NOT NULL DEFAULT 0
+        CHECK (use_web_search IN (0, 1));
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS persona_fidelity_stages (
+        persona_id TEXT NOT NULL
+            REFERENCES persona_specs(persona_id) ON DELETE CASCADE,
+        stage TEXT NOT NULL
+            CHECK (stage IN ('design', 'answer', 'judge')),
+        pipeline_version INTEGER NOT NULL,
+        input_hash TEXT NOT NULL,
+        result_json TEXT NOT NULL,
+        duration_ms INTEGER NOT NULL DEFAULT 0 CHECK (duration_ms >= 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (persona_id, stage)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_persona_fidelity_stages_updated
+        ON persona_fidelity_stages(updated_at DESC);
+    """,
 )
 
 

@@ -17,6 +17,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from writing_factory.generate.models import (
+    DocumentForm,
     GlobalPolishResult,
     PolishedSection,
     StructureReview,
@@ -30,6 +31,7 @@ from writing_factory.generate.prompts import (
     structure_review_messages,
     term_consistency_messages,
 )
+from writing_factory.nonfiction import NonfictionGenre
 
 if TYPE_CHECKING:
     from writing_factory.llm.siliconflow import SiliconFlowClient
@@ -110,6 +112,7 @@ def review_term_consistency(
         response_format="json_object",
         seed=42,
         stream=True,
+        step_id="writing.term_review",
     )
 
     check_cancelled()
@@ -138,6 +141,8 @@ def review_structure(
     outline_nodes: list[dict[str, Any]],
     sections: list[dict],
     siliconflow: SiliconFlowClient,
+    document_form: DocumentForm = "paper",
+    genre: NonfictionGenre = "general_nonfiction",
     check_cancelled: Callable[[], None] = _no_cancellation,
 ) -> StructureReview:
     """审查全文结构：节篇幅平衡、逻辑推进、过渡衔接。
@@ -160,6 +165,8 @@ def review_structure(
         thesis_text=thesis_text,
         outline_nodes=outline_nodes,
         sections_text=sections_text,
+        document_form=document_form,
+        genre=genre,
     )
 
     check_cancelled()
@@ -171,6 +178,7 @@ def review_structure(
         response_format="json_object",
         seed=42,
         stream=True,
+        step_id="writing.structure_review",
     )
 
     check_cancelled()
@@ -199,6 +207,8 @@ def run_global_polish(
     siliconflow: SiliconFlowClient,
     term_consistency_report: TermConsistencyReport | None = None,
     structure_review: StructureReview | None = None,
+    document_form: DocumentForm = "paper",
+    genre: NonfictionGenre = "general_nonfiction",
     check_drift: bool = True,
     check_cancelled: Callable[[], None] = _no_cancellation,
 ) -> GlobalPolishResult:
@@ -243,6 +253,8 @@ def run_global_polish(
         sections_text=sections_text,
         term_consistency_json=term_json,
         structure_review_json=struct_json,
+        document_form=document_form,
+        genre=genre,
     )
 
     # 全局打磨使用思考模式（低）— 这是最后一次全篇审查，值得投入推理
@@ -256,6 +268,7 @@ def run_global_polish(
         response_format="json_object",
         seed=42,
         stream=True,
+        step_id="writing.global_polish",
     )
 
     check_cancelled()
@@ -266,7 +279,7 @@ def run_global_polish(
         if [item.section_id for item in global_result.sections] != [
             item.section_id for item in original_sections
         ]:
-            raise ValueError("全局打磨返回的章节集合或顺序发生变化")
+            raise ValueError("全局打磨返回的内容单元集合或顺序发生变化")
         global_result = global_result.model_copy(
             update={
                 "sections": [
@@ -324,6 +337,7 @@ def run_global_polish(
             response_format="json_object",
             seed=42,
             stream=True,
+            step_id="writing.global_drift",
         )
         check_cancelled()
         check_data = json.loads(check_result.content)

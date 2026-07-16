@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from writing_factory.generate.conceptual_safety import verify_conceptual_section
 from writing_factory.generate.framework import FrameworkOutputError, _validate_outline_budget
 from writing_factory.generate.models import (
     AnnotatedOutline,
@@ -19,6 +20,7 @@ from writing_factory.generate.models import (
     GenerationContext,
     GenerationOptions,
     OutlineNode,
+    PolishedSection,
     ReferenceList,
     SectionDraft,
     StructureReview,
@@ -31,15 +33,19 @@ from writing_factory.generate.models import (
 from writing_factory.generate.prompts import drafting_messages, verification_messages
 from writing_factory.generate.verification import verify_section
 from writing_factory.kb.models import Bibliography, FusedHit, RetrievalResult
+from writing_factory.llm.bocha import BochaSearchResult, BochaWebPage
 from writing_factory.llm.models import ChatResult
 from writing_factory.orchestration.errors import PipelineNodeError
 from writing_factory.orchestration.nodes import (
     WritingPipeline,
+    _should_show_headings,
+    _strip_internal_source_markers,
     prepare_revise_section,
     should_continue_after_verify,
 )
 from writing_factory.orchestration.pipeline_runner import (
     _checkpoint_progress,
+    _legacy_common_recovery_config,
     _legacy_resume_config,
     _verification_recovery_config,
     run_writing_pipeline_with_progress,
@@ -287,6 +293,208 @@ def test_full_writing_graph_runs_offline(tmp_path: Path) -> None:
     assert resumed_context.progress[0][1] == "读取写作断点"
 
 
+def test_conceptual_pipeline_never_retrieves_and_builds_empty_references(tmp_path: Path) -> None:
+    class ConceptualClient:
+        def __init__(self) -> None:
+            self.responses = [
+                {
+                    "thesis_text": "可以从目标、约束与反馈三个层面形成分析框架。",
+                    "angle": "把问题拆成可检验的思路",
+                    "kb_support_assessment": "无事实构思模式未使用知识库。",
+                    "persona_id": "persona_1",
+                },
+                {
+                    "thesis": {
+                        "thesis_text": "占位论旨",
+                        "angle": "占位角度",
+                        "kb_support_assessment": "无事实依据",
+                        "persona_id": "persona_1",
+                    },
+                    "root_nodes": [
+                        {
+                            "node_id": "1",
+                            "heading": "可能的分析路径",
+                            "rhetorical_purpose": "提出条件性解释框架",
+                            "candidate_source_keys": ["S99"],
+                            "children": [],
+                        }
+                    ],
+                    "term_registry": {},
+                    "kb_id": "kb",
+                },
+                {
+                    "section_id": "1",
+                    "heading": "可能的分析路径",
+                    "paragraphs": ["如果把目标与约束分开，可以先比较不同方案的适用条件。"],
+                    "claims": [
+                        {
+                            "claim_id": "1_c1",
+                            "text": "可以先比较不同方案的适用条件。",
+                            "claim_type": "interpretation",
+                            "source_keys": [],
+                            "paragraph_index": 0,
+                        }
+                    ],
+                },
+                {"safe": True, "issues": [], "reviewer_note": "未混入外部事实。"},
+            ]
+            self.calls = []
+
+        def chat(self, messages, **kwargs):
+            self.calls.append((messages, kwargs))
+            value = self.responses.pop(0)
+            return ChatResult(
+                content=json.dumps(value, ensure_ascii=False),
+                model="fake",
+                finish_reason="stop",
+            )
+
+    class RejectingRetriever(FakeRetriever):
+        def search(self, request, **kwargs):
+            raise AssertionError("conceptual_only 不得调用检索器")
+
+    repository = FakeKnowledgeRepository()
+    client = ConceptualClient()
+    result = run_writing_pipeline_with_progress(
+        persona_id="persona_1",
+        task_description="提出三个不依赖外部事实的解释框架",
+        domain="",
+        context=FakeTaskContext(),
+        siliconflow=client,
+        retriever=RejectingRetriever(repository),
+        persona_repository=FakePersonaRepository(),
+        kb_repository=repository,
+        checkpoint_dir=tmp_path,
+        kb_id="kb",
+        task_id="conceptual_task",
+        selected_doc_ids=set(),
+        generation_options=GenerationOptions(
+            evidence_mode="conceptual_only",
+            target_length_chars=500,
+            document_form="paragraph",
+            section_polish=False,
+            term_review=False,
+            structure_review=False,
+            global_polish=False,
+        ),
+    )
+
+    final = json.loads(result["final_draft_json"])
+    outline = json.loads(result["outline_json"])
+    evidence = EvidencePack.model_validate_json(result["sections"][0]["evidence_pack_json"])
+    assert result["status"] == "done"
+    assert final["quality_status"] == "conceptual_draft"
+    assert final["reference_list"]["items"] == []
+    assert evidence.items == []
+    assert outline["root_nodes"][0]["candidate_source_keys"] == []
+    assert [call[1]["step_id"] for call in client.calls] == [
+        "writing.topic",
+        "writing.framework",
+        "writing.draft",
+        "writing.conceptual_safety",
+    ]
+
+
+def test_web_search_can_support_writing_without_local_documents(tmp_path: Path) -> None:
+    class WebRepository(FakeKnowledgeRepository):
+        def get_bibliographies(self, _kb_id: str, _doc_ids: set[str]):
+            return {}
+
+    class RejectingRetriever(FakeRetriever):
+        def search(self, request, **kwargs):
+            raise AssertionError("空本地白名单不应调用本地检索器")
+
+    class FakeBocha:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, int]] = []
+
+        def search(self, query: str, *, count: int, check_cancelled=None):
+            if check_cancelled is not None:
+                check_cancelled()
+            self.calls.append((query, count))
+            return BochaSearchResult(
+                query=query,
+                pages=(
+                    BochaWebPage(
+                        title="数字人文方法资料",
+                        url="https://example.org/digital-humanities",
+                        summary="数字人文方法能够扩展传统文献研究的证据处理能力。",
+                        site_name="示例学术网",
+                        date_published="2025-06-01",
+                    ),
+                ),
+            )
+
+    repository = WebRepository()
+    bocha = FakeBocha()
+    result = run_writing_pipeline_with_progress(
+        persona_id="persona_1",
+        task_description="讨论数字人文方法",
+        domain="数字人文",
+        context=FakeTaskContext(),
+        siliconflow=FakeSiliconFlow(),
+        retriever=RejectingRetriever(repository),
+        persona_repository=FakePersonaRepository(),
+        kb_repository=repository,
+        checkpoint_dir=tmp_path,
+        kb_id="kb",
+        task_id="web_only_task",
+        selected_doc_ids=set(),
+        generation_options=GenerationOptions(use_web_search=True),
+        bocha_client=bocha,
+        web_search_result_count=4,
+    )
+
+    final = json.loads(result["final_draft_json"])
+    frozen = EvidencePack.model_validate_json(result["sections"][0]["evidence_pack_json"])
+    assert result["status"] == "done"
+    assert bocha.calls and all(count == 4 for _query, count in bocha.calls)
+    assert frozen.items[0].source_type == "web"
+    assert frozen.items[0].url == "https://example.org/digital-humanities"
+    assert final["reference_list"]["items"][0]["url"] == frozen.items[0].url
+    assert "https://example.org/digital-humanities" in final["reference_list"]["items"][0][
+        "citation_text"
+    ]
+
+
+def test_conceptual_safety_detects_untyped_fact_in_paragraph() -> None:
+    class SafetyClient:
+        def chat(self, _messages, **_kwargs):
+            return ChatResult(
+                content=json.dumps(
+                    {
+                        "safe": False,
+                        "issues": [
+                            {
+                                "paragraph_index": 0,
+                                "excerpt": "2024 年增长 18%",
+                                "rationale": "年份和比例需要外部来源。",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                model="fake",
+            )
+
+    draft = SectionDraft(
+        section_id="1",
+        heading="构思",
+        paragraphs=["2024 年增长 18%，因此可以调整策略。"],
+        claims=[],
+        evidence_pack=EvidencePack(section_id="1", items=[]),
+    )
+
+    verified = verify_conceptual_section(
+        section_draft=draft,
+        task_description="提出策略构想",
+        siliconflow=SafetyClient(),
+    )
+
+    assert verified.unsupported_count == 1
+    assert verified.verified_claims[0].claim.claim_id == "1_external_fact_p1"
+
+
 def test_evidence_prefetch_is_concurrent_and_keeps_outline_order() -> None:
     class ConcurrentRetriever(FakeRetriever):
         def __init__(self, repository) -> None:
@@ -392,7 +600,7 @@ def test_outline_budget_rejects_too_many_body_units_for_short_article() -> None:
         kb_id="kb",
     )
 
-    with pytest.raises(FrameworkOutputError, match="当前提纲有 6 个"):
+    with pytest.raises(FrameworkOutputError, match="当前内容规划有 6 个"):
         _validate_outline_budget(outline, target_length_chars=1500)
 
 
@@ -593,8 +801,20 @@ def test_revision_recovers_frozen_evidence_and_strips_prior_source_keys(monkeypa
 
 
 def test_quality_presets_reduce_calls_without_mislabeling_fast_draft(tmp_path: Path) -> None:
+    restored_fast = GenerationOptions.model_validate({"preset": "fast_draft"})
+    assert not any(
+        (
+            restored_fast.use_hyde,
+            restored_fast.use_query_rewrite,
+            restored_fast.topic_refinement,
+            restored_fast.framework_generation,
+            restored_fast.fact_verification,
+        )
+    )
+
     repository = FakeKnowledgeRepository()
     fast_client = FakeSiliconFlow()
+    fast_client.responses = fast_client.responses[2:]
     fast = run_writing_pipeline_with_progress(
         persona_id="persona_1",
         task_description="讨论数字人文方法",
@@ -611,6 +831,7 @@ def test_quality_presets_reduce_calls_without_mislabeling_fast_draft(tmp_path: P
         generation_options=GenerationOptions.from_preset(
             "fast_draft",
             target_length_chars=1500,
+            document_form="short_text",
         ),
     )
     balanced_client = FakeSiliconFlow()
@@ -630,13 +851,44 @@ def test_quality_presets_reduce_calls_without_mislabeling_fast_draft(tmp_path: P
         generation_options=GenerationOptions.from_preset(
             "balanced",
             target_length_chars=1500,
+            document_form="short_text",
         ),
     )
 
-    assert len(fast_client.calls) == 3
+    assert len(fast_client.calls) == 1
     assert json.loads(fast["final_draft_json"])["quality_status"] == "unverified_draft"
     assert len(balanced_client.calls) == 4
     assert json.loads(balanced["final_draft_json"])["quality_status"] == "verified_final"
+
+
+def test_generation_retrieval_uses_task_level_hyde_and_rewrite_options(
+    tmp_path: Path,
+) -> None:
+    repository = FakeKnowledgeRepository()
+    retriever = FakeRetriever(repository)
+
+    run_writing_pipeline_with_progress(
+        persona_id="persona_1",
+        task_description="讨论数字人文方法",
+        domain="数字人文",
+        context=FakeTaskContext(),
+        siliconflow=FakeSiliconFlow(),
+        retriever=retriever,
+        persona_repository=FakePersonaRepository(),
+        kb_repository=repository,
+        checkpoint_dir=tmp_path,
+        kb_id="kb",
+        task_id="task_retrieval_options",
+        selected_doc_ids={"doc_task"},
+        generation_options=GenerationOptions(
+            use_hyde=False,
+            use_query_rewrite=False,
+        ),
+    )
+
+    assert len(retriever.requests) == 4
+    assert all(not request.use_hyde for request in retriever.requests)
+    assert all(not request.use_rewrite for request in retriever.requests)
 
 
 def test_paragraph_form_produces_one_headingless_body_unit(tmp_path: Path) -> None:
@@ -928,6 +1180,64 @@ def test_pending_verification_gate_becomes_bounded_recovery_revision() -> None:
     assert values["sections"][0]["status"] == "revising"
 
 
+def test_legacy_common_claim_rewinds_to_controlled_reclassification() -> None:
+    common = Claim(
+        claim_id="legacy_common",
+        text="这是旧版自动放行的常识论断。",
+        claim_type="common",
+        paragraph_index=0,
+    )
+    draft = SectionDraft(
+        section_id="2",
+        heading="旧内容单元",
+        paragraphs=[common.text],
+        claims=[common],
+        evidence_pack=EvidencePack(section_id="2", items=[]),
+    )
+    state = {
+        "status": "global_polish",
+        "current_section_index": 1,
+        "sections": [
+            {"section_id": "1", "status": "polished", "draft_json": None},
+            {
+                "section_id": "2",
+                "status": "polished",
+                "draft_json": draft.model_dump_json(),
+                "recovery_revision_count": 0,
+                "polished_section_json": PolishedSection(
+                    section_id="2",
+                    polished_text=common.text,
+                ).model_dump_json(),
+            },
+        ],
+    }
+    captured: dict[str, object] = {}
+
+    class RecoveryGraph:
+        def get_state(self, _config):
+            return SimpleNamespace(values=state, next=("global_polish",))
+
+        def update_state(self, config, values, *, as_node):
+            captured.update(config=config, values=values, as_node=as_node)
+            return {"configurable": {"checkpoint_id": "common_recovery"}}
+
+    selected, recovered = _legacy_common_recovery_config(
+        RecoveryGraph(), {"configurable": {"thread_id": "task"}}
+    )
+
+    assert recovered
+    assert selected["configurable"]["checkpoint_id"] == "common_recovery"
+    assert captured["as_node"] == "prepare_revise_section"
+    values = captured["values"]
+    assert values["current_section_index"] == 1
+    recovered_section = values["sections"][1]
+    assert recovered_section["status"] == "revising"
+    assert recovered_section["recovery_revision_count"] == 1
+    verified = VerifiedDraft.model_validate_json(recovered_section["verified_draft_json"])
+    assert verified.unsupported_count == 1
+    assert verified.verified_claims[0].claim.claim_type == "common"
+
+
 def test_recovery_revision_has_separate_two_attempt_limit() -> None:
     claim = Claim(
         claim_id="c1",
@@ -985,6 +1295,36 @@ def test_fact_claim_requires_source_and_inline_marker() -> None:
             claim_type="fact",
             paragraph_index=0,
         )
+
+
+def test_nonfiction_genre_controls_citation_and_heading_presentation() -> None:
+    speech_options = GenerationOptions(
+        document_form="paper",
+        genre="speech",
+        citation_display="auto",
+    )
+    assert speech_options.resolved_citation_display == "internal_only"
+    academic_options = speech_options.model_copy(
+        update={"genre": "academic_paper"}
+    )
+    assert academic_options.resolved_citation_display == "bibliography"
+
+    legacy = GenerationOptions.model_validate({"document_form": "paper"})
+    assert legacy.genre == "academic_paper"
+    assert legacy.resolved_citation_display == "bibliography"
+
+    context = GenerationContext(
+        kb_id="kb",
+        task_description="面向公众撰写一篇演讲稿",
+        persona_id="persona",
+        generation_options=speech_options,
+    )
+    assert not _should_show_headings(context)
+    with_headings = context.model_copy(
+        update={"task_description": "撰写演讲稿，并使用小标题分节"}
+    )
+    assert _should_show_headings(with_headings)
+    assert _strip_internal_source_markers("事实一[S1]，事实二 [S20]。") == "事实一，事实二。"
 
 
 def test_drafting_response_schema_excludes_frozen_evidence_pack() -> None:

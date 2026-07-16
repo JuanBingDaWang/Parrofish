@@ -41,7 +41,7 @@ project/
 
 ## 2. 统一的外部服务客户端（Day 1 就建，最关键的一条）
 
-在 `llm/` 里先建一个薄封装层，统一封装 SiliconFlow（chat / embedding / rerank）和 MinerU。**所有业务模块只调这个封装，不碰裸 HTTP。**
+在 `llm/` 里建薄封装层，统一封装 SiliconFlow（chat / embedding / rerank）、MinerU 和可选博查 Web Search。**所有业务模块只调这个封装，不碰裸 HTTP。**
 
 这一层统一处理：
 - 重试、限流、超时、错误处理；
@@ -55,7 +55,7 @@ project/
 
 ## 3. 配置与密钥
 
-- SiliconFlow、MinerU 的 API key 放 `.env` 或本地配置文件，**绝不硬编码、绝不提交**（写进 `.gitignore`）。
+- SiliconFlow、MinerU、博查的 API key 放 `.env`、系统凭据库或本地配置文件，**绝不硬编码、绝不提交**（写进 `.gitignore`）。
 - `config/` 里做一个集中配置模块：模型名、base_url、镜像地址、引用样式选择，全部在一处可改。
 
 ---

@@ -14,7 +14,11 @@ class RedactingFilter(logging.Filter):
 
     def __init__(self, secrets: tuple[str, ...]) -> None:
         super().__init__()
-        self._secrets = tuple(secret for secret in secrets if secret)
+        self._secrets = {secret for secret in secrets if secret}
+
+    def add_secret(self, secret: str) -> None:
+        if secret:
+            self._secrets.add(secret)
 
     def filter(self, record: logging.LogRecord) -> bool:
         message = record.getMessage()
@@ -30,7 +34,11 @@ class JsonFormatter(logging.Formatter):
 
     def __init__(self, secrets: tuple[str, ...]) -> None:
         super().__init__()
-        self._secrets = tuple(secret for secret in secrets if secret)
+        self._secrets = {secret for secret in secrets if secret}
+
+    def add_secret(self, secret: str) -> None:
+        if secret:
+            self._secrets.add(secret)
 
     def _redact(self, value: str) -> str:
         for secret in self._secrets:
@@ -77,3 +85,17 @@ def shutdown_logging() -> None:
     for handler in list(root.handlers):
         root.removeHandler(handler)
         handler.close()
+
+
+def register_secret(secret: str) -> None:
+    """Add a credential saved at runtime to every active redaction layer."""
+
+    if not secret:
+        return
+    for handler in logging.getLogger().handlers:
+        formatter = handler.formatter
+        if isinstance(formatter, JsonFormatter):
+            formatter.add_secret(secret)
+        for item in handler.filters:
+            if isinstance(item, RedactingFilter):
+                item.add_secret(secret)

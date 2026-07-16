@@ -4,14 +4,24 @@ build-backend = "hatchling.build"
 
 [project]
 name = "writing-factory"
-version = "0.1.0"
+version = "0.1.1"
 description = "A traceable humanities and social-sciences writing desktop application."
+readme = "README.md"
+license = "GPL-3.0-or-later"
+authors = [
+    { name = "叶芃", email = "yp.work@foxmail.com" },
+]
 requires-python = ">=3.12,<3.13"
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Programming Language :: Python :: 3.12",
+]
 dependencies = [
     "citeproc-py>=0.9.0,<1",
     "citeproc-py-styles>=0.1.5,<1",
     "httpx>=0.28.1,<1",
     "jieba>=0.42.1,<1",
+    "keyring>=25.6,<26",
     "lancedb>=0.20,<1",
     "langgraph>=1.2.9",
     "langgraph-checkpoint-sqlite>=3.1.0",
@@ -31,6 +41,9 @@ dev = [
     "pytest-qt>=4.4,<5",
     "respx>=0.22,<1",
     "ruff>=0.12,<1",
+]
+packaging = [
+    "pyinstaller>=6.16,<7",
 ]
 
 [[tool.uv.index]]

@@ -1,4 +1,4 @@
-"""论文级归并、跨文档聚类与独立学术候选验证流水线。"""
+"""文档级归并、跨文档聚类与独立非虚构候选验证流水线。"""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ import hashlib
 import json
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
+from contextvars import copy_context
 from typing import TypeVar
 
 from pydantic import BaseModel, ValidationError
@@ -28,6 +30,7 @@ from writing_factory.distill.academic_prompts import (
 from writing_factory.distill.extraction import StructuredDistillationError
 from writing_factory.distill.language import OutputLanguageError, validate_academic_language
 from writing_factory.distill.models import SourceInfo
+from writing_factory.distill.progress import WeightedProgress
 from writing_factory.distill.selection import select_academic_candidates
 from writing_factory.llm import SiliconFlowClient
 from writing_factory.store.persona_repository import PersonaRepository
@@ -68,41 +71,80 @@ class AcademicDistillationEngine:
         control_bundle: dict[str, object] | None,
         control_source_info: tuple[SourceInfo, ...],
         control_hash: str | None,
+        run_generative_validation: bool = True,
+        run_exclusivity_validation: bool = True,
+        reuse_persona_id: str | None = None,
         progress: ProgressCallback,
         check_cancelled: CancellationCheck,
     ) -> CandidateRegistry:
-        """运行或恢复全部论文级与全局候选验证阶段。"""
+        """运行或恢复全部文档级与全局候选验证阶段。"""
 
-        target_profiles = self._consolidate_corpus(
-            run_id=run_id,
-            stage="target_paper",
-            bundle=target_bundle,
-            source_info=target_source_info,
-            corpus_hash=target_hash,
-            progress=progress,
-            progress_start=66,
-            progress_end=75,
-            check_cancelled=check_cancelled,
-        )
-        control_profiles: list[PaperProfile] = []
-        if control_bundle is not None and control_hash is not None:
-            control_profiles = self._consolidate_corpus(
+        def target_job(callback: ProgressCallback) -> list[PaperProfile]:
+            return self._consolidate_corpus(
                 run_id=run_id,
-                stage="control_paper",
-                bundle=control_bundle,
-                source_info=control_source_info,
-                corpus_hash=control_hash,
-                progress=progress,
-                progress_start=75,
-                progress_end=82,
+                stage="target_paper",
+                bundle=target_bundle,
+                source_info=target_source_info,
+                corpus_hash=target_hash,
+                reuse_persona_id=reuse_persona_id,
+                progress=callback,
+                progress_start=0,
+                progress_end=100,
                 check_cancelled=check_cancelled,
             )
-        holdout_doc_ids = choose_holdout_doc_ids(target_source_info)
+
+        target_profiles: list[PaperProfile]
+        control_profiles: list[PaperProfile] = []
+        if control_bundle is not None and control_hash is not None:
+            tracker = WeightedProgress(
+                progress,
+                start=66,
+                end=82,
+                weights={
+                    "target": max(1, len(target_source_info)),
+                    "control": max(1, len(control_source_info)),
+                },
+            )
+
+            def control_job() -> list[PaperProfile]:
+                return self._consolidate_corpus(
+                    run_id=run_id,
+                    stage="control_paper",
+                    bundle=control_bundle,
+                    source_info=control_source_info,
+                    corpus_hash=control_hash,
+                    reuse_persona_id=reuse_persona_id,
+                    progress=tracker.branch("control"),
+                    progress_start=0,
+                    progress_end=100,
+                    check_cancelled=check_cancelled,
+                )
+
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="paper-corpus") as pool:
+                target_future = pool.submit(
+                    copy_context().run,
+                    target_job,
+                    tracker.branch("target"),
+                )
+                control_future = pool.submit(copy_context().run, control_job)
+                target_profiles = target_future.result()
+                tracker.complete("target")
+                control_profiles = control_future.result()
+                tracker.complete("control")
+        else:
+            def target_progress(percent: int, message: str) -> None:
+                progress(66 + round(16 * percent / 100), message)
+
+            target_profiles = target_job(target_progress)
+
+        holdout_doc_ids = (
+            choose_holdout_doc_ids(target_source_info) if run_generative_validation else []
+        )
         training_profiles = [
             profile for profile in target_profiles if profile.doc_id not in holdout_doc_ids
         ]
         check_cancelled()
-        progress(83, "跨论文聚类候选")
+        progress(83, "跨文档聚类候选")
         clusters = self._cluster(
             run_id=run_id,
             target_label=target_label,
@@ -113,23 +155,42 @@ class AcademicDistillationEngine:
         holdout_profiles = [
             profile for profile in target_profiles if profile.doc_id in holdout_doc_ids
         ]
-        check_cancelled()
-        progress(87, "中性验证生成力")
-        generative = self._validate_generative(
-            run_id=run_id,
-            clusters=clusters,
-            holdout_profiles=holdout_profiles,
-            target_hash=target_hash,
-        )
-        check_cancelled()
-        progress(90, "中性验证排他性")
-        exclusivity = self._validate_exclusivity(
-            run_id=run_id,
-            domain=domain,
-            clusters=clusters,
-            control_profiles=control_profiles,
-            control_hash=control_hash,
-        )
+        generative = None
+        exclusivity = None
+        validation_jobs: dict[str, Callable[[], BaseModel | None]] = {}
+        if run_generative_validation:
+            validation_jobs["generative"] = lambda: self._validate_generative(
+                run_id=run_id,
+                clusters=clusters,
+                holdout_profiles=holdout_profiles,
+                target_hash=target_hash,
+            )
+        if run_exclusivity_validation:
+            validation_jobs["exclusivity"] = lambda: self._validate_exclusivity(
+                run_id=run_id,
+                domain=domain,
+                clusters=clusters,
+                control_profiles=control_profiles,
+                control_hash=control_hash,
+            )
+        if validation_jobs:
+            progress(87, "并发运行中性验证")
+            with ThreadPoolExecutor(
+                max_workers=len(validation_jobs), thread_name_prefix="candidate-validation"
+            ) as pool:
+                futures = {
+                    pool.submit(copy_context().run, job): key
+                    for key, job in validation_jobs.items()
+                }
+                for completed, future in enumerate(as_completed(futures), 1):
+                    check_cancelled()
+                    key = futures[future]
+                    value = future.result()
+                    if key == "generative":
+                        generative = value
+                    else:
+                        exclusivity = value
+                    progress(87 + round(3 * completed / len(futures)), "中性验证完成")
         registry = select_academic_candidates(
             clusters=clusters,
             target_profiles=target_profiles,
@@ -164,6 +225,7 @@ class AcademicDistillationEngine:
         bundle: dict[str, object],
         source_info: tuple[SourceInfo, ...],
         corpus_hash: str,
+        reuse_persona_id: str | None,
         progress: ProgressCallback,
         progress_start: int,
         progress_end: int,
@@ -185,7 +247,10 @@ class AcademicDistillationEngine:
             }
             doc_evidence = [item for item in evidence if item.get("evidence_id") in evidence_ids]
             input_hash = _hash_payload(
-                self.PAPER_VERSION, corpus_hash, source.doc_id, doc_candidates, doc_evidence
+                self.PAPER_VERSION,
+                source.doc_id,
+                doc_candidates,
+                doc_evidence,
             )
             cached = self.repository.load_stage_result(
                 run_id=run_id,
@@ -199,8 +264,10 @@ class AcademicDistillationEngine:
                     item_id=source.doc_id,
                     input_hash=input_hash,
                     model=PaperProfile,
+                    persona_id=reuse_persona_id,
                 )
             if cached is not None:
+                cached = self._stabilize_paper_profile(cached, source.doc_id, doc_candidates)
                 profiles[source.doc_id] = cached
                 self.repository.save_stage_result(
                     run_id=run_id,
@@ -228,6 +295,7 @@ class AcademicDistillationEngine:
                 futures: dict[Future[PaperProfile], tuple[SourceInfo, str]] = {}
                 for source, doc_candidates, doc_evidence, input_hash in missing:
                     future = executor.submit(
+                        copy_context().run,
                         self._consolidate_one,
                         source.doc_id,
                         doc_candidates,
@@ -249,7 +317,7 @@ class AcademicDistillationEngine:
                     percent = progress_start + round(
                         (progress_end - progress_start) * completed / len(missing)
                     )
-                    progress(percent, f"并发归并单篇论文（{completed}/{len(missing)}）")
+                    progress(percent, f"并发归并单篇文档（{completed}/{len(missing)}）")
         return [profiles[item.doc_id] for item in source_info]
 
     def _consolidate_one(
@@ -258,16 +326,22 @@ class AcademicDistillationEngine:
         candidates: list[dict[str, object]],
         evidence: list[dict[str, object]],
     ) -> PaperProfile:
-        return self._structured_call(
-            paper_profile_messages(doc_id=doc_id, candidates=candidates, evidence=evidence),
-            PaperProfile,
-            seed=23,
-            validator=lambda profile: self._stabilize_paper_profile(
-                profile,
-                doc_id,
-                candidates,
-            ),
+        stage = getattr(self.siliconflow, "stream_stage", None)
+        stream_context = (
+            stage(f"单篇文档画像 · {doc_id[-8:]}") if callable(stage) else nullcontext()
         )
+        with stream_context:
+            return self._structured_call(
+                paper_profile_messages(doc_id=doc_id, candidates=candidates, evidence=evidence),
+                PaperProfile,
+                seed=23,
+                step_id="distill.paper_profile",
+                validator=lambda profile: self._stabilize_paper_profile(
+                    profile,
+                    doc_id,
+                    candidates,
+                ),
+            )
 
     @staticmethod
     def _stabilize_paper_profile(
@@ -317,11 +391,16 @@ class AcademicDistillationEngine:
         payload = [item.model_dump(mode="json") for item in profiles]
         input_hash = _hash_payload(self.CLUSTER_VERSION, target_label, domain, target_hash, payload)
         cached = self.repository.find_compatible_stage_result(
+            stage="candidate_clusters", item_id="global", input_hash=input_hash,
+            model=CandidateClusterResult, persona_id=None,
+        )
+        current = self.repository.load_stage_result(
+            run_id=run_id,
             stage="candidate_clusters",
             item_id="global",
-            input_hash=input_hash,
             model=CandidateClusterResult,
         )
+        cached = current or cached
         if cached is None:
             cached = self._structured_call(
                 cluster_messages(
@@ -331,6 +410,7 @@ class AcademicDistillationEngine:
                 ),
                 CandidateClusterResult,
                 seed=29,
+                step_id="distill.cluster",
                 validator=lambda result: self._stabilize_clusters(result, profiles),
             )
         self.repository.save_stage_result(
@@ -354,7 +434,7 @@ class AcademicDistillationEngine:
         for item in result.candidates:
             member_ids = list(dict.fromkeys(item.paper_candidate_ids))
             if set(member_ids) - members.keys() or used.intersection(member_ids):
-                raise StructuredDistillationError("跨论文聚类引用了未知或重复的单篇候选")
+                raise StructuredDistillationError("跨文档聚类引用了未知或重复的单篇候选")
             allowed_evidence = {
                 evidence_id
                 for member_id in member_ids
@@ -388,10 +468,8 @@ class AcademicDistillationEngine:
         input_hash = _hash_payload(
             self.GENERATIVE_VERSION, target_hash, candidate_payload, holdout_payload
         )
-        result = self.repository.find_compatible_stage_result(
-            stage="generative_validation",
-            item_id="global",
-            input_hash=input_hash,
+        result = self.repository.load_stage_result(
+            run_id=run_id, stage="generative_validation", item_id="global",
             model=ValidationBatchResult,
         )
         if result is None:
@@ -402,6 +480,7 @@ class AcademicDistillationEngine:
                 ),
                 ValidationBatchResult,
                 seed=31,
+                step_id="distill.generative_validation",
                 validator=lambda value: self._validate_generative_result(
                     value,
                     clusters,
@@ -450,10 +529,8 @@ class AcademicDistillationEngine:
         input_hash = _hash_payload(
             self.EXCLUSIVITY_VERSION, domain, control_hash, candidate_payload, control_payload
         )
-        result = self.repository.find_compatible_stage_result(
-            stage="exclusivity_validation",
-            item_id="global",
-            input_hash=input_hash,
+        result = self.repository.load_stage_result(
+            run_id=run_id, stage="exclusivity_validation", item_id="global",
             model=ExclusivityBatchResult,
         )
         if result is None:
@@ -465,6 +542,7 @@ class AcademicDistillationEngine:
                 ),
                 ExclusivityBatchResult,
                 seed=37,
+                step_id="distill.exclusivity_validation",
                 validator=lambda value: self._validate_exclusivity_result(
                     value,
                     clusters,
@@ -503,6 +581,7 @@ class AcademicDistillationEngine:
         model: type[StructuredModel],
         *,
         seed: int,
+        step_id: str,
         validator: Callable[[StructuredModel], StructuredModel] | None = None,
     ) -> StructuredModel:
         last_error = "未知校验错误"
@@ -530,6 +609,7 @@ class AcademicDistillationEngine:
                 use_cache=True,
                 request_attempts=2,
                 stream=True,
+                step_id=step_id,
             )
             try:
                 parsed = model.model_validate(json.loads(response.content))
@@ -544,7 +624,7 @@ class AcademicDistillationEngine:
                 StructuredDistillationError,
             ) as exc:
                 last_error = str(exc)[:2000]
-        raise StructuredDistillationError(f"学术蒸馏结构化调用失败：{last_error}")
+        raise StructuredDistillationError(f"非虚构蒸馏结构化调用失败：{last_error}")
 
 
 def choose_holdout_doc_ids(source_info: tuple[SourceInfo, ...]) -> list[str]:

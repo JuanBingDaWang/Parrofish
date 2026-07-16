@@ -92,8 +92,14 @@ class ProjectRepository:
         allowed_persona_doc_ids: set[str] | None = None,
         generation_options: dict | None = None,
     ) -> str:
-        if not selected_doc_ids:
-            raise ValueError("写作任务至少需要选择一篇事实语料")
+        options = generation_options or {}
+        evidence_mode = str(options.get("evidence_mode", "knowledge_grounded"))
+        if (
+            not selected_doc_ids
+            and evidence_mode != "conceptual_only"
+            and not bool(options.get("use_web_search", False))
+        ):
+            raise ValueError("知识库事实写作至少需要选择一篇事实语料")
         task_id = f"task_{uuid4().hex}"
         now = utc_now()
         with self.database.connection() as connection:

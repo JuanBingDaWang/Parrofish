@@ -54,6 +54,7 @@ class QueryExpander:
                 use_cache=use_cache,
                 stream=True,
                 priority=20,
+                step_id="retrieval.query_rewrite",
             )
         parsed = self._parse_queries(result.content)
         return parsed or [query]
@@ -77,6 +78,7 @@ class QueryExpander:
                 use_cache=use_cache,
                 stream=True,
                 priority=20,
+                step_id="retrieval.hyde",
             )
         passage = result.content.strip()
         return passage or None

@@ -1,4 +1,4 @@
-"""学术作者蒸馏的论文级候选、验证与选择数据契约。"""
+"""非虚构作者蒸馏的文档级候选、验证与选择数据契约。"""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ Specificity = Literal[
     "author_distinctive",
     "field_conventional",
     "general_academic",
+    "general_nonfiction",
     "unverified",
 ]
 RecurrenceLevel = Literal["provisional", "basic", "high"]
@@ -27,7 +28,7 @@ ValidationStatus = Literal["passed", "failed", "not_tested"]
 
 
 class PaperMentalCandidate(BaseModel):
-    """一篇论文内部归并后的可复用学术写作操作。"""
+    """一篇文档内部归并后的可复用非虚构写作操作。"""
 
     model_config = ConfigDict(frozen=True)
 
@@ -35,33 +36,33 @@ class PaperMentalCandidate(BaseModel):
     map_candidate_ids: list[str] = Field(
         min_length=1, description="被归并到该候选的局部 Map 候选标识"
     )
-    operation: AcademicOperation = Field(description="候选所属的学术写作操作类别")
+    operation: AcademicOperation = Field(description="候选所属的非虚构写作操作类别")
     name: str = Field(description="候选操作的简体中文名称")
     description: str = Field(description="候选操作如何运行的简体中文描述")
     evidence_ids: list[str] = Field(min_length=1, description="支持候选的登记证据标识")
     applicability: str = Field(description="该操作适用的问题和条件，使用简体中文")
     limits: str = Field(description="该操作的失效条件，使用简体中文")
-    research_context: str = Field(description="该论文中出现此操作的研究情境")
+    research_context: str = Field(description="该文档中出现此操作的写作情境")
 
 
 class PaperProfile(BaseModel):
-    """单篇论文画像；同一论文的多个 Map 单元在此只计一次。"""
+    """单篇文档画像；同一文档的多个 Map 单元在此只计一次。"""
 
     model_config = ConfigDict(frozen=True)
 
-    doc_id: str = Field(description="必须与输入论文标识完全一致")
+    doc_id: str = Field(description="必须与输入文档标识完全一致")
     candidates: list[PaperMentalCandidate] = Field(
-        default_factory=list, description="该论文中有证据支持的学术写作操作"
+        default_factory=list, description="该文档中有证据支持的非虚构写作操作"
     )
 
 
 class CandidateCluster(BaseModel):
-    """跨论文聚类得到的候选模型，还没有通过中性验证。"""
+    """跨文档聚类得到的候选模型，还没有通过中性验证。"""
 
     model_config = ConfigDict(frozen=True)
 
     candidate_id: str = Field(description="全局候选的稳定标识")
-    operation: AcademicOperation = Field(description="候选所属的学术写作操作类别")
+    operation: AcademicOperation = Field(description="候选所属的非虚构写作操作类别")
     name: str = Field(description="候选模型的简体中文名称")
     description: str = Field(description="候选模型如何运行的简体中文描述")
     paper_candidate_ids: list[str] = Field(min_length=1, description="被聚入该候选的单篇候选标识")
@@ -95,7 +96,7 @@ class CandidateAssessment(BaseModel):
     @model_validator(mode="after")
     def require_match_for_pass(self) -> CandidateAssessment:
         if self.status == "passed" and not self.matched_paper_candidate_ids:
-            raise ValueError("生成力通过时必须提供留出论文中的匹配候选")
+            raise ValueError("生成力通过时必须提供留出文档中的匹配候选")
         return self
 
 
@@ -146,7 +147,7 @@ class AcademicModelValidation(BaseModel):
     @model_validator(mode="after")
     def validate_recurrence(self) -> AcademicModelValidation:
         if self.recurrence_document_count != len(set(self.supporting_doc_ids)):
-            raise ValueError("复现论文数必须等于去重后的 supporting_doc_ids 数量")
+            raise ValueError("复现文档数必须等于去重后的 supporting_doc_ids 数量")
         expected = (
             "high"
             if self.recurrence_document_count >= 3
@@ -155,12 +156,12 @@ class AcademicModelValidation(BaseModel):
             else "provisional"
         )
         if self.recurrence_level != expected:
-            raise ValueError("复现等级与覆盖论文数不一致")
+            raise ValueError("复现等级与覆盖文档数不一致")
         return self
 
     @property
     def eligible(self) -> bool:
-        """至少跨两篇论文复现且没有生成力反证才可进入模型列表。"""
+        """至少跨两篇文档复现且没有生成力反证才可进入模型列表。"""
 
         return self.recurrence_document_count >= 2 and self.generative_status != "failed"
 

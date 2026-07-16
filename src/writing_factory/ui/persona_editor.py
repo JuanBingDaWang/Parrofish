@@ -127,7 +127,10 @@ class PersonaEditorWindow(QMainWindow):
         self._reload_derived_tabs()
         self.json_editor.setEnabled(True)
         self.save_button.setEnabled(True)
-        self.status_label.setText(f"{persona.name} · {len(persona.mental_models)} 个心智模型")
+        self.status_label.setText(
+            f"{persona.name} · {len(persona.mental_models)} 个心智模型 · "
+            f"{len(persona.composition_dna.genre_profiles)} 个谋篇侧写"
+        )
 
     def save(self) -> None:
         """校验并保存 JSON；错误显示在窗口内，不弹阻塞对话框。"""
@@ -165,9 +168,15 @@ class PersonaEditorWindow(QMainWindow):
         )
         self.version_preview.setPlainText(
             "\n".join(
-                f"v{item.get('version_number')} · {item.get('status')} · "
+                f"v{item.get('version_number')} · {self._version_status(item)} · "
                 f"{format_china_datetime(item.get('research_date') or item.get('updated_at'))}"
                 for item in versions
             )
             or "暂无版本历史"
         )
+
+    @staticmethod
+    def _version_status(item: dict[str, object]) -> str:
+        if item.get("status") == "failed" and item.get("error_type") == "TaskCancelled":
+            return "未完成"
+        return str(item.get("status", ""))

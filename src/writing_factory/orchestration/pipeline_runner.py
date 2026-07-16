@@ -37,6 +37,8 @@ from writing_factory.generate.models import (
     GenerationContext,
     GenerationOptions,
     PolishedSection,
+    SectionDraft,
+    VerifiedClaim,
     VerifiedDraft,
 )
 from writing_factory.generate.source_policy import build_persona_generation_source_policy
@@ -68,8 +70,8 @@ logger = logging.getLogger(__name__)
 _NODE_LABELS: dict[str, str] = {
     "select_topic": "选题中",
     "build_framework": "构建文稿框架",
-    "prefetch_evidence": "并发预取并冻结章节证据",
-    "draft_section": "起草章节",
+    "prefetch_evidence": "并发预取并冻结内容单元证据",
+    "draft_section": "起草内容单元",
     "verify_section": "核对事实",
     "polish_section": "打磨文风",
     "prepare_next_section": "准备下一节",
@@ -78,7 +80,7 @@ _NODE_LABELS: dict[str, str] = {
     "term_consistency": "术语一致性审查",
     "structure_review": "结构审查",
     "global_polish": "全局一致性打磨",
-    "assemble": "组装参考文献与最终稿",
+    "assemble": "组装事实来源与最终稿",
 }
 
 
@@ -100,6 +102,8 @@ def run_writing_pipeline_with_progress(
     selected_doc_ids: set[str] | None = None,
     explicitly_allowed_persona_doc_ids: set[str] | None = None,
     generation_options: GenerationOptions | None = None,
+    bocha_client=None,
+    web_search_result_count: int = 5,
     state_callback: Callable[[dict[str, Any]], None] | None = None,
     resume: bool = False,
 ) -> dict[str, Any]:
@@ -127,15 +131,34 @@ def run_writing_pipeline_with_progress(
     # ── Build full task text ───────────────────────────────────
     full_task = task_description
     if domain:
-        full_task = f"{task_description}\n研究领域：{domain}"
+        full_task = f"{task_description}\n内容领域：{domain}"
 
+    resolved_options = generation_options or GenerationOptions()
     source_policy = build_persona_generation_source_policy(
         persona_repository=persona_repository,
         persona_id=persona_id,
         selected_task_doc_ids=selected_doc_ids or set(),
         explicitly_allowed_persona_doc_ids=explicitly_allowed_persona_doc_ids or set(),
     )
-    source_policy.require_nonempty()
+    if (
+        resolved_options.evidence_mode == "knowledge_grounded"
+        and not resolved_options.use_web_search
+    ):
+        source_policy.require_nonempty()
+    active_retriever = retriever
+    if resolved_options.use_web_search:
+        if bocha_client is None:
+            raise ValueError("已启用联网检索，但博查 API 客户端不可用")
+        bocha_transport = getattr(bocha_client, "transport", None)
+        if bocha_transport is not None and not bocha_transport.credential_configured:
+            raise ValueError("已启用联网检索，请先在设置页配置博查 API Key")
+        from writing_factory.kb.web_retrieval import WebAugmentedRetriever
+
+        active_retriever = WebAugmentedRetriever(
+            retriever,
+            bocha_client,
+            result_count=web_search_result_count,
+        )
 
     gen_ctx = GenerationContext(
         kb_id=kb_id,
@@ -146,7 +169,7 @@ def run_writing_pipeline_with_progress(
         allowed_doc_ids=tuple(sorted(source_policy.allowed_task_doc_ids)),
         excluded_persona_doc_ids=tuple(sorted(source_policy.excluded_persona_doc_ids)),
         source_policy_id=source_policy.policy_id,
-        generation_options=generation_options or GenerationOptions(),
+        generation_options=resolved_options,
     )
 
     # ── Create initial state ───────────────────────────────────
@@ -176,7 +199,7 @@ def run_writing_pipeline_with_progress(
             report_progress(2, "编译写作流水线图")
         graph = build_writing_graph(
             persona_repository=persona_repository,
-            retriever=retriever,
+            retriever=active_retriever,
             siliconflow=siliconflow,
             kb_repository=kb_repository,
             checkpoint_dir=checkpoint_dir,
@@ -199,7 +222,17 @@ def run_writing_pipeline_with_progress(
             if stream_config is not config:
                 report_progress(last_reported_percent, "恢复升级前的失败断点")
             else:
-                stream_config, recovered = _verification_recovery_config(graph, config)
+                stream_config, common_recovered = _legacy_common_recovery_config(
+                    graph, config
+                )
+                if common_recovered:
+                    report_progress(
+                        last_reported_percent,
+                        "旧版 common 论断已进入受控重新分类",
+                    )
+                stream_config, recovered = _verification_recovery_config(
+                    graph, stream_config
+                )
                 if recovered:
                     report_progress(
                         last_reported_percent,
@@ -309,7 +342,7 @@ def _verification_recovery_config(
     sections = list(state.get("sections", []))
     index = state.get("current_section_index")
     if not isinstance(index, int) or not 0 <= index < len(sections):
-        raise PipelineNodeError("事实核对恢复", "安全门断点缺少有效的当前章节")
+        raise PipelineNodeError("事实核对恢复", "安全门断点缺少有效的当前内容单元")
 
     section = dict(sections[index])
     verified_json = section.get("verified_draft_json")
@@ -358,6 +391,102 @@ def _verification_recovery_config(
         recovery_count + 1,
         MAX_RECOVERY_REVISIONS_PER_SECTION,
         [item.claim.claim_id for item in failed],
+    )
+    return updated_config, True
+
+
+def _legacy_common_recovery_config(
+    graph,
+    config: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """Rewind an old post-verification section that still contains ``common`` claims."""
+
+    current = graph.get_state(config)
+    if current is None:
+        return config, False
+    state = dict(current.values)
+    sections = list(state.get("sections", []))
+    target_index: int | None = None
+    target_draft: SectionDraft | None = None
+    for index, section in enumerate(sections):
+        raw = section.get("draft_json")
+        if not raw:
+            continue
+        draft = SectionDraft.model_validate_json(raw)
+        if any(claim.claim_type == "common" for claim in draft.claims):
+            target_index = index
+            target_draft = draft
+            break
+    if target_index is None or target_draft is None:
+        return config, False
+
+    section = dict(sections[target_index])
+    recovery_count = int(section.get("recovery_revision_count", 0))
+    if recovery_count >= MAX_RECOVERY_REVISIONS_PER_SECTION:
+        raise PipelineNodeError(
+            "旧版 common 论断恢复",
+            "该内容单元的额外恢复修订已用尽，无法自动重新分类 common 论断",
+        )
+    prior: dict[str, VerifiedClaim] = {}
+    if section.get("verified_draft_json"):
+        verified = VerifiedDraft.model_validate_json(section["verified_draft_json"])
+        prior = {item.claim.claim_id: item for item in verified.verified_claims}
+    verified_claims = []
+    for claim in target_draft.claims:
+        if claim.claim_type == "common":
+            verified_claims.append(
+                VerifiedClaim(
+                    claim=claim,
+                    verdict="unsupported",
+                    verifier_rationale=(
+                        "common 仅为兼容旧断点保留；请重新分类为带来源的 fact，"
+                        "或不依赖外部事实的 interpretation。"
+                    ),
+                )
+            )
+        elif claim.claim_id in prior:
+            verified_claims.append(prior[claim.claim_id])
+        else:
+            verified_claims.append(
+                VerifiedClaim(
+                    claim=claim,
+                    verdict="supported",
+                    verifier_rationale="沿用旧断点中的非 common 论断，等待后续安全门。",
+                )
+            )
+    unsupported = sum(item.verdict == "unsupported" for item in verified_claims)
+    partial = sum(item.verdict == "partial" for item in verified_claims)
+    section.update(
+        {
+            "status": SECTION_STATUS_REVISING,
+            "verified_draft_json": VerifiedDraft(
+                section_id=target_draft.section_id,
+                verified_claims=verified_claims,
+                unsupported_count=unsupported,
+                partial_count=partial,
+                supported_count=len(verified_claims) - unsupported - partial,
+            ).model_dump_json(),
+            "recovery_revision_count": recovery_count + 1,
+            "polished_section_json": None,
+            "error": None,
+        }
+    )
+    sections[target_index] = section
+    updated_config = graph.update_state(
+        config,
+        {
+            "sections": sections,
+            "current_section_index": target_index,
+            "status": PIPELINE_STATUS_DRAFTING,
+            "error": None,
+        },
+        as_node="prepare_revise_section",
+    )
+    logger.info(
+        "恢复旧版 common 论断: section=%s recovery=%d/%d",
+        section.get("section_id"),
+        recovery_count + 1,
+        MAX_RECOVERY_REVISIONS_PER_SECTION,
     )
     return updated_config, True
 

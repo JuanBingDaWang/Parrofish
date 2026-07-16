@@ -5,9 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
 
@@ -47,6 +48,7 @@ class ServiceTransport:
         http_client: httpx.Client | None = None,
         concurrency_gate: DynamicConcurrencyGate | None = None,
         default_request_timeout_seconds: float | None = None,
+        stream_idle_timeout_seconds: float = DEFAULT_STREAM_IDLE_TIMEOUT_SECONDS,
     ) -> None:
         self.provider = provider
         self.base_url = base_url.rstrip("/")
@@ -57,7 +59,9 @@ class ServiceTransport:
         self.default_request_timeout_seconds = default_request_timeout_seconds
         self.connect_timeout_seconds = connect_timeout_seconds
         self.read_timeout_seconds = read_timeout_seconds
-        self.stream_idle_timeout_seconds = DEFAULT_STREAM_IDLE_TIMEOUT_SECONDS
+        if stream_idle_timeout_seconds <= 0:
+            raise ValueError("stream_idle_timeout_seconds must be positive")
+        self.stream_idle_timeout_seconds = stream_idle_timeout_seconds
         self._owns_client = http_client is None
         timeout = httpx.Timeout(
             connect=connect_timeout_seconds,
@@ -80,6 +84,25 @@ class ServiceTransport:
         if self._owns_client:
             self._client.close()
 
+    def set_credential(self, credential: SecretStr) -> None:
+        """Atomically update authorization for subsequent requests."""
+
+        self._client.headers["Authorization"] = f"Bearer {credential.get_secret_value()}"
+
+    @property
+    def credential_configured(self) -> bool:
+        value = self._client.headers.get("Authorization", "")
+        return bool(value.removeprefix("Bearer ").strip())
+
+    def set_base_url(self, base_url: str) -> None:
+        """Update the provider endpoint without rebuilding business services."""
+
+        normalized = base_url.rstrip("/")
+        if not normalized.startswith(("https://", "http://")):
+            raise ValueError("API Base URL 必须以 http:// 或 https:// 开头")
+        self.base_url = normalized
+        self._client.base_url = httpx.URL(f"{normalized}/")
+
     def request_json(
         self,
         method: str,
@@ -95,12 +118,16 @@ class ServiceTransport:
         request_total_timeout_seconds: float | None = None,
         request_attempts: int | None = None,
         stream_response: bool = False,
+        stream_idle_timeout_seconds: float | None = None,
         priority: int = 10,
         response_validator: Callable[[dict[str, Any]], None] | None = None,
         stream_event_callback: Callable[[dict[str, Any]], None] | None = None,
+        check_cancelled: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         """Execute one JSON request and record only structural summaries."""
 
+        if check_cancelled is not None:
+            check_cancelled()
         normalized_payload = dict(payload or {})
         request_hash = self._request_hash(method, path, normalized_payload)
         call_id = str(uuid.uuid4())
@@ -131,6 +158,8 @@ class ServiceTransport:
                         call_id,
                     )
                 else:
+                    if check_cancelled is not None:
+                        check_cancelled()
                     self._record_call(
                         call_id=call_id,
                         request_hash=request_hash,
@@ -162,6 +191,8 @@ class ServiceTransport:
             )
 
             def execute_attempt() -> dict[str, Any]:
+                if check_cancelled is not None:
+                    check_cancelled()
                 attempt_timeout = request_timeout_seconds
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
@@ -182,6 +213,8 @@ class ServiceTransport:
                         attempt_timeout,
                         priority,
                         stream_event_callback,
+                        check_cancelled,
+                        stream_idle_timeout_seconds,
                     )
                     if stream_response and response_validator is not None:
                         try:
@@ -206,6 +239,8 @@ class ServiceTransport:
                                 f"{self.provider} returned an invalid streamed response",
                                 response=invalid_response,
                             ) from exc
+                    if check_cancelled is not None:
+                        check_cancelled()
                     return attempt_response
                 except IncompleteStreamError as exc:
                     if exc.response is not None:
@@ -226,8 +261,26 @@ class ServiceTransport:
                 wait=wait_exponential_jitter(initial=0.5, max=8.0),
                 retry=retry_if_exception_type(RetryableServiceError),
                 reraise=True,
+                sleep=lambda seconds: self._cancellable_sleep(seconds, check_cancelled),
             )(execute_attempt)
         except Exception as exc:
+            if check_cancelled is not None:
+                try:
+                    check_cancelled()
+                except Exception as cancellation_error:
+                    self._record_call(
+                        call_id=call_id,
+                        request_hash=request_hash,
+                        operation=operation,
+                        model=model,
+                        reasoning_effort=reasoning_effort,
+                        prompt_summary=summary,
+                        cache_hit=False,
+                        status="cancelled",
+                        duration_ms=self._elapsed_ms(started_at),
+                        error_type=type(cancellation_error).__name__,
+                    )
+                    raise cancellation_error from exc
             safe_error = (
                 exc
                 if isinstance(exc, ExternalServiceError)
@@ -275,6 +328,9 @@ class ServiceTransport:
             )
             raise
 
+        if check_cancelled is not None:
+            check_cancelled()
+
         if use_cache:
             self.database.set_cached_response(
                 request_hash,
@@ -304,15 +360,23 @@ class ServiceTransport:
         request_timeout_seconds: float | None = None,
         priority: int = 10,
         stream_event_callback: Callable[[dict[str, Any]], None] | None = None,
+        check_cancelled: Callable[[], None] | None = None,
+        stream_idle_timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         """Collect one server-sent event response through the shared transport boundary."""
 
-        self.rate_limiter.wait()
+        self.rate_limiter.wait(check_cancelled)
         timeout_kwargs: dict[str, object] = {}
         idle_timeout_seconds = min(
             self.read_timeout_seconds,
-            self.stream_idle_timeout_seconds,
+            (
+                stream_idle_timeout_seconds
+                if stream_idle_timeout_seconds is not None
+                else self.stream_idle_timeout_seconds
+            ),
         )
+        if idle_timeout_seconds <= 0:
+            raise ValueError("stream_idle_timeout_seconds must be positive")
         if request_timeout_seconds is not None:
             idle_timeout_seconds = min(request_timeout_seconds, idle_timeout_seconds)
             timeout_kwargs["timeout"] = httpx.Timeout(
@@ -322,12 +386,19 @@ class ServiceTransport:
                 pool=min(request_timeout_seconds, self.connect_timeout_seconds),
             )
         wall_started = time.monotonic()
+        last_valid_event_at = wall_started
         chunks: list[dict[str, Any]] = []
         done_received = False
         gate = self.concurrency_gate
-        slot = gate.slot(priority=priority) if gate is not None else _null_slot()
+        slot = (
+            gate.slot(priority=priority, check_cancelled=check_cancelled)
+            if gate is not None
+            else _null_slot()
+        )
         try:
             with slot:
+                if check_cancelled is not None:
+                    check_cancelled()
                 with self._client.stream(
                     method,
                     path,
@@ -335,37 +406,46 @@ class ServiceTransport:
                     **timeout_kwargs,
                 ) as response:
                     self._raise_for_status(response)
-                    for line in response.iter_lines():
-                        if (
-                            request_timeout_seconds is not None
-                            and time.monotonic() - wall_started > request_timeout_seconds
-                        ):
-                            raise RetryableServiceError(
-                                f"{self.provider} stream exceeded wall-clock timeout"
-                            )
-                        value = line.strip()
-                        if not value.startswith("data:"):
-                            continue
-                        data = value[5:].strip()
-                        if data == "[DONE]":
-                            done_received = True
-                            break
-                        try:
-                            decoded = json.loads(data)
-                        except ValueError as exc:
-                            raise ExternalServiceError(
-                                f"{self.provider} returned invalid event JSON"
-                            ) from exc
-                        if not isinstance(decoded, dict):
-                            raise ExternalServiceError(
-                                f"{self.provider} returned an invalid event shape"
-                            )
-                        chunks.append(decoded)
-                        if stream_event_callback is not None:
+                    with _close_response_on_cancel(response, check_cancelled):
+                        for line in response.iter_lines():
+                            if check_cancelled is not None:
+                                check_cancelled()
+                            now = time.monotonic()
+                            if now - last_valid_event_at > idle_timeout_seconds:
+                                raise httpx.ReadTimeout(
+                                    f"{self.provider} stream produced no valid event"
+                                )
+                            if (
+                                request_timeout_seconds is not None
+                                and now - wall_started > request_timeout_seconds
+                            ):
+                                raise RetryableServiceError(
+                                    f"{self.provider} stream exceeded wall-clock timeout"
+                                )
+                            value = line.strip()
+                            if not value.startswith("data:"):
+                                continue
+                            data = value[5:].strip()
+                            if data == "[DONE]":
+                                done_received = True
+                                break
                             try:
-                                stream_event_callback(decoded)
-                            except Exception:
-                                logger.exception("SiliconFlow stream observer failed")
+                                decoded = json.loads(data)
+                            except ValueError as exc:
+                                raise ExternalServiceError(
+                                    f"{self.provider} returned invalid event JSON"
+                                ) from exc
+                            if not isinstance(decoded, dict):
+                                raise ExternalServiceError(
+                                    f"{self.provider} returned an invalid event shape"
+                                )
+                            last_valid_event_at = now
+                            chunks.append(decoded)
+                            if stream_event_callback is not None:
+                                try:
+                                    stream_event_callback(decoded)
+                                except Exception:
+                                    logger.exception("SiliconFlow stream observer failed")
                 if done_received and stream_event_callback is not None:
                     try:
                         stream_event_callback({"_stream_event": "done"})
@@ -484,28 +564,46 @@ class ServiceTransport:
         request_timeout_seconds: float | None = None,
         priority: int = 10,
         stream_event_callback: Callable[[dict[str, Any]], None] | None = None,
+        check_cancelled: Callable[[], None] | None = None,
+        stream_idle_timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
-        _ = stream_event_callback
-        self.rate_limiter.wait()
+        _ = (stream_event_callback, stream_idle_timeout_seconds)
+        self.rate_limiter.wait(check_cancelled)
         timeout_kwargs = (
             {"timeout": request_timeout_seconds} if request_timeout_seconds is not None else {}
         )
         gate = self.concurrency_gate
-        slot = gate.slot(priority=priority) if gate is not None else _null_slot()
+        slot = (
+            gate.slot(priority=priority, check_cancelled=check_cancelled)
+            if gate is not None
+            else _null_slot()
+        )
+        request_client = self._client
+        owns_request_client = check_cancelled is not None and self._owns_client
+        if owns_request_client:
+            request_client = self._new_isolated_client()
         try:
             with slot:
-                if method.upper() == "GET":
-                    response = self._client.request(
-                        method, path, params=payload or None, **timeout_kwargs
-                    )
-                else:
-                    response = self._client.request(
-                        method, path, json=payload or None, **timeout_kwargs
-                    )
+                if check_cancelled is not None:
+                    check_cancelled()
+                with _close_client_on_cancel(request_client, check_cancelled):
+                    if method.upper() == "GET":
+                        response = request_client.request(
+                            method, path, params=payload or None, **timeout_kwargs
+                        )
+                    else:
+                        response = request_client.request(
+                            method, path, json=payload or None, **timeout_kwargs
+                        )
+                    if check_cancelled is not None:
+                        check_cancelled()
         except httpx.TimeoutException as exc:
             raise RetryableServiceError(f"{self.provider} request timed out") from exc
         except httpx.TransportError as exc:
             raise RetryableServiceError(f"{self.provider} network error") from exc
+        finally:
+            if owns_request_client:
+                request_client.close()
 
         self._raise_for_status(response)
         try:
@@ -515,6 +613,37 @@ class ServiceTransport:
         if not isinstance(data, dict):
             raise ExternalServiceError(f"{self.provider} returned an invalid response shape")
         return data
+
+    def _new_isolated_client(self) -> httpx.Client:
+        """Create one cancellable client so closing it cannot affect sibling requests."""
+
+        timeout = httpx.Timeout(
+            connect=self.connect_timeout_seconds,
+            read=self.read_timeout_seconds,
+            write=self.read_timeout_seconds,
+            pool=self.connect_timeout_seconds,
+        )
+        return httpx.Client(
+            base_url=self.base_url,
+            headers=dict(self._client.headers),
+            timeout=timeout,
+        )
+
+    @staticmethod
+    def _cancellable_sleep(
+        seconds: float,
+        check_cancelled: Callable[[], None] | None,
+    ) -> None:
+        """Keep retry backoff responsive to a desktop task cancellation."""
+
+        deadline = time.monotonic() + max(0.0, seconds)
+        while True:
+            if check_cancelled is not None:
+                check_cancelled()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.1, remaining))
 
     def _raise_for_status(self, response: httpx.Response) -> None:
         """Apply the same sanitized status policy to JSON and SSE responses."""
@@ -639,3 +768,85 @@ def _null_slot():
     """避免为未配置并发闸门的其他服务改变传输行为。"""
 
     yield
+
+
+@contextmanager
+def _close_response_on_cancel(
+    response: httpx.Response,
+    check_cancelled: Callable[[], None] | None,
+) -> Iterator[None]:
+    """Close a blocking SSE response as soon as its owning UI task is cancelled."""
+
+    if check_cancelled is None:
+        yield
+        return
+
+    stopped = threading.Event()
+    cancellation_seen = threading.Event()
+
+    def watch() -> None:
+        while not stopped.wait(0.1):
+            try:
+                check_cancelled()
+            except Exception:
+                cancellation_seen.set()
+                try:
+                    response.close()
+                except Exception:
+                    pass
+                return
+
+    watcher = threading.Thread(
+        target=watch,
+        name="service-stream-cancellation",
+        daemon=True,
+    )
+    watcher.start()
+    try:
+        yield
+    finally:
+        stopped.set()
+        watcher.join(timeout=0.2)
+        if cancellation_seen.is_set():
+            check_cancelled()
+
+
+@contextmanager
+def _close_client_on_cancel(
+    client: httpx.Client,
+    check_cancelled: Callable[[], None] | None,
+) -> Iterator[None]:
+    """Close an isolated blocking client when its owning task is cancelled."""
+
+    if check_cancelled is None:
+        yield
+        return
+
+    stopped = threading.Event()
+    cancellation_seen = threading.Event()
+
+    def watch() -> None:
+        while not stopped.wait(0.1):
+            try:
+                check_cancelled()
+            except Exception:
+                cancellation_seen.set()
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                return
+
+    watcher = threading.Thread(
+        target=watch,
+        name="service-request-cancellation",
+        daemon=True,
+    )
+    watcher.start()
+    try:
+        yield
+    finally:
+        stopped.set()
+        watcher.join(timeout=0.2)
+        if cancellation_seen.is_set():
+            check_cancelled()

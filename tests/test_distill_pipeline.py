@@ -34,6 +34,8 @@ from writing_factory.distill.models import (
     StyleTags,
     TripleValidation,
 )
+from writing_factory.distill.options import DistillationOptions
+from writing_factory.distill.reference_aliases import GapReferenceAliases
 from writing_factory.distill.serialization import render_persona_markdown
 from writing_factory.distill.service import DistillationService
 from writing_factory.distill.sources import SourceCorpus
@@ -42,6 +44,7 @@ from writing_factory.llm.models import ChatResult
 from writing_factory.store import Database
 from writing_factory.store.kb_repository import KnowledgeBaseRepository
 from writing_factory.store.persona_repository import PersonaRepository
+from writing_factory.ui.workers import TaskCancelled
 
 
 class FakeChatClient:
@@ -372,7 +375,7 @@ class FakeSynthesizer:
         return _persona(persona_id)
 
 
-def test_service_resumes_maps_and_reuses_ready_profile(tmp_path) -> None:
+def test_service_resumes_only_the_explicit_selected_checkpoint(tmp_path) -> None:
     database = Database(tmp_path / "distill.db")
     database.initialize()
     KnowledgeBaseRepository(database).ensure_default()
@@ -409,15 +412,55 @@ def test_service_resumes_maps_and_reuses_ready_profile(tmp_path) -> None:
 
     with pytest.raises(RuntimeError, match="planned failure"):
         service.distill(kb_id="kb_default", name="author", mode="person")
-    second = service.distill(kb_id="kb_default", name="author", mode="person")
-    third = service.distill(kb_id="kb_default", name="author", mode="person")
+    interrupted = repository.list_personas("kb_default")[0]
+    with pytest.raises(ValueError, match="继续"):
+        service.distill(kb_id="kb_default", name="author", mode="person")
+    second = service.resume(
+        kb_id="kb_default",
+        persona_id=str(interrupted["persona_id"]),
+    )
 
     assert isinstance(second, DistillationOutcome)
     assert not second.reused
-    assert third.reused
+    with pytest.raises(ValueError, match="已经完成的档案不能继续"):
+        service.resume(kb_id="kb_default", persona_id=second.persona.id)
+    with pytest.raises(ValueError, match="升级"):
+        service.distill(kb_id="kb_default", name="author", mode="person")
     assert extractor.calls.count("unit_1") == 1
     assert extractor.calls.count("unit_2") == 2
     assert synthesizer.calls == 1
+
+
+def test_cancelled_distillation_marks_the_resumable_run_as_unfinished(tmp_path) -> None:
+    database = Database(tmp_path / "cancelled_distillation.db")
+    database.initialize()
+    KnowledgeBaseRepository(database).ensure_default()
+    repository = PersonaRepository(database)
+    service = DistillationService(
+        repository,
+        FakeCorpusBuilder(_service_corpus(unit_count=1)),
+        TrackingExtractor(delay=0.01),
+        FakeSynthesizer(),
+        map_concurrency=1,
+    )
+
+    def check_cancelled() -> None:
+        raise TaskCancelled("planned cancellation")
+
+    with pytest.raises(TaskCancelled):
+        service.distill(
+            kb_id="kb_default",
+            name="待继续作者",
+            mode="person",
+            check_cancelled=check_cancelled,
+        )
+
+    profile = repository.list_personas("kb_default")[0]
+    assert profile["status"] == "failed"
+    assert profile["error_type"] == "TaskCancelled"
+    context = repository.load_run_context("kb_default", str(profile["persona_id"]))
+    assert context is not None
+    assert context.status == "failed"
 
 
 class ConcurrentFailingOnceExtractor:
@@ -444,8 +487,9 @@ def test_service_saves_successful_in_flight_maps_before_raising(tmp_path) -> Non
     KnowledgeBaseRepository(database).ensure_default()
     extractor = ConcurrentFailingOnceExtractor()
     synthesizer = FakeSynthesizer()
+    repository = PersonaRepository(database)
     service = DistillationService(
-        PersonaRepository(database),
+        repository,
         FakeCorpusBuilder(_service_corpus(unit_count=3)),
         extractor,
         synthesizer,
@@ -454,7 +498,11 @@ def test_service_saves_successful_in_flight_maps_before_raising(tmp_path) -> Non
 
     with pytest.raises(RuntimeError, match="planned concurrent failure"):
         service.distill(kb_id="kb_default", name="测试作者", mode="person")
-    service.distill(kb_id="kb_default", name="测试作者", mode="person")
+    interrupted = repository.list_personas("kb_default")[0]
+    service.resume(
+        kb_id="kb_default",
+        persona_id=str(interrupted["persona_id"]),
+    )
 
     assert extractor.calls.count("unit_0") == 2
     assert extractor.calls.count("unit_1") == 1
@@ -657,6 +705,81 @@ def test_reduce_reports_allowed_gap_ids_for_repair() -> None:
     assert next(iter(gap_registry)) in str(exc_info.value)
 
 
+def test_reduce_uses_short_gap_aliases_and_repair_bypasses_normal_cache() -> None:
+    unit, mapped = _synthesis_sources()
+    mapped = mapped.model_copy(
+        update={
+            "information_gaps": [
+                MapInformationGap(
+                    dimension="研究阶段",
+                    description="当前单元缺少早期材料",
+                    reason="本单元只包含近期材料",
+                    resolvable_by_more_sources=True,
+                    confidence="medium",
+                )
+            ]
+        }
+    )
+    registry, gap_registry, bundle = CandidateBundleBuilder().build([mapped], (unit,))
+    aliases = GapReferenceAliases.from_registry(gap_registry)
+    stable_gap_id = next(iter(gap_registry))
+    evidence_ids = list(registry)
+    base = _reduced_fixture(evidence_ids)
+
+    def reduced_with_gap(identifier: str) -> str:
+        return base.model_copy(
+            update={
+                "information_gaps": [
+                    ReduceInformationGap(
+                        dimension="研究阶段",
+                        description="完整语料仍缺少早期研究材料",
+                        supporting_gap_ids=[identifier],
+                        reviewed_document_count=2,
+                        unresolved_reason="两篇来源都没有覆盖早期阶段",
+                        confidence="medium",
+                    )
+                ]
+            }
+        ).model_dump_json()
+
+    class ValidatingClient(FakeChatClient):
+        def chat(self, messages, **kwargs):
+            self.calls.append({"messages": messages, **kwargs})
+            result = ChatResult(content=self.responses.pop(0), model="fixture")
+            validator = kwargs.get("result_validator")
+            if callable(validator):
+                validator(result)
+            return result
+
+    client = ValidatingClient([reduced_with_gap("G999"), reduced_with_gap("G001")])
+    synthesizer = PersonaSynthesizer(client, max_attempts=2)
+    persona = synthesizer.synthesize(
+        persona_id="persona_alias",
+        name="测试作者",
+        mode="person",
+        map_results=[mapped],
+        units=(unit,),
+        source_info=(
+            SourceInfo(doc_id="doc_a", title="甲", filename="a.txt", chunk_count=1),
+            SourceInfo(doc_id="doc_b", title="乙", filename="b.txt", chunk_count=1),
+        ),
+        expression=ExpressionAnalyzer().analyze(["完整材料用于全局复核。"]),
+        research_date=date(2026, 7, 16),
+    )
+
+    first_request = client.calls[0]["messages"][1]["content"]
+    repair_message = client.calls[1]["messages"][-1]["content"]
+    assert aliases.alias_to_gap_id == {"G001": stable_gap_id}
+    assert '"gap_id": "G001"' in first_request
+    assert stable_gap_id not in first_request
+    assert "未知缺口短标识：G999" in repair_message
+    assert stable_gap_id not in repair_message
+    assert [call["use_cache"] for call in client.calls] == [True, False]
+    assert all(call["report_stream_error"] is False for call in client.calls)
+    assert persona.information_gaps[0].supporting_gap_ids == [stable_gap_id]
+    assert stable_gap_id in bundle["local_information_gaps"][0]["gap_id"]
+
+
 def test_reduce_can_repair_sequential_independent_contract_failures() -> None:
     unit, mapped = _synthesis_sources()
     mapped = mapped.model_copy(
@@ -809,17 +932,53 @@ def test_service_runs_three_maps_concurrently_and_preserves_reduce_order(tmp_pat
     assert synthesizer.map_orders == [[unit.unit_id for unit in corpus.units]]
 
 
-def test_reduce_version_change_reuses_compatible_maps_across_runs(tmp_path) -> None:
-    class NextReduceService(DistillationService):
-        REDUCE_PIPELINE_VERSION = "persona-reduce-test-next"
+def test_resume_after_final_assembly_failure_reuses_all_completed_maps(tmp_path) -> None:
+    class FailingOnceSynthesizer:
+        def __init__(self) -> None:
+            self.calls = 0
 
+        def synthesize(self, *, persona_id, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise StructuredDistillationError("planned final assembly failure")
+            return _persona(persona_id)
+
+    database = Database(tmp_path / "resume_final_assembly.db")
+    database.initialize()
+    KnowledgeBaseRepository(database).ensure_default()
+    repository = PersonaRepository(database)
+    extractor = TrackingExtractor(delay=0.0)
+    synthesizer = FailingOnceSynthesizer()
+    service = DistillationService(
+        repository,
+        FakeCorpusBuilder(_service_corpus(unit_count=3)),
+        extractor,
+        synthesizer,
+        map_concurrency=1,
+    )
+
+    with pytest.raises(StructuredDistillationError, match="final assembly"):
+        service.distill(kb_id="kb_default", name="待续跑作者", mode="person")
+    failed = repository.list_personas("kb_default")[0]
+
+    outcome = service.resume(
+        kb_id="kb_default",
+        persona_id=str(failed["persona_id"]),
+    )
+
+    assert outcome.persona.id == failed["persona_id"]
+    assert synthesizer.calls == 2
+    assert extractor.calls == ["unit_0", "unit_1", "unit_2"]
+
+
+def test_explicit_upgrade_reuses_compatible_maps_and_reruns_reduce(tmp_path) -> None:
     database = Database(tmp_path / "reuse.db")
     database.initialize()
     KnowledgeBaseRepository(database).ensure_default()
     repository = PersonaRepository(database)
     corpus = _service_corpus(unit_count=2)
     first_extractor = TrackingExtractor(delay=0.0)
-    DistillationService(
+    first = DistillationService(
         repository,
         FakeCorpusBuilder(corpus),
         first_extractor,
@@ -829,16 +988,16 @@ def test_reduce_version_change_reuses_compatible_maps_across_runs(tmp_path) -> N
     second_extractor = TrackingExtractor(delay=0.0)
     progress_messages: list[str] = []
 
-    outcome = NextReduceService(
+    outcome = DistillationService(
         repository,
         FakeCorpusBuilder(corpus),
         second_extractor,
         FakeSynthesizer(),
         map_concurrency=1,
-    ).distill(
+    ).upgrade(
         kb_id="kb_default",
-        name="测试作者",
-        mode="person",
+        base_persona_id=first.persona.id,
+        doc_ids={"doc_a"},
         progress=lambda _percent, message: progress_messages.append(message),
     )
 
@@ -846,6 +1005,119 @@ def test_reduce_version_change_reuses_compatible_maps_across_runs(tmp_path) -> N
     assert first_extractor.calls == ["unit_0", "unit_1"]
     assert second_extractor.calls == []
     assert "复用思维候选" in progress_messages
+    assert outcome.persona.id != first.persona.id
+    versions = repository.list_versions(outcome.persona.id)
+    assert [item["version_number"] for item in versions] == [2, 1]
+
+
+def test_failed_upgrade_keeps_previous_ready_version_available(tmp_path) -> None:
+    class FailingSynthesizer:
+        def synthesize(self, **_kwargs):
+            raise RuntimeError("planned upgrade failure")
+
+    database = Database(tmp_path / "failed_upgrade.db")
+    database.initialize()
+    KnowledgeBaseRepository(database).ensure_default()
+    repository = PersonaRepository(database)
+    corpus = _service_corpus(unit_count=2)
+    first = DistillationService(
+        repository,
+        FakeCorpusBuilder(corpus),
+        TrackingExtractor(delay=0.0),
+        FakeSynthesizer(),
+        map_concurrency=1,
+    ).distill(kb_id="kb_default", name="测试作者", mode="person")
+
+    with pytest.raises(RuntimeError, match="planned upgrade failure"):
+        DistillationService(
+            repository,
+            FakeCorpusBuilder(corpus),
+            TrackingExtractor(delay=0.0),
+            FailingSynthesizer(),
+            map_concurrency=1,
+        ).upgrade(
+            kb_id="kb_default",
+            base_persona_id=first.persona.id,
+            doc_ids={"doc_a"},
+        )
+
+    management = repository.list_personas("kb_default")
+    ready = repository.list_ready_personas("kb_default")
+    assert management[0]["status"] == "failed"
+    assert management[0]["version_number"] == 2
+    assert ready[0]["persona_id"] == first.persona.id
+    assert ready[0]["version_number"] == 1
+
+
+def test_upgrade_does_not_reuse_changed_text_with_same_unit_and_chunk_ids(tmp_path) -> None:
+    database = Database(tmp_path / "changed_source.db")
+    database.initialize()
+    KnowledgeBaseRepository(database).ensure_default()
+    repository = PersonaRepository(database)
+    original = _service_corpus(unit_count=2)
+    first = DistillationService(
+        repository,
+        FakeCorpusBuilder(original),
+        TrackingExtractor(delay=0.0),
+        FakeSynthesizer(),
+        map_concurrency=1,
+    ).distill(kb_id="kb_default", name="测试作者", mode="person")
+    changed_units = list(original.units)
+    changed_units[0] = changed_units[0].model_copy(
+        update={
+            "segments": [
+                changed_units[0].segments[0].model_copy(update={"text": "已经修改的语料"})
+            ]
+        }
+    )
+    changed = SourceCorpus(
+        units=tuple(changed_units),
+        source_info=original.source_info,
+        source_hash="changed_source_hash",
+    )
+    extractor = TrackingExtractor(delay=0.0)
+
+    DistillationService(
+        repository,
+        FakeCorpusBuilder(changed),
+        extractor,
+        FakeSynthesizer(),
+        map_concurrency=1,
+    ).upgrade(
+        kb_id="kb_default",
+        base_persona_id=first.persona.id,
+        doc_ids={"doc_a"},
+    )
+
+    assert extractor.calls == ["unit_0"]
+
+
+def test_quality_options_survive_persona_and_sqlite_round_trip(tmp_path) -> None:
+    database = Database(tmp_path / "quality_options.db")
+    database.initialize()
+    KnowledgeBaseRepository(database).ensure_default()
+    repository = PersonaRepository(database)
+    options = DistillationOptions.from_preset("fast")
+
+    outcome = DistillationService(
+        repository,
+        FakeCorpusBuilder(_service_corpus(unit_count=2)),
+        TrackingExtractor(delay=0.0),
+        FakeSynthesizer(),
+        map_concurrency=1,
+    ).distill(
+        kb_id="kb_default",
+        name="快速作者",
+        mode="person",
+        options=options,
+    )
+
+    context = repository.load_run_context("kb_default", outcome.persona.id)
+    loaded = repository.load_ready(outcome.persona.id)
+    assert outcome.persona.distillation_options == options
+    assert context is not None and context.options == options
+    assert loaded is not None and loaded[0].distillation_options == options
+    assert "快速" in loaded[1]
 
 
 def test_repository_updates_and_deletes_ready_persona_with_dependents(tmp_path) -> None:

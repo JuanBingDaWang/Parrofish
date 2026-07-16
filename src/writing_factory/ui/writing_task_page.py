@@ -16,7 +16,6 @@ from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
-    QComboBox,
     QFormLayout,
     QGridLayout,
     QGroupBox,
@@ -43,6 +42,7 @@ from PyQt6.QtWidgets import (
 )
 
 from writing_factory.generate.models import DocumentForm, GenerationOptions
+from writing_factory.nonfiction import GENRE_OPTIONS, NonfictionGenre, infer_nonfiction_genre
 from writing_factory.orchestration.state import (
     MAX_RECOVERY_REVISIONS_PER_SECTION,
     PIPELINE_STATUS_ASSEMBLING,
@@ -57,8 +57,11 @@ from writing_factory.orchestration.state import (
     PIPELINE_STATUS_TOPIC,
     PIPELINE_STATUS_VERIFYING,
 )
+from writing_factory.ui.help_ui import create_help_button
 from writing_factory.ui.live_output_window import LiveOutputWindow
+from writing_factory.ui.quality_steps_help import QualityStepsHelpDialog
 from writing_factory.ui.time_format import format_china_datetime
+from writing_factory.ui.widgets import NoWheelComboBox
 from writing_factory.ui.workers import BackgroundTaskManager, TaskContext
 
 logger = logging.getLogger(__name__)
@@ -74,7 +77,7 @@ _PIPELINE_LABELS: dict[str, str] = {
     PIPELINE_STATUS_TERM_REVIEW: "术语审查",
     PIPELINE_STATUS_STRUCTURE_REVIEW: "结构审查",
     PIPELINE_STATUS_GLOBAL_POLISH: "全局打磨",
-    PIPELINE_STATUS_ASSEMBLING: "组装参考文献",
+    PIPELINE_STATUS_ASSEMBLING: "组装成稿与来源",
     PIPELINE_STATUS_DONE: "完成",
     PIPELINE_STATUS_ERROR: "出错",
 }
@@ -149,6 +152,7 @@ class WritingTaskPage(QWidget):
         self._show_message = show_message
         self._task_id: str | None = None
         self._writing_task_id: str | None = None
+        self._displayed_task_id: str | None = None
         self._last_result: dict[str, Any] | None = None
         self._current_section_index: int | None = None
         self._personas: list[dict[str, object]] = []
@@ -182,13 +186,10 @@ class WritingTaskPage(QWidget):
         heading = QLabel("写作任务")
         heading.setObjectName("pageTitle")
         header.addWidget(heading)
+        self.help_button = create_help_button("writing", self)
+        header.addWidget(self.help_button)
         header.addStretch(1)
         layout.addLayout(header)
-
-        self.source_summary_label = QLabel("已选 0 篇 · 隔离 0 篇 · 实际可用 0 篇")
-        self.source_summary_label.setObjectName("mutedText")
-        self.source_summary_label.setWordWrap(True)
-        layout.addWidget(self.source_summary_label)
 
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.main_splitter.setChildrenCollapsible(False)
@@ -197,10 +198,11 @@ class WritingTaskPage(QWidget):
         # ── Config panel ──
         config_group = QGroupBox("任务配置")
         config_group.setObjectName("configGroup")
-        config_layout = QFormLayout(config_group)
+        self.config_layout = QFormLayout(config_group)
+        config_layout = self.config_layout
         config_layout.setSpacing(10)
 
-        self.project_combo = QComboBox()
+        self.project_combo = NoWheelComboBox()
         self.project_combo.currentIndexChanged.connect(self._reload_task_history)
         config_layout.addRow("所属项目:", self.project_combo)
 
@@ -209,8 +211,8 @@ class WritingTaskPage(QWidget):
         config_layout.addRow("任务标题:", self.title_input)
 
         persona_row = QHBoxLayout()
-        self.persona_combo = QComboBox()
-        self.persona_combo.setMinimumWidth(300)
+        self.persona_combo = NoWheelComboBox()
+        self.persona_combo.setMinimumWidth(160)
         self.persona_combo.setToolTip("选择一个已蒸馏的作者档案作为写作风格来源")
         self.persona_combo.currentIndexChanged.connect(self._update_source_summary)
         self.refresh_button = QPushButton(
@@ -226,27 +228,58 @@ class WritingTaskPage(QWidget):
 
         self.task_input = QTextEdit()
         self.task_input.setPlaceholderText(
-            "描述写作任务，例如：「写一个论证数字阅读公共价值的段落」"
+            "描述文体、受众和任务，例如：「面向普通读者写一篇解释数字阅读公共价值的评论」"
         )
         self.task_input.setMaximumHeight(72)
         config_layout.addRow("主题/要求:", self.task_input)
 
         domain_row = QHBoxLayout()
         self.domain_input = QTextEdit()
-        self.domain_input.setPlaceholderText("研究领域（可选），如「出版学」")
+        self.domain_input.setPlaceholderText("内容领域（可选），如「出版学」")
         self.domain_input.setMaximumHeight(48)
         self.domain_input.setMaximumWidth(300)
         domain_row.addWidget(self.domain_input, 1)
         domain_row.addStretch(1)
-        config_layout.addRow("研究领域:", domain_row)
+        config_layout.addRow("内容领域:", domain_row)
 
-        self.document_form_combo = QComboBox()
+        self.document_form_combo = NoWheelComboBox()
         self.document_form_combo.addItem("自动识别", "auto")
         self.document_form_combo.addItem("单个段落", "paragraph")
-        self.document_form_combo.addItem("短文 / 摘要", "short_text")
-        self.document_form_combo.addItem("论文", "paper")
-        self.document_form_combo.setToolTip("自动模式根据任务中的“段落、摘要、论文”等表达判断")
-        config_layout.addRow("文稿形态:", self.document_form_combo)
+        self.document_form_combo.addItem("短篇文本", "short_text")
+        self.document_form_combo.addItem("长篇文本", "paper")
+        self.document_form_combo.setToolTip("这里只控制篇幅层级；具体文体由下方单独选择")
+        config_layout.addRow("篇幅形态:", self.document_form_combo)
+
+        self.genre_combo = NoWheelComboBox()
+        self.genre_combo.addItem("自动识别", "auto")
+        for genre, label in GENRE_OPTIONS:
+            self.genre_combo.addItem(label, genre)
+        self.genre_combo.setToolTip("自动模式根据任务描述识别；无法判断时采用通用非虚构文本")
+        config_layout.addRow("非虚构文体:", self.genre_combo)
+
+        self.evidence_mode_combo = NoWheelComboBox()
+        self.evidence_mode_combo.addItem("知识库事实写作", "knowledge_grounded")
+        self.evidence_mode_combo.addItem("无事实构思", "conceptual_only")
+        self.evidence_mode_combo.setToolTip(
+            "无事实构思不检索知识库，只生成观点、框架、建议和条件性假设"
+        )
+        self.evidence_mode_combo.currentIndexChanged.connect(self._evidence_mode_changed)
+        config_layout.addRow("写作依据:", self.evidence_mode_combo)
+        self.web_search_checkbox = QCheckBox("使用博查联网检索")
+        self.web_search_checkbox.setToolTip(
+            "按设置中的条目数检索公开网页；未勾选时不会发起任何联网搜索"
+        )
+        self.web_search_checkbox.toggled.connect(self._update_source_summary)
+        config_layout.addRow("联网增强:", self.web_search_checkbox)
+
+        self.citation_display_combo = NoWheelComboBox()
+        self.citation_display_combo.addItem("自动（按文体）", "auto")
+        self.citation_display_combo.addItem("正文标注并列参考文献", "bibliography")
+        self.citation_display_combo.addItem("仅内部溯源，成稿不显示", "internal_only")
+        self.citation_display_combo.setToolTip(
+            "无论是否显示，事实论断仍会保留内部来源并按所选质量步骤核验"
+        )
+        config_layout.addRow("引用呈现:", self.citation_display_combo)
 
         self.target_length_spin = QSpinBox()
         self.target_length_spin.setRange(0, 100000)
@@ -256,7 +289,7 @@ class WritingTaskPage(QWidget):
         self.target_length_spin.setToolTip("设为自动时，从主题/要求中的“1500字”等表达识别")
         config_layout.addRow("目标篇幅:", self.target_length_spin)
 
-        self.quality_preset_combo = QComboBox()
+        self.quality_preset_combo = NoWheelComboBox()
         self.quality_preset_combo.addItem("严谨定稿", "strict")
         self.quality_preset_combo.addItem("平衡模式", "balanced")
         self.quality_preset_combo.addItem("快速草稿", "fast_draft")
@@ -265,18 +298,26 @@ class WritingTaskPage(QWidget):
         config_layout.addRow("质量模式:", self.quality_preset_combo)
 
         quality_widget = QWidget()
-        quality_grid = QGridLayout(quality_widget)
-        quality_grid.setContentsMargins(0, 0, 0, 0)
-        quality_grid.setHorizontalSpacing(16)
-        quality_grid.setVerticalSpacing(6)
-        self.fact_verification_checkbox = QCheckBox("事实语义核验")
-        self.section_polish_checkbox = QCheckBox("章节文风打磨")
-        self.section_drift_checkbox = QCheckBox("章节防漂移")
+        self.quality_grid = QGridLayout(quality_widget)
+        self.quality_grid.setContentsMargins(0, 0, 0, 0)
+        self.quality_grid.setHorizontalSpacing(6)
+        self.quality_grid.setVerticalSpacing(6)
+        self.hyde_checkbox = QCheckBox("HyDE")
+        self.query_rewrite_checkbox = QCheckBox("查询改写")
+        self.topic_refinement_checkbox = QCheckBox("选题锐化")
+        self.framework_generation_checkbox = QCheckBox("内容规划")
+        self.fact_verification_checkbox = QCheckBox("事实核验")
+        self.section_polish_checkbox = QCheckBox("单元打磨")
+        self.section_drift_checkbox = QCheckBox("打磨防漂移")
         self.term_review_checkbox = QCheckBox("术语审查")
         self.structure_review_checkbox = QCheckBox("结构审查")
         self.global_polish_checkbox = QCheckBox("全局打磨")
         self.global_drift_checkbox = QCheckBox("全局防漂移")
         self._quality_checkboxes = (
+            self.hyde_checkbox,
+            self.query_rewrite_checkbox,
+            self.topic_refinement_checkbox,
+            self.framework_generation_checkbox,
             self.fact_verification_checkbox,
             self.section_polish_checkbox,
             self.section_drift_checkbox,
@@ -286,9 +327,23 @@ class WritingTaskPage(QWidget):
             self.global_drift_checkbox,
         )
         for index, checkbox in enumerate(self._quality_checkboxes):
-            quality_grid.addWidget(checkbox, index // 2, index % 2)
+            self.quality_grid.addWidget(checkbox, index // 3, index % 3)
             checkbox.toggled.connect(self._mark_quality_custom)
-        config_layout.addRow("质量步骤:", quality_widget)
+        for column in range(3):
+            self.quality_grid.setColumnStretch(column, 1)
+        quality_label = QWidget()
+        quality_label_layout = QHBoxLayout(quality_label)
+        quality_label_layout.setContentsMargins(0, 0, 0, 0)
+        quality_label_layout.setSpacing(4)
+        quality_label_layout.addWidget(QLabel("质量步骤:"))
+        self.quality_help_button = QToolButton()
+        self.quality_help_button.setText("?")
+        self.quality_help_button.setFixedSize(24, 24)
+        self.quality_help_button.setToolTip("查看各质量步骤的作用和预计耗时")
+        self.quality_help_button.setAccessibleName("质量步骤说明")
+        self.quality_help_button.clicked.connect(self._show_quality_steps_help)
+        quality_label_layout.addWidget(self.quality_help_button)
+        config_layout.addRow(quality_label, quality_widget)
         self._apply_quality_preset()
 
         self.document_list = QListWidget()
@@ -296,9 +351,13 @@ class WritingTaskPage(QWidget):
         self.document_list.setToolTip("勾选本任务允许作为事实与引用来源的文档")
         self.document_list.itemChanged.connect(self._update_source_summary)
         config_layout.addRow("事实语料:", self.document_list)
-        self.allow_persona_sources = QCheckBox("明确允许复用所选作者蒸馏语料作为事实来源")
+        self.source_summary_label = QLabel("已选 0 篇 · 隔离 0 篇 · 实际可用 0 篇")
+        self.source_summary_label.setObjectName("mutedText")
+        self.source_summary_label.setWordWrap(True)
+        config_layout.addRow("", self.source_summary_label)
+        self.allow_persona_sources = QCheckBox("允许作者蒸馏语料作为事实来源")
         self.allow_persona_sources.setToolTip(
-            "默认隔离作者旧论文；只有本任务确实需要引用它们时才开启"
+            "默认隔离作者蒸馏语料；只有本任务确实需要引用它们时才开启"
         )
         self.allow_persona_sources.stateChanged.connect(self._update_source_summary)
         config_layout.addRow("来源隔离:", self.allow_persona_sources)
@@ -365,8 +424,7 @@ class WritingTaskPage(QWidget):
         task_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         task_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         task_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.task_table.itemDoubleClicked.connect(lambda _item: self._load_selected_task())
-        self.task_table.itemSelectionChanged.connect(self._update_task_error_banner)
+        self.task_table.itemSelectionChanged.connect(self._task_selection_changed)
         history_layout.addWidget(self.task_table)
         self.task_error_label = QPlainTextEdit()
         self.task_error_label.setObjectName("errorText")
@@ -434,6 +492,9 @@ class WritingTaskPage(QWidget):
         self.live_output_view.setPlaceholderText("模型的实时输出将在这里逐步显示")
         self.live_output_view.setMinimumHeight(110)
         self.live_output_view.document().setMaximumBlockCount(5000)
+        self.live_output_view.verticalScrollBar().rangeChanged.connect(
+            self._live_output_range_changed
+        )
 
         live_tab = QWidget()
         live_layout = QVBoxLayout(live_tab)
@@ -469,7 +530,7 @@ class WritingTaskPage(QWidget):
         self.diagnostic_output_view.document().setMaximumBlockCount(5000)
 
         self.progress_tabs = QTabWidget()
-        self.progress_tabs.addTab(section_tab, "章节进度")
+        self.progress_tabs.addTab(section_tab, "内容单元进度")
         self._live_output_tab_index = self.progress_tabs.addTab(live_tab, "实时输出")
         self.progress_tabs.addTab(self.diagnostic_output_view, "调用明细")
         progress_layout.addWidget(self.progress_tabs)
@@ -496,13 +557,13 @@ class WritingTaskPage(QWidget):
         self.result_tabs.addTab(self._draft_view, "正文")
 
         self._outline_view = QPlainTextEdit()
-        self._outline_view.setPlaceholderText("提纲将在此显示…")
-        self.result_tabs.addTab(self._outline_view, "提纲")
+        self._outline_view.setPlaceholderText("内容规划将在此显示…")
+        self.result_tabs.addTab(self._outline_view, "内容规划")
 
         self._ref_view = QPlainTextEdit()
         self._ref_view.setReadOnly(True)
-        self._ref_view.setPlaceholderText("参考文献将在此显示…")
-        self.result_tabs.addTab(self._ref_view, "参考文献")
+        self._ref_view.setPlaceholderText("事实来源或参考文献将在此显示…")
+        self.result_tabs.addTab(self._ref_view, "来源 / 参考文献")
 
         self._eval_view = QPlainTextEdit()
         self._eval_view.setReadOnly(True)
@@ -516,6 +577,7 @@ class WritingTaskPage(QWidget):
             self.style().standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton),
             "保存人工编辑稿",
         )
+        self.save_draft_button.setEnabled(False)
         self.save_draft_button.clicked.connect(self._save_draft)
         save_row.addWidget(self.save_draft_button)
         results_layout.addLayout(save_row)
@@ -528,7 +590,7 @@ class WritingTaskPage(QWidget):
         )
         self._progress_workspace_index = self.workspace_tabs.addTab(
             self.progress_scroll,
-            "章节与输出",
+            "内容单元与输出",
         )
         self._results_workspace_index = self.workspace_tabs.addTab(
             self.results_group,
@@ -543,9 +605,12 @@ class WritingTaskPage(QWidget):
         self.refresh_projects()
         self._reload_personas()
         self._reload_documents()
-        self._update_source_summary()
+        self._evidence_mode_changed()
 
     # ── Local project/task loading ─────────────────────────────
+
+    def _show_quality_steps_help(self) -> None:
+        QualityStepsHelpDialog(self).exec()
 
     def _apply_quality_preset(self) -> None:
         preset = str(self.quality_preset_combo.currentData() or "strict")
@@ -555,8 +620,14 @@ class WritingTaskPage(QWidget):
                 preset,
                 target_length_chars=max(500, self._resolved_target_length()),
                 document_form=self._resolved_document_form(),
+                genre=self._resolved_genre(),
+                citation_display=str(self.citation_display_combo.currentData() or "auto"),
             )
             values = (
+                options.use_hyde,
+                options.use_query_rewrite,
+                options.topic_refinement,
+                options.framework_generation,
                 options.fact_verification,
                 options.section_polish,
                 options.section_drift_check,
@@ -573,6 +644,10 @@ class WritingTaskPage(QWidget):
                 self._updating_quality_controls = False
         for checkbox in self._quality_checkboxes:
             checkbox.setEnabled(custom)
+        if self.evidence_mode_combo.currentData() == "conceptual_only":
+            self.hyde_checkbox.setEnabled(False)
+            self.query_rewrite_checkbox.setEnabled(False)
+            self.fact_verification_checkbox.setEnabled(False)
 
     def _mark_quality_custom(self) -> None:
         if self._updating_quality_controls:
@@ -607,20 +682,48 @@ class WritingTaskPage(QWidget):
             "paper": 5000,
         }[self._resolved_document_form()]
 
+    def _resolved_genre(self) -> NonfictionGenre:
+        selected = str(self.genre_combo.currentData() or "auto")
+        if selected != "auto":
+            return cast(NonfictionGenre, selected)
+        return infer_nonfiction_genre(self.task_input.toPlainText().strip())
+
     def _generation_options(self) -> GenerationOptions:
         target = self._resolved_target_length()
         document_form = self._resolved_document_form()
+        genre = self._resolved_genre()
         preset = str(self.quality_preset_combo.currentData() or "strict")
+        evidence_mode = str(
+            self.evidence_mode_combo.currentData() or "knowledge_grounded"
+        )
+        use_web_search = (
+            evidence_mode == "knowledge_grounded" and self.web_search_checkbox.isChecked()
+        )
         if preset != "custom":
             return GenerationOptions.from_preset(
                 preset,
                 target_length_chars=target,
                 document_form=document_form,
+                genre=genre,
+                citation_display=str(self.citation_display_combo.currentData() or "auto"),
+            ).model_copy(
+                update={
+                    "evidence_mode": evidence_mode,
+                    "use_web_search": use_web_search,
+                }
             )
         return GenerationOptions(
             preset="custom",
+            evidence_mode=evidence_mode,
+            use_web_search=use_web_search,
             document_form=document_form,
+            genre=genre,
+            citation_display=str(self.citation_display_combo.currentData() or "auto"),
             target_length_chars=target,
+            use_hyde=self.hyde_checkbox.isChecked(),
+            use_query_rewrite=self.query_rewrite_checkbox.isChecked(),
+            topic_refinement=self.topic_refinement_checkbox.isChecked(),
+            framework_generation=self.framework_generation_checkbox.isChecked(),
             fact_verification=self.fact_verification_checkbox.isChecked(),
             section_polish=self.section_polish_checkbox.isChecked(),
             section_drift_check=self.section_drift_checkbox.isChecked(),
@@ -632,13 +735,24 @@ class WritingTaskPage(QWidget):
 
     def _set_generation_options(self, raw: object) -> None:
         options = GenerationOptions.model_validate(raw or {})
+        evidence_index = self.evidence_mode_combo.findData(options.evidence_mode)
+        self.evidence_mode_combo.setCurrentIndex(max(0, evidence_index))
+        self.web_search_checkbox.setChecked(options.use_web_search)
         self.target_length_spin.setValue(options.target_length_chars)
         form_index = self.document_form_combo.findData(options.document_form)
         self.document_form_combo.setCurrentIndex(max(0, form_index))
+        genre_index = self.genre_combo.findData(options.genre)
+        self.genre_combo.setCurrentIndex(max(0, genre_index))
+        citation_index = self.citation_display_combo.findData(options.citation_display)
+        self.citation_display_combo.setCurrentIndex(max(0, citation_index))
         index = self.quality_preset_combo.findData(options.preset)
         self.quality_preset_combo.setCurrentIndex(max(0, index))
         if options.preset == "custom":
             values = (
+                options.use_hyde,
+                options.use_query_rewrite,
+                options.topic_refinement,
+                options.framework_generation,
                 options.fact_verification,
                 options.section_polish,
                 options.section_drift_check,
@@ -655,6 +769,7 @@ class WritingTaskPage(QWidget):
                 self._updating_quality_controls = False
             for checkbox in self._quality_checkboxes:
                 checkbox.setEnabled(True)
+        self._evidence_mode_changed()
 
     def refresh_projects(self) -> None:
         current = self.project_combo.currentData()
@@ -702,6 +817,8 @@ class WritingTaskPage(QWidget):
         """Return the same source counts used by the generation policy."""
 
         selected = self._selected_doc_ids()
+        if self.evidence_mode_combo.currentData() == "conceptual_only":
+            return {"selected_count": 0, "isolated_count": 0, "usable_count": 0}
         fallback = {
             "selected_count": len(selected),
             "isolated_count": 0,
@@ -715,6 +832,17 @@ class WritingTaskPage(QWidget):
 
     def _update_source_summary(self, *_args: object) -> None:
         """Refresh preflight counts without starting a background task."""
+
+        if self.evidence_mode_combo.currentData() == "conceptual_only":
+            self.source_summary_label.setText(
+                "无事实构思 · 不检索知识库 · 强制运行外部事实混入检查"
+            )
+            self.source_summary_label.setObjectName("mutedText")
+            self.source_summary_label.style().unpolish(self.source_summary_label)
+            self.source_summary_label.style().polish(self.source_summary_label)
+            if self._task_id is None:
+                self.start_button.setEnabled(self._run_writing_pipeline is not None)
+            return
 
         try:
             preview = self._source_preview()
@@ -730,6 +858,7 @@ class WritingTaskPage(QWidget):
             f"已选 {preview['selected_count']} 篇 · "
             f"隔离 {preview['isolated_count']} 篇 · "
             f"实际可用 {preview['usable_count']} 篇"
+            f"{' · 已启用联网检索' if self.web_search_checkbox.isChecked() else ''}"
         )
         object_name = (
             "statusError"
@@ -741,41 +870,87 @@ class WritingTaskPage(QWidget):
         self.source_summary_label.style().polish(self.source_summary_label)
         if self._preview_source_selection is not None and self._task_id is None:
             self.start_button.setEnabled(
-                self._run_writing_pipeline is not None and preview["usable_count"] > 0
+                self._run_writing_pipeline is not None
+                and (preview["usable_count"] > 0 or self.web_search_checkbox.isChecked())
             )
+
+    def _evidence_mode_changed(self, *_args: object) -> None:
+        """Apply mode-specific UI locks while preserving grounded selections."""
+
+        conceptual = self.evidence_mode_combo.currentData() == "conceptual_only"
+        idle = self._task_id is None
+        self.document_list.setEnabled(idle and not conceptual)
+        self.allow_persona_sources.setEnabled(idle and not conceptual)
+        self.citation_display_combo.setEnabled(idle and not conceptual)
+        self.web_search_checkbox.setEnabled(idle and not conceptual)
+        for checkbox in (
+            self.hyde_checkbox,
+            self.query_rewrite_checkbox,
+            self.fact_verification_checkbox,
+        ):
+            if conceptual:
+                checkbox.setEnabled(False)
+            elif self.quality_preset_combo.currentData() == "custom" and idle:
+                checkbox.setEnabled(True)
+        self._update_source_summary()
 
     def _reload_task_history(self) -> None:
         project_id = self.project_combo.currentData()
         records = self._list_writing_tasks(str(project_id)) if project_id else []
         self._task_records = records
-        self.task_table.setRowCount(len(records))
-        for row, record in enumerate(records):
-            checkbox = QTableWidgetItem()
-            checkbox.setFlags(
-                Qt.ItemFlag.ItemIsEnabled
-                | Qt.ItemFlag.ItemIsSelectable
-                | Qt.ItemFlag.ItemIsUserCheckable
-            )
-            checkbox.setCheckState(Qt.CheckState.Unchecked)
-            checkbox.setData(Qt.ItemDataRole.UserRole, record.get("task_id"))
-            self.task_table.setItem(row, 0, checkbox)
-            self.task_table.setItem(row, 1, QTableWidgetItem(str(record.get("title", ""))))
-            status = str(record.get("status", ""))
-            self.task_table.setItem(
-                row,
-                2,
-                QTableWidgetItem(_TASK_STATUS_LABELS.get(status, status)),
-            )
-            self.task_table.setItem(
-                row,
-                3,
-                QTableWidgetItem(format_china_datetime(record.get("updated_at"))),
-            )
-            error = str(record.get("error") or "")
-            if error:
-                for column in range(self.task_table.columnCount()):
-                    self.task_table.item(row, column).setToolTip(error)
+        active_row: int | None = None
+        self.task_table.blockSignals(True)
+        try:
+            self.task_table.setRowCount(len(records))
+            for row, record in enumerate(records):
+                checkbox = QTableWidgetItem()
+                checkbox.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                )
+                checkbox.setCheckState(Qt.CheckState.Unchecked)
+                checkbox.setData(Qt.ItemDataRole.UserRole, record.get("task_id"))
+                self.task_table.setItem(row, 0, checkbox)
+                self.task_table.setItem(row, 1, QTableWidgetItem(str(record.get("title", ""))))
+                status = str(record.get("status", ""))
+                self.task_table.setItem(
+                    row,
+                    2,
+                    QTableWidgetItem(_TASK_STATUS_LABELS.get(status, status)),
+                )
+                self.task_table.setItem(
+                    row,
+                    3,
+                    QTableWidgetItem(format_china_datetime(record.get("updated_at"))),
+                )
+                error = str(record.get("error") or "")
+                if error:
+                    for column in range(self.task_table.columnCount()):
+                        self.task_table.item(row, column).setToolTip(error)
+                if str(record.get("task_id")) == self._displayed_task_id:
+                    active_row = row
+            if active_row is not None:
+                self.task_table.selectRow(active_row)
+        finally:
+            self.task_table.blockSignals(False)
+        if self._displayed_task_id and active_row is None and self._task_id is None:
+            self._clear_loaded_task()
         self._update_task_error_banner()
+        self._update_save_draft_button()
+
+    def _task_selection_changed(self) -> None:
+        self._update_task_error_banner()
+        rows = sorted({item.row() for item in self.task_table.selectedItems()})
+        if self._task_id is not None or len(rows) != 1:
+            self._update_save_draft_button()
+            return
+        task_id = str(
+            self.task_table.item(rows[0], 0).data(Qt.ItemDataRole.UserRole) or ""
+        )
+        if task_id and task_id != self._displayed_task_id:
+            self._load_task(task_id, switch_workspace=False)
+        self._update_save_draft_button()
 
     def _update_task_error_banner(self) -> None:
         task_id = self._selected_history_task_id()
@@ -799,15 +974,33 @@ class WritingTaskPage(QWidget):
             return None
         return str(self.task_table.item(rows[0], 0).data(Qt.ItemDataRole.UserRole))
 
-    def _load_selected_task(self) -> dict[str, object] | None:
+    def _load_selected_task(
+        self,
+        *,
+        switch_workspace: bool = True,
+    ) -> dict[str, object] | None:
         task_id = self._selected_history_task_id()
-        if not task_id or self._load_writing_task is None:
+        if not task_id:
+            return None
+        return self._load_task(task_id, switch_workspace=switch_workspace)
+
+    def _load_task(
+        self,
+        task_id: str,
+        *,
+        switch_workspace: bool,
+    ) -> dict[str, object] | None:
+        if self._load_writing_task is None:
             return None
         record = self._load_writing_task(task_id)
         if record is None:
             self._show_message("任务不存在", 4000)
             return None
+        result_tab_index = self.result_tabs.currentIndex()
         self._writing_task_id = task_id
+        self._displayed_task_id = task_id
+        self._clear_result_views()
+        self.results_group.setTitle(f"写作结果 · {record.get('title', '未命名任务')}")
         self.title_input.setText(str(record.get("title", "")))
         self.task_input.setPlainText(str(record.get("task_description", "")))
         self.domain_input.setPlainText(str(record.get("domain", "")))
@@ -828,17 +1021,35 @@ class WritingTaskPage(QWidget):
         if isinstance(state, dict):
             self._last_result = state
             self._display_results(state)
-            self.workspace_tabs.setCurrentIndex(self._progress_workspace_index)
             edited = record.get("edited_draft_text")
-            if edited:
+            if edited is not None:
                 self._draft_view.setPlainText(str(edited))
             edited_outline = record.get("edited_outline_text")
-            if edited_outline:
+            if edited_outline is not None:
                 self._outline_view.setPlainText(str(edited_outline))
+            evaluation = record.get("evaluation")
+            if evaluation is not None:
+                self._eval_view.setPlainText(self._format_evaluation_result(evaluation))
             self.eval_button.setEnabled(
                 state.get("status") == PIPELINE_STATUS_DONE
                 and self._evaluate_generation is not None
             )
+        else:
+            self._last_result = None
+            self._current_section_index = None
+            self._set_section_rows([], None)
+            self.eval_button.setEnabled(False)
+            self.results_group.show()
+        if switch_workspace:
+            workspace_index = (
+                self._results_workspace_index
+                if record.get("status") == PIPELINE_STATUS_DONE
+                else self._progress_workspace_index
+            )
+            self.workspace_tabs.setCurrentIndex(workspace_index)
+        else:
+            self.result_tabs.setCurrentIndex(result_tab_index)
+        self._update_save_draft_button()
         return record
 
     def _resume_selected_task(self) -> None:
@@ -850,6 +1061,10 @@ class WritingTaskPage(QWidget):
             return
         if record.get("status") == PIPELINE_STATUS_DONE:
             self._show_message("该任务已经完成，已载入稿件", 4000)
+            return
+        options = GenerationOptions.model_validate(record.get("generation_options", {}))
+        if options.evidence_mode == "conceptual_only" or options.use_web_search:
+            self._launch_pipeline(record, resume=True)
             return
         try:
             source_preview = self._source_preview()
@@ -880,12 +1095,17 @@ class WritingTaskPage(QWidget):
             self._show_message("请勾选或选择要删除的任务", 4000)
             return
         removed = self._delete_writing_tasks(identifiers)
+        if self._displayed_task_id in identifiers:
+            self._clear_loaded_task()
         self._reload_task_history()
         self._show_message(f"已删除 {removed} 个任务", 4000)
 
     def _save_draft(self) -> None:
         if not self._writing_task_id or self._save_edited_draft is None:
             self._show_message("当前没有可保存的任务", 4000)
+            return
+        if self._displayed_task_id != self._writing_task_id:
+            self._show_message("当前稿件与任务标识不一致，请重新选择任务", 6000)
             return
         self._save_edited_draft(
             self._writing_task_id,
@@ -941,20 +1161,25 @@ class WritingTaskPage(QWidget):
             self._show_message("请先创建或选择一个项目", 5000)
             return
         selected_doc_ids = self._selected_doc_ids()
-        if not selected_doc_ids:
-            self._show_message("请至少勾选一篇事实语料", 5000)
+        conceptual = self.evidence_mode_combo.currentData() == "conceptual_only"
+        use_web_search = not conceptual and self.web_search_checkbox.isChecked()
+        if not conceptual and not selected_doc_ids and not use_web_search:
+            self._show_message("请勾选事实语料，或启用博查联网检索", 5000)
             return
-        try:
-            source_preview = self._source_preview()
-        except Exception as exc:
-            self._show_message(f"无法检查事实来源：{exc}", 6000)
-            return
-        if source_preview["usable_count"] == 0:
-            self._show_message(
-                "所选文档均被来源隔离，请增加事实语料或明确允许复用目标语料",
-                7000,
-            )
-            return
+        if not conceptual:
+            try:
+                source_preview = self._source_preview()
+            except Exception as exc:
+                self._show_message(f"无法检查事实来源：{exc}", 6000)
+                return
+            if source_preview["usable_count"] == 0 and not use_web_search:
+                self._show_message(
+                    "所选文档均被来源隔离，请增加事实语料或明确允许复用目标语料",
+                    7000,
+                )
+                return
+        else:
+            selected_doc_ids = set()
         if self._create_writing_task is None:
             self._show_message("任务持久化服务不可用", 5000)
             return
@@ -974,6 +1199,7 @@ class WritingTaskPage(QWidget):
         )
         record = {
             "task_id": task_id,
+            "title": self.title_input.text().strip() or task_text[:60],
             "persona_id": persona_id,
             "task_description": task_text,
             "domain": domain,
@@ -990,14 +1216,15 @@ class WritingTaskPage(QWidget):
         if self._run_writing_pipeline is None:
             return
         self._writing_task_id = str(record["task_id"])
+        self._displayed_task_id = self._writing_task_id
+        self.results_group.setTitle(
+            f"写作结果 · {record.get('title') or self.title_input.text().strip() or '未命名任务'}"
+        )
         self._history_refreshed_for_run = False
         self._set_running(True)
         if not resume:
             self._last_result = None
-            self._draft_view.clear()
-            self._outline_view.clear()
-            self._ref_view.clear()
-            self._eval_view.clear()
+            self._clear_result_views()
         self.workspace_tabs.setCurrentIndex(self._progress_workspace_index)
         resume_state = record.get("state") if resume else None
         self.progress_bar.setValue(
@@ -1087,6 +1314,31 @@ class WritingTaskPage(QWidget):
         self._last_stream_at = time.monotonic()
         stage = stream_label if separator else (self._current_step or "模型输出")
         output_view = self._stream_view_for_stage(stage)
+        if event_kind == "complete":
+            self._ensure_stream_stage(stage, output_view)
+            self._set_attempt_start(output_view)
+            self.activity_label.setText(f"{stage} · 本次调用完整完成")
+            self._update_elapsed_display()
+            return
+        if event_kind == "error" and text:
+            self._ensure_stream_stage(stage, output_view)
+            self._discard_stream_attempt(output_view)
+            self._append_stream_text(output_view, f"\n[失败原因] {text}\n")
+            self._set_attempt_start(output_view)
+            self.workspace_tabs.setCurrentIndex(self._progress_workspace_index)
+            self.progress_tabs.setCurrentWidget(output_view)
+            self.activity_label.setText(f"{stage} · 失败")
+            self.status_label.setText(f"{stage}失败：{text}")
+            self._update_elapsed_display()
+            return
+        if event_kind == "attempt_reset" and text:
+            self._ensure_stream_stage(stage, output_view)
+            self._discard_stream_attempt(output_view)
+            self._append_stream_text(output_view, f"\n[系统] {text}\n")
+            self._set_attempt_start(output_view)
+            self.activity_label.setText(f"{stage} · 正在准备下一次尝试")
+            self._update_elapsed_display()
+            return
         if event_kind == "status" and text:
             if output_view is self.live_output_view:
                 self._activate_live_output_once()
@@ -1197,6 +1449,12 @@ class WritingTaskPage(QWidget):
         if self.auto_scroll_checkbox.isChecked():
             self.live_output_view.moveCursor(QTextCursor.MoveOperation.End)
             self.live_output_view.ensureCursorVisible()
+            scrollbar = self.live_output_view.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
+
+    def _live_output_range_changed(self, _minimum: int, maximum: int) -> None:
+        if self.auto_scroll_checkbox.isChecked():
+            self.live_output_view.verticalScrollBar().setValue(maximum)
 
     def _copy_live_output(self) -> None:
         QApplication.clipboard().setText(self.live_output_view.toPlainText())
@@ -1232,10 +1490,9 @@ class WritingTaskPage(QWidget):
         self._set_section_rows(sections, current_index)
         completed_parts: list[str] = []
         for section in sections:
-            text = str(section.get("polished_text") or "").strip()
+            heading, text = self._completed_section_content(section)
             if not text:
                 continue
-            heading = str(section.get("heading") or "").strip()
             if heading:
                 completed_parts.append(heading)
             completed_parts.extend([text, ""])
@@ -1322,6 +1579,9 @@ class WritingTaskPage(QWidget):
         if quality_status == "unverified_draft":
             self.status_label.setText("快速草稿完成 · 尚未通过完整质量核验")
             self._show_message("未核验草稿已生成，可补做质量步骤后定稿", 7000)
+        elif quality_status == "conceptual_draft":
+            self.status_label.setText("无事实构思稿完成")
+            self._show_message("无事实构思稿已完成外部事实混入检查", 7000)
         else:
             self.status_label.setText("写作完成 ✓")
             self._show_message("写作流水线已完成全篇稿件的生成", 6000)
@@ -1330,6 +1590,18 @@ class WritingTaskPage(QWidget):
         self._finish_writing()
 
     def _pipeline_failed(self, message: str) -> None:
+        self._discard_stream_attempt(self.live_output_view)
+        self._discard_stream_attempt(self.diagnostic_output_view)
+        if message == "任务已取消":
+            self._append_stream_text(
+                self.live_output_view,
+                "\n[系统] 任务已停止，当前不完整输出未保存。\n",
+            )
+            self._show_message("写作已停止 · 已完成断点仍然保留", 8000)
+            self._show_pipeline_cancelled()
+            self._reload_task_history()
+            self._finish_writing()
+            return
         self._show_message(f"写作流水线失败: {message}", 8000)
         self._show_pipeline_failure(message)
         self._reload_task_history()
@@ -1345,6 +1617,17 @@ class WritingTaskPage(QWidget):
             "QProgressBar::chunk { background: #b42318; border-radius: 4px; }"
         )
         self.status_label.setText(f"失败: {message}")
+
+    def _show_pipeline_cancelled(self) -> None:
+        """Show a resumable interruption without presenting it as a failure."""
+
+        if self.progress_bar.value() >= 100:
+            self.progress_bar.setValue(99)
+        self.progress_bar.setFormat("已停止 · %p%")
+        self.progress_bar.setStyleSheet(
+            "QProgressBar::chunk { background: #8a6d3b; border-radius: 4px; }"
+        )
+        self.status_label.setText("已停止 · 当前不完整输出未保存")
 
     def _finish_writing(self) -> None:
         self._task_id = None
@@ -1362,6 +1645,14 @@ class WritingTaskPage(QWidget):
         self.task_input.setEnabled(not running)
         self.domain_input.setEnabled(not running)
         self.document_form_combo.setEnabled(not running)
+        self.genre_combo.setEnabled(not running)
+        self.evidence_mode_combo.setEnabled(not running)
+        self.web_search_checkbox.setEnabled(
+            not running and self.evidence_mode_combo.currentData() != "conceptual_only"
+        )
+        self.citation_display_combo.setEnabled(
+            not running and self.evidence_mode_combo.currentData() != "conceptual_only"
+        )
         self.target_length_spin.setEnabled(not running)
         self.quality_preset_combo.setEnabled(not running)
         if not running:
@@ -1372,6 +1663,42 @@ class WritingTaskPage(QWidget):
         self.refresh_button.setEnabled(not running)
         if not running:
             self._update_source_summary()
+            self._evidence_mode_changed()
+        self._update_save_draft_button()
+
+    def _update_save_draft_button(self) -> None:
+        rows = {item.row() for item in self.task_table.selectedItems()}
+        selection_matches = not rows or (
+            len(rows) == 1
+            and self._selected_history_task_id() == self._displayed_task_id
+        )
+        self.save_draft_button.setEnabled(
+            self._task_id is None
+            and self._save_edited_draft is not None
+            and self._writing_task_id is not None
+            and self._displayed_task_id == self._writing_task_id
+            and selection_matches
+        )
+
+    def _clear_loaded_task(self) -> None:
+        self._writing_task_id = None
+        self._displayed_task_id = None
+        self._last_result = None
+        self._current_section_index = None
+        self._set_section_rows([], None)
+        self._clear_result_views()
+        self.results_group.setTitle("写作结果")
+        self._update_save_draft_button()
+
+    def _clear_result_views(self) -> None:
+        self._draft_view.clear()
+        self._draft_view.setPlaceholderText("该任务尚未生成正文")
+        self._outline_view.clear()
+        self._outline_view.setPlaceholderText("该任务尚未生成内容规划")
+        self._ref_view.clear()
+        self._ref_view.setPlaceholderText("该任务尚未生成事实来源或参考文献")
+        self._eval_view.clear()
+        self._eval_view.setPlaceholderText("该任务尚无评估结果")
 
     # ── Results display ────────────────────────────────────────
 
@@ -1388,6 +1715,7 @@ class WritingTaskPage(QWidget):
     def _display_results(self, state: dict[str, Any]) -> None:
         """Populate the result tabs from the final WritingState."""
 
+        self._clear_result_views()
         sections_state = state.get("sections", [])
         if not isinstance(sections_state, list):
             sections_state = []
@@ -1402,13 +1730,29 @@ class WritingTaskPage(QWidget):
 
         # Draft
         final_draft_json = state.get("final_draft_json")
+        citation_display = "bibliography"
+        completed_parts: list[str] = []
+        for section in sections_state:
+            heading, text = self._completed_section_content(section)
+            if not text:
+                continue
+            if heading:
+                completed_parts.append(heading)
+            completed_parts.extend([text, ""])
+        if completed_parts:
+            self._draft_view.setPlainText("\n".join(completed_parts).strip())
         if final_draft_json:
             try:
                 draft_data = json.loads(final_draft_json)
+                citation_display = str(
+                    draft_data.get("citation_display", "bibliography")
+                )
                 sections = draft_data.get("sections", [])
                 lines: list[str] = []
                 if draft_data.get("quality_status") == "unverified_draft":
                     lines.extend(["[未核验草稿]", ""])
+                elif draft_data.get("quality_status") == "conceptual_draft":
+                    lines.extend(["[无事实构思稿]", ""])
                 title = draft_data.get("title", "")
                 if title:
                     lines.extend([str(title), ""])
@@ -1434,9 +1778,15 @@ class WritingTaskPage(QWidget):
                 thesis = json.loads(thesis_json)
                 t = thesis.get("thesis_text", "")
                 angle = thesis.get("angle", "")
-                outline_parts.append(f"论点: {t}")
+                purpose = thesis.get("purpose", "")
+                audience = thesis.get("audience", "")
+                outline_parts.append(f"中心信息: {t}")
                 if angle:
                     outline_parts.append(f"角度: {angle}")
+                if purpose:
+                    outline_parts.append(f"目的: {purpose}")
+                if audience:
+                    outline_parts.append(f"受众: {audience}")
                 outline_parts.append("")
             except (json.JSONDecodeError, TypeError):
                 pass
@@ -1454,7 +1804,7 @@ class WritingTaskPage(QWidget):
                     for term, defn in term_registry.items():
                         outline_parts.append(f"  {term}: {defn}")
             except (json.JSONDecodeError, TypeError) as exc:
-                outline_parts.append(f"[解析提纲出错: {exc}]")
+                outline_parts.append(f"[解析内容规划出错: {exc}]")
 
         self._outline_view.setPlainText("\n".join(outline_parts))
 
@@ -1464,7 +1814,12 @@ class WritingTaskPage(QWidget):
             try:
                 refs = json.loads(ref_json)
                 items = refs.get("items", [])
-                ref_lines = [f"参考文献 (样式: {refs.get('style', 'gb-t-7714')})", ""]
+                heading = (
+                    "内部事实来源（成稿未显示引用标记）"
+                    if citation_display == "internal_only"
+                    else f"参考文献 (样式: {refs.get('style', 'gb-t-7714')})"
+                )
+                ref_lines = [heading, ""]
                 for i, item in enumerate(items, 1):
                     ref_lines.append(f"[{i}] {item.get('citation_text', '')}")
                 self._ref_view.setPlainText("\n".join(ref_lines))
@@ -1473,6 +1828,24 @@ class WritingTaskPage(QWidget):
 
         self.results_group.show()
         self.result_tabs.setCurrentIndex(0)
+
+    @staticmethod
+    def _completed_section_content(section: dict[str, Any]) -> tuple[str, str]:
+        heading = str(section.get("heading") or "").strip()
+        text = str(section.get("polished_text") or "").strip()
+        if text:
+            return heading, text
+        raw = section.get("polished_section_json")
+        if not raw:
+            return heading, ""
+        try:
+            polished = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return heading, ""
+        return (
+            str(polished.get("heading") or heading).strip(),
+            str(polished.get("polished_text") or "").strip(),
+        )
 
     @staticmethod
     def _format_node(node: dict, depth: int) -> str:
@@ -1542,37 +1915,41 @@ class WritingTaskPage(QWidget):
         if result is None:
             self._eval_view.setPlainText("评估完成，未返回具体结果。")
         else:
-            lines = ["== 阶段 7 — 评估结果 ==", ""]
-            if isinstance(result, dict):
-                traceability = result.get("traceability")
-                if traceability is not None:
-                    lines.append(f"引用可溯性: {traceability}")
-                hallucination = result.get("hallucination_rate")
-                if hallucination is not None:
-                    lines.append(f"幻觉率: {hallucination}")
-                faithfulness = result.get("faithfulness")
-                if faithfulness is not None:
-                    lines.append(f"忠实度 (Faithfulness): {faithfulness}")
-                judge = result.get("judge")
-                if judge is not None:
-                    lines.append(f"裁判评分 (LLM-Judge): {judge}")
-                rationale = result.get("judge_rationale")
-                if rationale:
-                    lines.append("")
-                    lines.append(f"评语: {rationale}")
-                injection = result.get("injection")
-                if injection is not None:
-                    lines.append("")
-                    lines.append(f"注入检测: {injection}")
-            else:
-                lines.append(str(result))
-            self._eval_view.setPlainText("\n".join(lines))
+            self._eval_view.setPlainText(self._format_evaluation_result(result))
 
         self.status_label.setText("评估完成 ✓")
         self.progress_bar.setValue(100)
         self._show_message("阶段 7 评估完成", 6000)
         self.result_tabs.setCurrentIndex(3)
         self._finish_eval()
+
+    @staticmethod
+    def _format_evaluation_result(result: Any) -> str:
+        if isinstance(result, dict) and result.get("error"):
+            return f"评估失败: {result['error']}"
+        if result is None:
+            return "评估完成，未返回具体结果。"
+        lines = ["== 阶段 7 — 评估结果 ==", ""]
+        if not isinstance(result, dict):
+            lines.append(str(result))
+            return "\n".join(lines)
+        labels = (
+            ("traceability", "引用可溯性"),
+            ("hallucination_rate", "幻觉率"),
+            ("faithfulness", "忠实度 (Faithfulness)"),
+            ("judge", "裁判评分 (LLM-Judge)"),
+        )
+        for key, label in labels:
+            value = result.get(key)
+            if value is not None:
+                lines.append(f"{label}: {value}")
+        rationale = result.get("judge_rationale")
+        if rationale:
+            lines.extend(["", f"评语: {rationale}"])
+        injection = result.get("injection")
+        if injection is not None:
+            lines.extend(["", f"注入检测: {injection}"])
+        return "\n".join(lines)
 
     def _eval_failed(self, message: str) -> None:
         self._eval_view.setPlainText(f"评估失败: {message}")

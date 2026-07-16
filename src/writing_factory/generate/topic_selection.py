@@ -10,6 +10,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from writing_factory.generate.models import GenerationContext, ThesisStatement
+from writing_factory.generate.persona_context import persona_context_for_genre
 from writing_factory.generate.prompts import topic_selection_messages
 from writing_factory.generate.source_policy import (
     enforce_retrieval_safety,
@@ -34,6 +35,32 @@ def _no_progress(_percent: int, _message: str) -> None:
 
 def _no_cancellation() -> None:
     pass
+
+
+def build_direct_thesis(context: GenerationContext) -> ThesisStatement:
+    """Create a stable thesis anchor without spending an LLM call."""
+
+    if not context.persona_id:
+        raise ValueError("persona_id 不能为空：写作任务必须指定 persona")
+    task = context.task_description.strip()
+    if not task:
+        raise ValueError("写作任务不能为空")
+    suggested_title = "" if context.generation_options.document_form == "paragraph" else task[:60]
+    return ThesisStatement(
+        suggested_title=suggested_title,
+        thesis_text=task,
+        angle="按用户给定的主题和要求直接展开，不额外改写选题角度。",
+        kb_support_assessment=(
+            "无事实构思模式不使用知识库，仅允许观点、框架和条件性假设。"
+            if context.generation_options.evidence_mode == "conceptual_only"
+            else "未执行 LLM 创作意图锐化；后续内容单元仍按所选质量步骤检索并处理事实证据。"
+        ),
+        persona_id=context.persona_id,
+        genre=context.generation_options.genre,
+        purpose="完成用户明确指定的非虚构写作任务",
+        audience="以用户任务描述为准",
+        desired_effect="满足用户指定的信息与表达目标",
+    )
 
 
 def select_topic(
@@ -79,37 +106,46 @@ def select_topic(
     persona_spec = persona_repository.load_runtime(context.persona_id)
     if persona_spec is None:
         raise ValueError(f"persona '{context.persona_id}' 未就绪或不存在，请先完成蒸馏再选题")
-    persona_json = persona_spec.model_dump(mode="json")
+    persona_json = persona_context_for_genre(persona_spec, context.generation_options.genre)
     logger.info("选题阶段加载运行时 persona: %s", persona_spec.name)
 
-    progress(15, "检索知识库")
+    progress(15, "准备创作依据")
     check_cancelled()
 
     # ── 2. KB 预检索 ─────────────────────────────────────────────────
-    retrieval_request = RetrievalRequest(
-        kb_id=context.kb_id,
-        query=context.task_description,
-        top_k=8,
-        filters=task_document_filter(context),
-        use_rerank=True,
-    )
-    retrieval_result = retriever.search(
-        retrieval_request,
-        progress=progress,
-        check_cancelled=check_cancelled,
-    )
-    enforce_retrieval_safety(retrieval_result, siliconflow)
+    if context.generation_options.evidence_mode == "conceptual_only":
+        kb_retrieval_summary = (
+            "当前为无事实构思模式：未检索知识库。只能形成观点、问题、框架、建议"
+            "和条件性假设，不得引入具体外部事实。"
+        )
+        progress(40, "已跳过知识库检索")
+    else:
+        retrieval_request = RetrievalRequest(
+            kb_id=context.kb_id,
+            query=context.task_description,
+            top_k=8,
+            filters=task_document_filter(context),
+            use_rewrite=context.generation_options.use_query_rewrite,
+            use_hyde=context.generation_options.use_hyde,
+            use_rerank=True,
+        )
+        retrieval_result = retriever.search(
+            retrieval_request,
+            progress=progress,
+            check_cancelled=check_cancelled,
+        )
+        enforce_retrieval_safety(retrieval_result, siliconflow)
 
-    progress(40, "汇总检索结果")
+        progress(40, "汇总检索结果")
+        check_cancelled()
+        kb_retrieval_summary = _format_retrieval_summary(retrieval_result)
+        logger.info(
+            "选题检索完成: %d hits, 摘要长度 %d",
+            len(retrieval_result.hits),
+            len(kb_retrieval_summary),
+        )
+
     check_cancelled()
-
-    # ── 3. 格式化检索摘要 ────────────────────────────────────────────
-    kb_retrieval_summary = _format_retrieval_summary(retrieval_result)
-    logger.info(
-        "选题检索完成: %d hits, 摘要长度 %d",
-        len(retrieval_result.hits),
-        len(kb_retrieval_summary),
-    )
 
     progress(50, "构造选题提示词")
     check_cancelled()
@@ -133,6 +169,7 @@ def select_topic(
         response_format="json_object",
         seed=42,
         stream=True,
+        step_id="writing.topic",
     )
 
     progress(85, "解析选题结果")
@@ -144,6 +181,8 @@ def select_topic(
     except Exception as exc:
         logger.error("选题解析失败，原始响应: %s", result.content[:500])
         raise ValueError(f"LLM 返回的选题结果无法解析为 ThesisStatement: {exc}") from exc
+    if thesis.genre != context.generation_options.genre:
+        thesis = thesis.model_copy(update={"genre": context.generation_options.genre})
 
     progress(100, "选题完成")
     logger.info(
@@ -192,5 +231,6 @@ def _source_label(source: str) -> str:
         "dense": "稠密检索",
         "bm25": "BM25检索",
         "hybrid": "混合检索",
+        "web": "联网检索",
     }
     return labels.get(source, source)

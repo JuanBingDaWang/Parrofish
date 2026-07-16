@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import json
+import logging
+import os
 import threading
 from collections.abc import Sequence
 from pathlib import Path
+from uuid import uuid4
 
 import lancedb
 import pyarrow as pa
 
 from writing_factory.kb.models import Chunk, SearchHit
+
+logger = logging.getLogger(__name__)
 
 
 class LanceVectorIndex:
@@ -19,8 +25,11 @@ class LanceVectorIndex:
 
     def __init__(self, path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
+        self._path = path
+        self._active_pointer = path / ".active-vector-table"
         self._connection = lancedb.connect(path)
         self._lock = threading.Lock()
+        self._table_name, self._embedding_model = self._load_active_table()
 
     def replace_document(
         self,
@@ -54,6 +63,45 @@ class LanceVectorIndex:
             return False
         rows = table.search().where(f"doc_id = '{self._sql_string(doc_id)}'").limit(1).to_list()
         return bool(rows)
+
+    def rebuild(
+        self,
+        chunks: Sequence[Chunk],
+        vectors: Sequence[Sequence[float]],
+        *,
+        model_id: str | None = None,
+    ) -> None:
+        """Build a complete replacement table and switch only after it succeeds."""
+
+        if len(chunks) != len(vectors):
+            raise ValueError("Chunk and vector counts differ")
+        if any(chunk.chunk_kind != "child" for chunk in chunks):
+            raise ValueError("Only child chunks may enter the vector index")
+        replacement = f"{self.TABLE_NAME}_v_{uuid4().hex}"
+        with self._lock:
+            previous = self._table_name
+            if chunks:
+                self._connection.create_table(replacement, data=self._to_arrow(chunks, vectors))
+                pointer_tmp = self._active_pointer.with_suffix(f".{uuid4().hex}.tmp")
+                pointer_tmp.write_text(
+                    json.dumps({"table": replacement, "model": model_id}, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                os.replace(pointer_tmp, self._active_pointer)
+                self._table_name = replacement
+                self._embedding_model = model_id
+            else:
+                self._active_pointer.unlink(missing_ok=True)
+                self._table_name = self.TABLE_NAME
+                self._embedding_model = None
+                if previous in set(self._connection.list_tables().tables):
+                    self._connection.drop_table(previous)
+                return
+            if previous != replacement and previous in set(self._connection.list_tables().tables):
+                try:
+                    self._connection.drop_table(previous)
+                except Exception:
+                    logger.warning("旧向量表暂未清理: %s", previous, exc_info=True)
 
     def delete_document(self, doc_id: str) -> None:
         """删除一个文档的全部稠密向量；表不存在时视为已经清理。"""
@@ -119,9 +167,29 @@ class LanceVectorIndex:
         return hits
 
     def _open_table(self):
-        if self.TABLE_NAME not in self._connection.list_tables().tables:
+        if self._table_name not in self._connection.list_tables().tables:
             return None
-        return self._connection.open_table(self.TABLE_NAME)
+        return self._connection.open_table(self._table_name)
+
+    @property
+    def embedding_model(self) -> str | None:
+        """Return the model bound to the atomically selected vector table."""
+
+        return self._embedding_model
+
+    def _load_active_table(self) -> tuple[str, str | None]:
+        if self._active_pointer.is_file():
+            raw = self._active_pointer.read_text(encoding="utf-8").strip()
+            try:
+                payload = json.loads(raw)
+                selected = str(payload["table"])
+                model = str(payload["model"]) if payload.get("model") else None
+            except (ValueError, KeyError, TypeError):
+                selected = raw
+                model = None
+            if selected in self._connection.list_tables().tables:
+                return selected, model
+        return self.TABLE_NAME, None
 
     @staticmethod
     def _to_arrow(chunks: Sequence[Chunk], vectors: Sequence[Sequence[float]]) -> pa.Table:

@@ -90,7 +90,7 @@ def validate_reduce_language(result: ReduceResult, language: OutputLanguage) -> 
 
 
 def validate_academic_supplement_language(result: AcademicSupplementResult) -> None:
-    """检查学术 v2 短 Reduce 的全部可读字段。"""
+    """检查新版短 Reduce 的全部可读字段。"""
 
     primary: list[str] = []
     supporting: list[str] = []
@@ -104,7 +104,7 @@ def validate_academic_supplement_language(result: AcademicSupplementResult) -> N
     supporting.extend(result.values)
     supporting.extend(result.anti_patterns)
     supporting.extend(result.declared_limits)
-    _validate_chinese(primary, supporting, context="学术档案补充")
+    _validate_chinese(primary, supporting, context="作者档案补充")
 
 
 def validate_persona_language(spec: PersonaSpec) -> None:
@@ -124,6 +124,29 @@ def validate_persona_language(spec: PersonaSpec) -> None:
         primary.extend((tension.side_a, tension.side_b, tension.interpretation))
     for gap in spec.information_gaps:
         primary.extend((gap.dimension, gap.description, gap.unresolved_reason))
+    for profile in spec.composition_dna.genre_profiles:
+        primary.extend((profile.genre_label, profile.heading_strategy, profile.paragraph_strategy))
+        supporting.extend(profile.typical_purposes)
+        supporting.extend(profile.audience_tendencies)
+        supporting.extend(profile.declared_limits)
+        for pattern in profile.patterns:
+            primary.extend(
+                (
+                    pattern.name,
+                    pattern.description,
+                    pattern.applicability,
+                    pattern.variability,
+                )
+            )
+            supporting.extend(pattern.sequence)
+            supporting.extend(pattern.relations)
+    for pattern in spec.composition_dna.cross_genre_patterns:
+        primary.extend(
+            (pattern.name, pattern.description, pattern.applicability, pattern.variability)
+        )
+        supporting.extend(pattern.sequence)
+        supporting.extend(pattern.relations)
+    supporting.extend(spec.composition_dna.information_gaps)
     supporting.extend(spec.expression_dna.style_rules)
     supporting.extend(spec.values)
     supporting.extend(spec.anti_patterns)
@@ -132,7 +155,7 @@ def validate_persona_language(spec: PersonaSpec) -> None:
 
 
 def validate_academic_language(result: object) -> None:
-    """检查论文归并、聚类和中性验证新增阶段的中文可读字段。"""
+    """检查文档归并、聚类和中性验证阶段的中文可读字段。"""
 
     primary: list[str] = []
     supporting: list[str] = []
@@ -148,7 +171,7 @@ def validate_academic_language(result: object) -> None:
         primary.extend(item.rationale for item in result.assessments)
     else:
         return
-    _validate_chinese(primary, supporting, context="学术蒸馏中间结果")
+    _validate_chinese(primary, supporting, context="非虚构蒸馏中间结果")
 
 
 def _validate_chinese(

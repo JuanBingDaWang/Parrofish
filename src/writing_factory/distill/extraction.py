@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 
 from pydantic import ValidationError
 
@@ -54,49 +55,55 @@ class PersonaMapExtractor:
             corpus_role=corpus_role,
             domain=domain,
         )
+        filename = unit.segments[0].filename if unit.segments else unit.unit_id
+        call_label = "认知 Map" if corpus_role == "target" else "对照认知 Map"
         last_error = "未知校验错误"
-        for attempt in range(self.max_attempts):
-            active_messages = messages
-            if attempt:
-                active_messages = [
-                    *messages,
-                    {
-                        "role": "user",
-                        "content": (
-                            "上一次 JSON 违反了契约。请返回修正后的完整对象，不要解释。"
-                            f"校验错误：{last_error}"
-                        ),
-                    },
-                ]
-            result = self.siliconflow.chat(
-                active_messages,
-                thinking=True,
-                reasoning_effort="high",
-                temperature=0.0,
-                max_tokens=8192,
-                seed=11,
-                response_format="json_object",
-                use_cache=True,
-                request_attempts=1,
-                stream=True,
+        stream_label = f"{call_label} · {filename} · {unit.unit_id[-6:]}"
+        stage = getattr(self.siliconflow, "stream_stage", None)
+        with stage(stream_label) if callable(stage) else nullcontext():
+            for attempt in range(self.max_attempts):
+                active_messages = messages
+                if attempt:
+                    active_messages = [
+                        *messages,
+                        {
+                            "role": "user",
+                            "content": (
+                                "上一次 JSON 违反了契约。请返回修正后的完整对象，不要解释。"
+                                f"校验错误：{last_error}"
+                            ),
+                        },
+                    ]
+                result = self.siliconflow.chat(
+                    active_messages,
+                    thinking=True,
+                    reasoning_effort="high",
+                    temperature=0.0,
+                    max_tokens=8192,
+                    seed=11,
+                    response_format="json_object",
+                    use_cache=True,
+                    request_attempts=1,
+                    stream=True,
+                    step_id="distill.map",
+                )
+                try:
+                    payload = json.loads(result.content)
+                    self._discard_unsubstantiated_tensions(payload)
+                    parsed = MapResult.model_validate(payload)
+                    self._validate_sources(parsed, unit)
+                    validate_map_language(parsed, self.output_language)
+                    return parsed
+                except (
+                    json.JSONDecodeError,
+                    ValidationError,
+                    StructuredDistillationError,
+                    OutputLanguageError,
+                ) as exc:
+                    last_error = str(exc)[:2000]
+            raise StructuredDistillationError(
+                f"Map 提取在 {self.max_attempts} 次尝试后失败：{last_error}"
             )
-            try:
-                payload = json.loads(result.content)
-                self._discard_unsubstantiated_tensions(payload)
-                parsed = MapResult.model_validate(payload)
-                self._validate_sources(parsed, unit)
-                validate_map_language(parsed, self.output_language)
-                return parsed
-            except (
-                json.JSONDecodeError,
-                ValidationError,
-                StructuredDistillationError,
-                OutputLanguageError,
-            ) as exc:
-                last_error = str(exc)[:2000]
-        raise StructuredDistillationError(
-            f"Map 提取在 {self.max_attempts} 次尝试后失败：{last_error}"
-        )
 
     @staticmethod
     def _discard_unsubstantiated_tensions(payload: object) -> None:

@@ -31,6 +31,7 @@ from writing_factory.generate.prompts import (
     polish_fact_check_messages,
     polishing_messages,
 )
+from writing_factory.nonfiction import NonfictionGenre
 
 if TYPE_CHECKING:
     from writing_factory.llm.siliconflow import SiliconFlowClient
@@ -58,6 +59,7 @@ def polish_section(
     section_paragraphs: list[str],
     siliconflow: SiliconFlowClient,
     document_form: DocumentForm = "paper",
+    genre: NonfictionGenre = "general_nonfiction",
     check_drift: bool = True,
     progress: ProgressCallback = _no_progress,
     check_cancelled: CancellationCheck = _no_cancellation,
@@ -96,6 +98,7 @@ def polish_section(
         section_heading=section_heading,
         thesis=thesis,
         document_form=document_form,
+        genre=genre,
     )
 
     progress(30, "LLM 文风打磨中")
@@ -109,6 +112,7 @@ def polish_section(
         max_tokens=8192,
         seed=42,
         stream=True,
+        step_id="writing.section_polish",
     )
 
     polished_text = polish_result.content.strip()
@@ -164,6 +168,7 @@ def polish_section(
         response_format="json_object",
         seed=42,
         stream=True,
+        step_id="writing.section_drift",
     )
 
     progress(90, "解析打磨结果")

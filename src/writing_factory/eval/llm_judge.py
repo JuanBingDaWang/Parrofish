@@ -36,7 +36,7 @@ _DEFAULT_DIMENSIONS_ORDER = [
 
 
 class LLMJudge:
-    """LLM-as-judge for evaluating academic writing quality.
+    """LLM-as-judge for evaluating nonfiction writing quality.
 
     Usage:
         judge = LLMJudge(siliconflow)
@@ -114,6 +114,7 @@ class LLMJudge:
                 seed=42,
                 response_format="json_object",
                 stream=True,
+                step_id="evaluation.llm_judge",
             )
 
             return self._parse_result(result.content or "")

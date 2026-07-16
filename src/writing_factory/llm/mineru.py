@@ -6,6 +6,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from pydantic import SecretStr
+
 from writing_factory.config import Settings
 from writing_factory.llm.base import ExternalServiceError, ServiceTransport
 from writing_factory.llm.models import MinerUBatchUpload, MinerUTask
@@ -41,6 +43,19 @@ class MinerUClient:
 
         self.transport.close()
         self.transfers.close()
+
+    def configure(
+        self,
+        *,
+        credential: SecretStr | None = None,
+        base_url: str | None = None,
+    ) -> None:
+        """Apply saved provider settings to subsequent MinerU API calls."""
+
+        if credential is not None:
+            self.transport.set_credential(credential)
+        if base_url is not None:
+            self.transport.set_base_url(base_url)
 
     def submit_url(
         self,

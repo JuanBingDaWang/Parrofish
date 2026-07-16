@@ -437,7 +437,7 @@ class _AcademicFakeClient:
         time.sleep(0.01)
         try:
             task = request["task"]
-            if task.startswith("归并同一篇论文"):
+            if task.startswith("归并同一篇文档"):
                 result = self._paper(request)
             elif task.startswith("列出并聚类"):
                 result = self._clusters(request)
@@ -592,7 +592,7 @@ class _SupplementFakeClient:
 
     def chat(self, _messages, **kwargs):
         self.calls.append(kwargs)
-        return ChatResult(
+        result = ChatResult(
             content=json.dumps(
                 {
                     "decision_heuristics": [],
@@ -607,6 +607,10 @@ class _SupplementFakeClient:
             ),
             model="fake",
         )
+        validator = kwargs.get("result_validator")
+        if callable(validator):
+            validator(result)
+        return result
 
 
 def test_academic_supplement_uses_direct_non_thinking_assembly() -> None:
@@ -730,6 +734,9 @@ def test_academic_supplement_uses_direct_non_thinking_assembly() -> None:
 
     assert client.calls[0]["thinking"] is False
     assert client.calls[0]["stream"] is False
+    assert callable(client.calls[0]["result_validator"])
+    assert client.calls[0]["use_cache"] is True
+    assert client.calls[0]["report_stream_error"] is False
     assert [item.candidate_id for item in persona.mental_models] == [
         "candidate_0",
         "candidate_1",

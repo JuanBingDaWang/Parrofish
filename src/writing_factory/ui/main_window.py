@@ -9,22 +9,21 @@ from typing import Any
 from PyQt6.QtCore import QSize
 from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import (
-    QCheckBox,
-    QFrame,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
-    QPushButton,
-    QSpinBox,
     QStackedWidget,
     QStyle,
     QVBoxLayout,
     QWidget,
 )
 
-from writing_factory.llm.models import ChatResult
+from writing_factory.distill.options import DistillationOptions
+from writing_factory.ui.author_chat_page import AuthorChatPage
+from writing_factory.ui.branding import APP_WINDOW_TITLE, application_icon
+from writing_factory.ui.help_ui import TutorialPage
 from writing_factory.ui.knowledge_page import KnowledgeBasePage
 from writing_factory.ui.persona_editor import (
     PersonaLoader,
@@ -34,6 +33,8 @@ from writing_factory.ui.persona_editor import (
 )
 from writing_factory.ui.persona_page import PersonaPage
 from writing_factory.ui.project_page import ProjectPage
+from writing_factory.ui.settings_dialogs import SettingsDialogBackend
+from writing_factory.ui.settings_page import SettingsPage
 from writing_factory.ui.workers import BackgroundTaskManager, TaskContext
 from writing_factory.ui.writing_task_page import WritingTaskPage
 
@@ -43,24 +44,37 @@ class MainWindow(QMainWindow):
 
     def __init__(
         self,
-        siliconflow_check: Callable[[], ChatResult],
+        siliconflow_check: Callable[[], Any],
         *,
         ingest_document: Callable[[Path, TaskContext], Any] | None = None,
         list_documents: Callable[[], list[dict[str, object]]] | None = None,
         delete_documents: Callable[[set[str], TaskContext], Any] | None = None,
-        distill_persona: Callable[[str, str, set[str], set[str], str, TaskContext], Any]
+        distill_persona: Callable[
+            [str, str, set[str], set[str], str, DistillationOptions, TaskContext], Any
+        ]
+        | None = None,
+        resume_persona: Callable[[str, TaskContext], Any] | None = None,
+        upgrade_persona: Callable[
+            [str, set[str], set[str], str, DistillationOptions, TaskContext], Any
+        ]
         | None = None,
         evaluate_persona: Callable[[str, TaskContext], Any] | None = None,
         list_personas: Callable[[], list[dict[str, object]]] | None = None,
+        list_persona_profiles: Callable[[], list[dict[str, object]]] | None = None,
         delete_personas: Callable[[set[str], TaskContext], Any] | None = None,
         load_persona: PersonaLoader | None = None,
         save_persona: PersonaSaver | None = None,
         load_runtime_persona: RuntimePersonaLoader | None = None,
         list_persona_versions: PersonaVersionLoader | None = None,
+        load_distillation_context: Callable[[str], Any] | None = None,
         get_siliconflow_concurrency: Callable[[], int] | None = None,
         set_siliconflow_concurrency: Callable[[int], None] | None = None,
         get_siliconflow_request_timeout: Callable[[], int] | None = None,
         set_siliconflow_request_timeout: Callable[[int], None] | None = None,
+        get_siliconflow_total_timeout: Callable[[], int] | None = None,
+        set_siliconflow_total_timeout: Callable[[int], None] | None = None,
+        get_siliconflow_stream_idle_timeout: Callable[[], int] | None = None,
+        set_siliconflow_stream_idle_timeout: Callable[[int], None] | None = None,
         get_retrieval_option: Callable[[str, bool], bool] | None = None,
         set_retrieval_option: Callable[[str, bool], None] | None = None,
         retrieve: Callable[..., Any] | None = None,
@@ -77,6 +91,19 @@ class MainWindow(QMainWindow):
         delete_writing_tasks: Callable[[set[str]], int] | None = None,
         preview_source_selection: Callable[[str, set[str], set[str]], dict[str, int]]
         | None = None,
+        list_chat_conversations: Callable[[], list[dict[str, object]]] | None = None,
+        load_chat_conversation: Callable[[str], Any] | None = None,
+        create_chat_conversation: Callable[..., str] | None = None,
+        rename_chat_conversation: Callable[[str, str], None] | None = None,
+        delete_chat_conversations: Callable[[set[str]], int] | None = None,
+        list_chat_messages: Callable[[str], list[Any]] | None = None,
+        send_chat_message: Callable[..., Any] | None = None,
+        verify_chat_message: Callable[..., Any] | None = None,
+        get_author_chat_recent_rounds: Callable[[], int] | None = None,
+        set_author_chat_recent_rounds: Callable[[int], None] | None = None,
+        get_web_search_result_count: Callable[[], int] | None = None,
+        set_web_search_result_count: Callable[[int], None] | None = None,
+        settings_backend: SettingsDialogBackend | None = None,
     ) -> None:
         super().__init__()
         self._siliconflow_check = siliconflow_check
@@ -84,17 +111,27 @@ class MainWindow(QMainWindow):
         self._list_documents = list_documents or (lambda: [])
         self._delete_documents = delete_documents
         self._distill_persona = distill_persona
+        self._resume_persona = resume_persona
+        self._upgrade_persona = upgrade_persona
         self._evaluate_persona = evaluate_persona
         self._list_personas = list_personas or (lambda: [])
+        self._list_persona_profiles = list_persona_profiles or self._list_personas
         self._delete_personas = delete_personas
         self._load_persona = load_persona
         self._save_persona = save_persona
         self._load_runtime_persona = load_runtime_persona
         self._list_persona_versions = list_persona_versions
+        self._load_distillation_context = load_distillation_context
         self._get_siliconflow_concurrency = get_siliconflow_concurrency or (lambda: 3)
         self._set_siliconflow_concurrency = set_siliconflow_concurrency
         self._get_siliconflow_request_timeout = get_siliconflow_request_timeout or (lambda: 900)
         self._set_siliconflow_request_timeout = set_siliconflow_request_timeout
+        self._get_siliconflow_total_timeout = get_siliconflow_total_timeout or (lambda: 1800)
+        self._set_siliconflow_total_timeout = set_siliconflow_total_timeout
+        self._get_siliconflow_stream_idle_timeout = (
+            get_siliconflow_stream_idle_timeout or (lambda: 180)
+        )
+        self._set_siliconflow_stream_idle_timeout = set_siliconflow_stream_idle_timeout
         self._get_retrieval_option = get_retrieval_option or (lambda _k, d=True: d)
         self._set_retrieval_option = set_retrieval_option
         self._retrieve = retrieve
@@ -110,12 +147,25 @@ class MainWindow(QMainWindow):
         self._save_edited_draft = save_edited_draft
         self._delete_writing_tasks = delete_writing_tasks
         self._preview_source_selection = preview_source_selection
+        self._list_chat_conversations = list_chat_conversations or (lambda: [])
+        self._load_chat_conversation = load_chat_conversation or (lambda _identifier: None)
+        self._create_chat_conversation = create_chat_conversation
+        self._rename_chat_conversation = rename_chat_conversation
+        self._delete_chat_conversations = delete_chat_conversations
+        self._list_chat_messages = list_chat_messages or (lambda _identifier: [])
+        self._send_chat_message = send_chat_message
+        self._verify_chat_message = verify_chat_message
+        self._get_author_chat_recent_rounds = get_author_chat_recent_rounds or (lambda: 6)
+        self._set_author_chat_recent_rounds = set_author_chat_recent_rounds
+        self._get_web_search_result_count = get_web_search_result_count or (lambda: 5)
+        self._set_web_search_result_count = set_web_search_result_count
+        self._settings_backend = settings_backend
         self._tasks = BackgroundTaskManager(self)
-        self._check_task_id: str | None = None
         self._close_pending = False
         self._tasks.task_finished.connect(self._task_finished)
 
-        self.setWindowTitle("写作工厂")
+        self.setWindowTitle(APP_WINDOW_TITLE)
+        self.setWindowIcon(application_icon())
         self.setMinimumSize(960, 640)
         self.resize(1120, 720)
         self.setStyleSheet(_STYLESHEET)
@@ -135,8 +185,10 @@ class MainWindow(QMainWindow):
             ("项目", QStyle.StandardPixmap.SP_DirIcon),
             ("知识库", QStyle.StandardPixmap.SP_FileDialogDetailedView),
             ("作者档案", QStyle.StandardPixmap.SP_FileIcon),
+            ("作者对话", QStyle.StandardPixmap.SP_MessageBoxInformation),
             ("写作任务", QStyle.StandardPixmap.SP_CommandLink),
             ("设置", QStyle.StandardPixmap.SP_ComputerIcon),
+            ("教程", QStyle.StandardPixmap.SP_DialogHelpButton),
         )
         for label, icon_type in nav_items:
             item = QListWidgetItem(self.style().standardIcon(icon_type), label)
@@ -165,18 +217,39 @@ class MainWindow(QMainWindow):
         self.persona_page = PersonaPage(
             self._tasks,
             distill_persona=self._distill_persona,
+            resume_persona=self._resume_persona,
+            upgrade_persona=self._upgrade_persona,
             evaluate_persona=self._evaluate_persona,
             list_sources=self._list_documents,
-            list_personas=self._list_personas,
+            list_personas=self._list_persona_profiles,
             delete_personas=self._delete_personas,
             load_persona=self._load_persona,
             save_persona=self._save_persona,
             load_runtime_persona=self._load_runtime_persona,
             list_persona_versions=self._list_persona_versions,
+            load_distillation_context=self._load_distillation_context,
+            get_siliconflow_concurrency=self._get_siliconflow_concurrency,
             show_message=self.statusBar().showMessage,
         )
         self.pages.addWidget(self.persona_page)
         self.knowledge_page.documents_changed.connect(self.persona_page.refresh)
+        self.author_chat_page = AuthorChatPage(
+            self._tasks,
+            list_personas=self._list_personas,
+            list_documents=self._list_documents,
+            list_conversations=self._list_chat_conversations,
+            load_conversation=self._load_chat_conversation,
+            create_conversation=self._create_chat_conversation,
+            rename_conversation=self._rename_chat_conversation,
+            delete_conversations=self._delete_chat_conversations,
+            list_messages=self._list_chat_messages,
+            send_message=self._send_chat_message,
+            verify_message=self._verify_chat_message,
+            show_message=self.statusBar().showMessage,
+        )
+        self.pages.addWidget(self.author_chat_page)
+        self.knowledge_page.documents_changed.connect(self.author_chat_page.refresh)
+        self.persona_page.personas_changed.connect(self.author_chat_page.refresh)
         self.writing_task_page = WritingTaskPage(
             self._tasks,
             list_personas=self._list_personas,
@@ -194,7 +267,34 @@ class MainWindow(QMainWindow):
         )
         self.pages.addWidget(self.writing_task_page)
         self.project_page.projects_changed.connect(self.writing_task_page.refresh_projects)
-        self.pages.addWidget(self._settings_page())
+        self.settings_page = SettingsPage(
+            self._tasks,
+            backend=self._settings_backend,
+            siliconflow_check=self._siliconflow_check,
+            get_concurrency=self._get_siliconflow_concurrency,
+            set_concurrency=self._set_siliconflow_concurrency,
+            get_timeout=self._get_siliconflow_request_timeout,
+            set_timeout=self._set_siliconflow_request_timeout,
+            get_total_timeout=self._get_siliconflow_total_timeout,
+            set_total_timeout=self._set_siliconflow_total_timeout,
+            get_stream_idle_timeout=self._get_siliconflow_stream_idle_timeout,
+            set_stream_idle_timeout=self._set_siliconflow_stream_idle_timeout,
+            get_chat_recent_rounds=self._get_author_chat_recent_rounds,
+            set_chat_recent_rounds=self._set_author_chat_recent_rounds,
+            get_web_search_result_count=self._get_web_search_result_count,
+            set_web_search_result_count=self._set_web_search_result_count,
+            show_message=self.statusBar().showMessage,
+        )
+        self.pages.addWidget(self.settings_page)
+        self.tutorial_page = TutorialPage()
+        self.pages.addWidget(self.tutorial_page)
+        # Keep stable handles used by existing UI tests and integrations.
+        self.siliconflow_status = self.settings_page.siliconflow_status
+        self.check_button = self.settings_page.check_button
+        self.concurrency_input = self.settings_page.concurrency_input
+        self.siliconflow_timeout_input = self.settings_page.timeout_input
+        self.siliconflow_total_timeout_input = self.settings_page.total_timeout_input
+        self.siliconflow_stream_idle_timeout_input = self.settings_page.stream_idle_timeout_input
         self.navigation.currentRowChanged.connect(self._switch_page)
         self.navigation.setCurrentRow(1)
 
@@ -214,7 +314,11 @@ class MainWindow(QMainWindow):
         elif index == 2:
             self.persona_page.refresh()
         elif index == 3:
+            self.author_chat_page.refresh()
+        elif index == 4:
             self.writing_task_page.refresh()
+        elif index == 5:
+            self.settings_page.refresh()
 
     def _empty_page(self, title: str) -> QWidget:
         page = QWidget()
@@ -225,208 +329,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(heading)
         layout.addStretch(1)
         return page
-
-    def _settings_page(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(32, 28, 32, 28)
-        layout.setSpacing(20)
-        heading = QLabel("设置")
-        heading.setObjectName("pageTitle")
-        layout.addWidget(heading)
-
-        section_title = QLabel("外部服务")
-        section_title.setObjectName("sectionTitle")
-        layout.addWidget(section_title)
-
-        siliconflow_row = QFrame()
-        siliconflow_row.setObjectName("serviceRow")
-        row_layout = QHBoxLayout(siliconflow_row)
-        row_layout.setContentsMargins(18, 14, 14, 14)
-        row_layout.setSpacing(16)
-        provider = QLabel("SiliconFlow")
-        provider.setObjectName("providerName")
-        model = QLabel("DeepSeek-V4-Flash")
-        model.setObjectName("mutedText")
-        self.siliconflow_status = QLabel("未检测")
-        self.siliconflow_status.setObjectName("statusNeutral")
-        self.check_button = QPushButton(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload), "检测"
-        )
-        self.check_button.setToolTip("检测 SiliconFlow 连接")
-        self.check_button.clicked.connect(self._start_siliconflow_check)
-        row_layout.addWidget(provider)
-        row_layout.addWidget(model)
-        row_layout.addStretch(1)
-        row_layout.addWidget(self.siliconflow_status)
-        row_layout.addWidget(self.check_button)
-        layout.addWidget(siliconflow_row)
-
-        concurrency_row = QFrame()
-        concurrency_row.setObjectName("serviceRow")
-        concurrency_layout = QHBoxLayout(concurrency_row)
-        concurrency_layout.setContentsMargins(18, 14, 14, 14)
-        concurrency_layout.setSpacing(16)
-        concurrency_label = QLabel("最大并发数")
-        concurrency_label.setObjectName("providerName")
-        concurrency_provider = QLabel("SiliconFlow 全部请求")
-        concurrency_provider.setObjectName("mutedText")
-        self.concurrency_input = QSpinBox()
-        self.concurrency_input.setRange(1, 8)
-        self.concurrency_input.setValue(self._get_siliconflow_concurrency())
-        self.concurrency_input.setToolTip("限制整个程序同时进行的 SiliconFlow 请求数")
-        self.concurrency_input.valueChanged.connect(self._concurrency_changed)
-        concurrency_layout.addWidget(concurrency_label)
-        concurrency_layout.addWidget(concurrency_provider)
-        concurrency_layout.addStretch(1)
-        concurrency_layout.addWidget(self.concurrency_input)
-        layout.addWidget(concurrency_row)
-
-        timeout_row = QFrame()
-        timeout_row.setObjectName("serviceRow")
-        timeout_layout = QHBoxLayout(timeout_row)
-        timeout_layout.setContentsMargins(18, 14, 14, 14)
-        timeout_layout.setSpacing(16)
-        timeout_label = QLabel("单次请求超时上限")
-        timeout_label.setObjectName("providerName")
-        timeout_description = QLabel("SiliconFlow 全部请求（含网络重试）")
-        timeout_description.setObjectName("mutedText")
-        self.siliconflow_timeout_input = QSpinBox()
-        self.siliconflow_timeout_input.setRange(60, 3600)
-        self.siliconflow_timeout_input.setSingleStep(60)
-        self.siliconflow_timeout_input.setSuffix(" 秒")
-        self.siliconflow_timeout_input.setValue(self._get_siliconflow_request_timeout())
-        self.siliconflow_timeout_input.setToolTip(
-            "每个 SiliconFlow 逻辑请求分别计时；框架的三次重新生成各自独立计时"
-        )
-        self.siliconflow_timeout_input.valueChanged.connect(self._siliconflow_timeout_changed)
-        timeout_layout.addWidget(timeout_label)
-        timeout_layout.addWidget(timeout_description)
-        timeout_layout.addStretch(1)
-        timeout_layout.addWidget(self.siliconflow_timeout_input)
-        layout.addWidget(timeout_row)
-
-        mineru_row = QFrame()
-        mineru_row.setObjectName("serviceRow")
-        mineru_layout = QHBoxLayout(mineru_row)
-        mineru_layout.setContentsMargins(18, 14, 14, 14)
-        mineru_layout.setSpacing(16)
-        mineru_name = QLabel("MinerU")
-        mineru_name.setObjectName("providerName")
-        mineru_endpoint = QLabel("API v4")
-        mineru_endpoint.setObjectName("mutedText")
-        mineru_status = QLabel("凭据已加载")
-        mineru_status.setObjectName("statusReady")
-        mineru_layout.addWidget(mineru_name)
-        mineru_layout.addWidget(mineru_endpoint)
-        mineru_layout.addStretch(1)
-        mineru_layout.addWidget(mineru_status)
-        layout.addWidget(mineru_row)
-
-        retrieval_title = QLabel("检索增强")
-        retrieval_title.setObjectName("sectionTitle")
-        layout.addWidget(retrieval_title)
-
-        self.hyde_checkbox = QCheckBox("HyDE 检索")
-        self.hyde_checkbox.setChecked(self._get_retrieval_option("use_hyde", True))
-        self.hyde_checkbox.setToolTip(
-            "先让模型写一段假设性答案，用其向量检索，通常显著提升学术查询召回"
-        )
-        self.hyde_checkbox.stateChanged.connect(
-            lambda state: self._retrieval_option_changed("use_hyde", state)
-        )
-        layout.addWidget(self.hyde_checkbox)
-
-        self.rewrite_checkbox = QCheckBox("查询改写")
-        self.rewrite_checkbox.setChecked(self._get_retrieval_option("use_rewrite", True))
-        self.rewrite_checkbox.setToolTip("把一个抽象问题扩展为 3-5 个具体子查询分别检索后融合")
-        self.rewrite_checkbox.stateChanged.connect(
-            lambda state: self._retrieval_option_changed("use_rewrite", state)
-        )
-        layout.addWidget(self.rewrite_checkbox)
-
-        layout.addStretch(1)
-        return page
-
-    def _retrieval_option_changed(self, key: str, state: int) -> None:
-        """持久化检索增强开关。"""
-
-        if self._set_retrieval_option is None:
-            return
-        enabled = bool(state)
-        self._set_retrieval_option(key, enabled)
-        self.statusBar().showMessage(f"检索选项「{key}」已{'开启' if enabled else '关闭'}", 4000)
-
-    def _concurrency_changed(self, value: int) -> None:
-        """运行时应用并持久化统一并发上限。"""
-
-        if self._set_siliconflow_concurrency is None:
-            return
-        try:
-            self._set_siliconflow_concurrency(value)
-        except ValueError as exc:
-            self.statusBar().showMessage(str(exc), 5000)
-            return
-        self.statusBar().showMessage(f"SiliconFlow 最大并发数已设为 {value}", 4000)
-
-    def _siliconflow_timeout_changed(self, value: int) -> None:
-        """持久化并应用全局 SiliconFlow 单次请求超时上限。"""
-
-        if self._set_siliconflow_request_timeout is None:
-            return
-        try:
-            self._set_siliconflow_request_timeout(value)
-        except ValueError as exc:
-            self.statusBar().showMessage(str(exc), 5000)
-            return
-        self.statusBar().showMessage(f"SiliconFlow 单次请求超时上限已设为 {value} 秒", 4000)
-
-    def _start_siliconflow_check(self) -> None:
-        if self._check_task_id is not None:
-            return
-        self.check_button.setEnabled(False)
-        self.siliconflow_status.setText("检测中")
-        self.siliconflow_status.setObjectName("statusBusy")
-        self.siliconflow_status.style().unpolish(self.siliconflow_status)
-        self.siliconflow_status.style().polish(self.siliconflow_status)
-        self.statusBar().showMessage("正在检测 SiliconFlow")
-
-        def task(context: TaskContext) -> ChatResult:
-            context.report_progress(20, "正在连接")
-            result = self._siliconflow_check()
-            context.report_progress(100, "完成")
-            return result
-
-        self._check_task_id = self._tasks.start(
-            task,
-            on_success=self._check_succeeded,
-            on_error=self._check_failed,
-            on_progress=self._check_progress,
-        )
-
-    def _check_succeeded(self, result: Any) -> None:
-        chat = result if isinstance(result, ChatResult) else None
-        tokens = chat.usage.total_tokens if chat is not None else 0
-        self.siliconflow_status.setText("可用")
-        self.siliconflow_status.setObjectName("statusReady")
-        self.statusBar().showMessage(f"SiliconFlow 可用 · {tokens} tokens", 5000)
-        self._finish_check()
-
-    def _check_failed(self, message: str) -> None:
-        self.siliconflow_status.setText("不可用")
-        self.siliconflow_status.setObjectName("statusError")
-        self.statusBar().showMessage(message, 8000)
-        self._finish_check()
-
-    def _check_progress(self, percent: int, message: str) -> None:
-        if message:
-            self.statusBar().showMessage(f"{message} · {percent}%")
-
-    def _finish_check(self) -> None:
-        self.siliconflow_status.style().unpolish(self.siliconflow_status)
-        self.siliconflow_status.style().polish(self.siliconflow_status)
-        self.check_button.setEnabled(True)
-        self._check_task_id = None
 
     def closeEvent(self, event: QCloseEvent) -> None:
         """Request cooperative task cancellation before closing."""
@@ -474,8 +376,8 @@ QMainWindow, QWidget {
 }
 #pageTitle {
     font-size: 24px;
-    font-weight: 600;
-    color: #18212b;
+    font-weight: 700;
+    color: #101820;
 }
 #sectionTitle {
     font-size: 15px;

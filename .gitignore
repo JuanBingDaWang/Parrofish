@@ -23,9 +23,21 @@ logs/
 *.db-wal
 *.lance/
 
+# Local research corpora and private working files
+/叶芃/
+/出版发行研究_高被引论文/
+/这个文件不重要.docx
+
+# Large source artwork; optimized application icons live under src/
+/icon.png
+
+# Local Windows packaging work and output
+/packaging/build/
+/packaging/work/
+/packaging/output/
+
 # Editors and operating systems
 .idea/
 .vscode/
 .DS_Store
 Thumbs.db
-

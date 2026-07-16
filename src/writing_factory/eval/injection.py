@@ -150,6 +150,7 @@ class InjectionDetector:
                 seed=42,
                 response_format="json_object",
                 stream=True,
+                step_id="evaluation.injection",
             )
             import json
 

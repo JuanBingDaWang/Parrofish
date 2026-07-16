@@ -139,7 +139,7 @@ class FusedHit(BaseModel):
     chunk_id: str
     doc_id: str
     text: str
-    source: Literal["dense", "bm25", "hybrid"]
+    source: Literal["dense", "bm25", "hybrid", "web"]
     dense_rank: int | None = None
     sparse_rank: int | None = None
     rrf_score: float = 0.0
@@ -151,6 +151,10 @@ class FusedHit(BaseModel):
     parent_id: str | None = None
     expanded_from_child: bool = False
     matched_child_ids: tuple[str, ...] = ()
+    title: str | None = None
+    url: str | None = None
+    site_name: str | None = None
+    date_published: str | None = None
 
 
 class RetrievalRequest(BaseModel):

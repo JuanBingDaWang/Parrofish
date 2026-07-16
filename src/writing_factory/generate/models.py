@@ -10,6 +10,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from writing_factory.nonfiction import NonfictionGenre
+
 # ---------------------------------------------------------------------------
 # 枚举与字面量类型
 # ---------------------------------------------------------------------------
@@ -30,8 +32,13 @@ VerificationVerdict = Literal["supported", "partial", "unsupported"]
 
 CitationStyle = Literal["gb-t-7714", "apa", "mla"]
 QualityPreset = Literal["strict", "balanced", "fast_draft", "custom"]
-GenerationQualityStatus = Literal["verified_final", "unverified_draft"]
+EvidenceMode = Literal["knowledge_grounded", "conceptual_only"]
+GenerationQualityStatus = Literal[
+    "verified_final", "unverified_draft", "conceptual_draft"
+]
 DocumentForm = Literal["paragraph", "short_text", "paper"]
+CitationDisplay = Literal["auto", "bibliography", "internal_only"]
+ResolvedCitationDisplay = Literal["bibliography", "internal_only"]
 
 
 def drafting_unit_range(
@@ -58,8 +65,23 @@ class GenerationOptions(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     preset: QualityPreset = Field(default="strict", description="质量预设")
-    document_form: DocumentForm = Field(default="paper", description="文稿形态")
+    evidence_mode: EvidenceMode = Field(
+        default="knowledge_grounded",
+        description="knowledge_grounded 使用知识库事实；conceptual_only 仅做无事实构思",
+    )
+    document_form: DocumentForm = Field(
+        default="paper", description="文稿长度与层级形态；paper 是旧版长文标识"
+    )
+    genre: NonfictionGenre = Field(default="general_nonfiction", description="目标非虚构文体")
+    citation_display: CitationDisplay = Field(
+        default="auto", description="引用在最终成稿中的显示方式"
+    )
     target_length_chars: int = Field(default=5000, ge=500, le=100000, description="目标中文字数")
+    use_hyde: bool = Field(default=True, description="是否在写作检索中使用 HyDE 假设文档")
+    use_query_rewrite: bool = Field(default=True, description="是否在写作检索中使用查询改写")
+    use_web_search: bool = Field(default=False, description="是否使用博查联网检索增强事实来源")
+    topic_refinement: bool = Field(default=True, description="是否使用 LLM 锐化选题")
+    framework_generation: bool = Field(default=True, description="是否使用 LLM 构建提纲")
     fact_verification: bool = Field(default=True, description="是否执行 LLM 事实语义核验")
     section_polish: bool = Field(default=True, description="是否执行逐节文风打磨")
     section_drift_check: bool = Field(default=True, description="是否核对逐节打磨后的事实漂移")
@@ -68,6 +90,56 @@ class GenerationOptions(BaseModel):
     global_polish: bool = Field(default=True, description="是否执行全局一致性打磨")
     global_drift_check: bool = Field(default=True, description="是否核对全局打磨后的事实漂移")
 
+    @model_validator(mode="before")
+    @classmethod
+    def apply_missing_preset_defaults(cls, value: object) -> object:
+        """Give legacy task JSON the current preset semantics without overriding saved choices."""
+
+        if not isinstance(value, dict):
+            return value
+        compatibility_defaults: dict[str, object] = {}
+        if "genre" not in value:
+            compatibility_defaults["genre"] = (
+                "academic_paper"
+                if value.get("document_form", "paper") == "paper"
+                else "general_nonfiction"
+            )
+        if "citation_display" not in value:
+            compatibility_defaults["citation_display"] = "bibliography"
+        preset = value.get("preset", "strict")
+        if preset == "balanced":
+            defaults = {
+                "section_polish": False,
+                "section_drift_check": False,
+                "term_review": False,
+                "structure_review": False,
+                "global_polish": False,
+                "global_drift_check": False,
+            }
+        elif preset == "fast_draft":
+            defaults = {
+                "use_hyde": False,
+                "use_query_rewrite": False,
+                "topic_refinement": False,
+                "framework_generation": False,
+                "fact_verification": False,
+                "section_polish": False,
+                "section_drift_check": False,
+                "term_review": False,
+                "structure_review": False,
+                "global_polish": False,
+                "global_drift_check": False,
+            }
+        else:
+            defaults = {}
+        return {**compatibility_defaults, **defaults, **value}
+
+    @model_validator(mode="after")
+    def validate_evidence_mode(self) -> GenerationOptions:
+        if self.evidence_mode == "conceptual_only" and self.use_web_search:
+            raise ValueError("无事实构思模式不能启用联网事实检索")
+        return self
+
     @classmethod
     def from_preset(
         cls,
@@ -75,6 +147,8 @@ class GenerationOptions(BaseModel):
         *,
         target_length_chars: int,
         document_form: DocumentForm = "paper",
+        genre: NonfictionGenre = "general_nonfiction",
+        citation_display: CitationDisplay = "auto",
     ) -> GenerationOptions:
         """Build one of the supported user-facing quality profiles."""
 
@@ -82,11 +156,15 @@ class GenerationOptions(BaseModel):
             return cls(
                 target_length_chars=target_length_chars,
                 document_form=document_form,
+                genre=genre,
+                citation_display=citation_display,
             )
         if preset == "balanced":
             return cls(
                 preset=preset,
                 document_form=document_form,
+                genre=genre,
+                citation_display=citation_display,
                 target_length_chars=target_length_chars,
                 section_polish=False,
                 section_drift_check=False,
@@ -99,7 +177,13 @@ class GenerationOptions(BaseModel):
             return cls(
                 preset=preset,
                 document_form=document_form,
+                genre=genre,
+                citation_display=citation_display,
                 target_length_chars=target_length_chars,
+                use_hyde=False,
+                use_query_rewrite=False,
+                topic_refinement=False,
+                framework_generation=False,
                 fact_verification=False,
                 section_polish=False,
                 section_drift_check=False,
@@ -111,12 +195,17 @@ class GenerationOptions(BaseModel):
         return cls(
             preset=preset,
             document_form=document_form,
+            genre=genre,
+            citation_display=citation_display,
             target_length_chars=target_length_chars,
         )
 
     @property
     def quality_status(self) -> GenerationQualityStatus:
         """Only fully checked transformation chains qualify as verified final copy."""
+
+        if self.evidence_mode == "conceptual_only":
+            return "conceptual_draft"
 
         transformations_checked = (
             (not self.section_polish or self.section_drift_check)
@@ -128,6 +217,21 @@ class GenerationOptions(BaseModel):
             else "unverified_draft"
         )
 
+    @property
+    def resolved_citation_display(self) -> ResolvedCitationDisplay:
+        """Keep formal citations visible only where the genre normally expects them."""
+
+        if self.evidence_mode == "conceptual_only":
+            return "internal_only"
+
+        if self.citation_display != "auto":
+            return self.citation_display
+        return (
+            "bibliography"
+            if self.genre in {"academic_paper", "research_report", "policy_brief"}
+            else "internal_only"
+        )
+
 
 # ---------------------------------------------------------------------------
 # 4a — 选题
@@ -135,17 +239,21 @@ class GenerationOptions(BaseModel):
 
 
 class ThesisStatement(BaseModel):
-    """Persona 锐化后、经 KB 可行性验证的中心论旨。"""
+    """Persona 锐化后、经 KB 可行性验证的非虚构创作意图。"""
 
     model_config = ConfigDict(frozen=True)
 
     suggested_title: str = Field(default="", description="建议文稿标题，使用简体中文")
-    thesis_text: str = Field(description="一句话核心论点，使用简体中文")
+    thesis_text: str = Field(description="一句话中心信息或核心论点，使用简体中文")
     angle: str = Field(description="persona 选择的独特切入角度，使用简体中文")
     kb_support_assessment: str = Field(
         description="KB 检索后对论点可行性的评估：证据是否充足、哪些方面薄弱，使用简体中文"
     )
     persona_id: str = Field(description="生成该论点的 persona 标识")
+    genre: NonfictionGenre = Field(default="general_nonfiction", description="目标非虚构文体")
+    purpose: str = Field(default="传达中心信息", description="本次文本的沟通目的")
+    audience: str = Field(default="一般读者", description="目标受众")
+    desired_effect: str = Field(default="准确理解", description="希望读者获得的认识或行动效果")
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +273,11 @@ class OutlineEvidence(BaseModel):
     page_start: int | None = None
     page_end: int | None = None
     section_heading: str | None = None
+    source_type: Literal["local", "web"] = "local"
+    title: str | None = None
+    url: str | None = None
+    site_name: str | None = None
+    date_published: str | None = None
 
 
 class OutlineNode(BaseModel):
@@ -173,9 +286,12 @@ class OutlineNode(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     node_id: str = Field(description="节点唯一标识，如 '1'、'1.1'、'2.3'")
-    heading: str = Field(description="本节标题，使用简体中文")
+    heading: str = Field(description="本内容单元标题；无需标题时可为空，使用简体中文")
     rhetorical_purpose: str = Field(
-        description="本节在论证中的修辞目的：如'提出问题'、'文献综述'、'论证核心主张'、'回应反驳'、'总结'等"
+        description="本内容单元在全文中的功能，如提出问题、解释概念、举证、比较、建议或收束"
+    )
+    relation_to_previous: str = Field(
+        default="", description="与前一内容单元的承接、递进、转折等关系"
     )
     candidate_source_keys: list[str] = Field(
         default_factory=list,
@@ -221,6 +337,11 @@ class EvidenceItem(BaseModel):
     page_start: int | None = Field(default=None, description="起始页码")
     page_end: int | None = Field(default=None, description="结束页码")
     section_heading: str | None = Field(default=None, description="所属章节标题")
+    source_type: Literal["local", "web"] = Field(default="local", description="证据来源类型")
+    title: str | None = Field(default=None, description="网页标题")
+    url: str | None = Field(default=None, description="网页 URL")
+    site_name: str | None = Field(default=None, description="网页站点名")
+    date_published: str | None = Field(default=None, description="网页发布时间")
 
 
 class EvidencePack(BaseModel):
@@ -429,6 +550,7 @@ class ReferenceItem(BaseModel):
     citation_text: str = Field(description="按指定样式格式化后的完整引文")
     doc_id: str = Field(description="来源文档标识")
     chunk_id: str = Field(description="关联 chunk 标识")
+    url: str | None = Field(default=None, description="网页来源 URL")
 
 
 class ReferenceList(BaseModel):
@@ -471,6 +593,9 @@ class PolishedDraft(BaseModel):
     title: str = Field(default="", description="文稿标题；单个段落可为空")
     sections: list[PolishedSection] = Field(description="逐节打磨后正文")
     reference_list: ReferenceList = Field(description="代码拼装的参考文献列表")
+    citation_display: ResolvedCitationDisplay = Field(
+        default="bibliography", description="成稿是否显示代码拼装的引用标记"
+    )
     thesis: ThesisStatement = Field(description="锚定论点")
     fact_drift_free: bool = Field(default=True, description="全篇打磨后是否无事实漂移")
     quality_status: GenerationQualityStatus = Field(

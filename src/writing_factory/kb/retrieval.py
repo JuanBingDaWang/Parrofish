@@ -168,6 +168,12 @@ class HybridRetriever:
         fingerprint = self.repository.retrieval_fingerprint(request.kb_id)
         return hashlib.sha256(f"{fingerprint}\x00{serialized}".encode()).hexdigest()
 
+    def clear_cache(self) -> None:
+        """Discard results produced by an obsolete model or rewrite profile."""
+
+        with self._cache_lock:
+            self._cache.clear()
+
     def search(
         self,
         request: RetrievalRequest,

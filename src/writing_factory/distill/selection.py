@@ -88,7 +88,8 @@ def select_academic_candidates(
     generic = [
         record
         for record in eligible
-        if record.validation.specificity in {"field_conventional", "general_academic"}
+        if record.validation.specificity
+        in {"field_conventional", "general_academic", "general_nonfiction"}
     ]
     personal.sort(key=_rank_key)
     generic.sort(key=_rank_key)
@@ -137,6 +138,7 @@ def _rank_key(record: CandidateRecord) -> tuple[int, int, int, int, str]:
         "unverified": 1,
         "field_conventional": 2,
         "general_academic": 3,
+        "general_nonfiction": 3,
     }[validation.specificity]
     return (
         recurrence,

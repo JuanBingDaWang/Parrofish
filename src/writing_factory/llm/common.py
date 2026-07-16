@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -33,13 +33,19 @@ class RateLimiter:
         self._last_request_at = 0.0
         self._lock = threading.Lock()
 
-    def wait(self) -> None:
+    def wait(self, check_cancelled: Callable[[], None] | None = None) -> None:
         """Wait only on the worker thread that is making the request."""
 
         with self._lock:
             delay = self._minimum_interval - (time.monotonic() - self._last_request_at)
-            if delay > 0:
-                time.sleep(delay)
+            deadline = time.monotonic() + max(0.0, delay)
+            while True:
+                if check_cancelled is not None:
+                    check_cancelled()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(0.1, remaining))
             self._last_request_at = time.monotonic()
 
 
@@ -114,7 +120,12 @@ class DynamicConcurrencyGate:
             self._condition.notify_all()
 
     @contextmanager
-    def slot(self, *, priority: int = 10) -> Iterator[None]:
+    def slot(
+        self,
+        *,
+        priority: int = 10,
+        check_cancelled: Callable[[], None] | None = None,
+    ) -> Iterator[None]:
         """等待一个槽位；较小的 priority 值优先。"""
 
         token = object()
@@ -123,14 +134,23 @@ class DynamicConcurrencyGate:
             waiter = _ConcurrencyWaiter(priority, self._sequence, token)
             self._waiters.append(waiter)
             self._waiters.sort()
-            while True:
-                self._refresh_adaptive_limit()
-                if self._active < self._effective_limit and self._waiters[0].token is token:
-                    break
-                timeout = None
-                if self._recover_at:
-                    timeout = max(0.01, self._recover_at - time.monotonic())
-                self._condition.wait(timeout=timeout)
+            try:
+                while True:
+                    if check_cancelled is not None:
+                        check_cancelled()
+                    self._refresh_adaptive_limit()
+                    if self._active < self._effective_limit and self._waiters[0].token is token:
+                        break
+                    timeout = None
+                    if self._recover_at:
+                        timeout = max(0.01, self._recover_at - time.monotonic())
+                    if check_cancelled is not None:
+                        timeout = min(0.1, timeout) if timeout is not None else 0.1
+                    self._condition.wait(timeout=timeout)
+            except Exception:
+                self._waiters = [item for item in self._waiters if item.token is not token]
+                self._condition.notify_all()
+                raise
             self._waiters.pop(0)
             self._active += 1
             self._peak = max(self._peak, self._active)
