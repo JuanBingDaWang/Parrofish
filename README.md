@@ -8,7 +8,7 @@
 
 把“作者怎样思考和表达”与“文章使用哪些事实和证据”严格分开。
 
-![Release](https://img.shields.io/badge/release-v0.1.2-167d6b?style=flat-square)
+![Release](https://img.shields.io/badge/release-v0.1.3-167d6b?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Windows%20x64-2563eb?style=flat-square&logo=windows)
 ![Python](https://img.shields.io/badge/Python-3.12-3776ab?style=flat-square&logo=python&logoColor=white)
 ![PyQt](https://img.shields.io/badge/UI-PyQt6-41cd52?style=flat-square)
@@ -19,7 +19,7 @@
 </div>
 
 > [!IMPORTANT]
-> 当前 `v0.1.2` 面向 Windows 10/11 x64。Parrofish 不是离线模型：文档解析使用 MinerU，文字生成、向量化和重排使用 SiliconFlow；可选联网检索使用博查 Web Search API。调用可能产生对应服务的额度消耗。
+> 当前 `v0.1.3` 面向 Windows 10/11 x64。Parrofish 不是离线模型：文档解析使用 MinerU，文字生成、向量化和重排使用 SiliconFlow；可选联网检索使用博查 Web Search API。调用可能产生对应服务的额度消耗。
 
 ## Parrofish 是什么
 

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "writing-factory"
-version = "0.1.2"
+version = "0.1.3"
 description = "A traceable humanities and social-sciences writing desktop application."
 readme = "README.md"
 license = "GPL-3.0-or-later"

@@ -24,12 +24,14 @@ from writing_factory.distill.composition_prompts import (
 from writing_factory.distill.composition_validation import (
     assemble_composition_dna,
     ensure_composition_chinese,
+    normalize_composition_evidence_ownership,
     validate_composition_reduce,
     validate_document_profile,
 )
 from writing_factory.distill.extraction import StructuredDistillationError
 from writing_factory.distill.models import PersonaMode, SourceInfo, SourceSegment, SourceUnit
 from writing_factory.llm import SiliconFlowClient
+from writing_factory.llm.models import ChatResult
 from writing_factory.store.persona_repository import PersonaRepository
 
 ProgressCallback = Callable[[int, str], None]
@@ -40,7 +42,7 @@ class CompositionDistiller:
     """Extract ordered document structure and reduce it into safe reusable rules."""
 
     PROFILE_VERSION = "composition-document-v2-document-scoped-cache"
-    REDUCE_VERSION = "composition-reduce-v1"
+    REDUCE_VERSION = "composition-reduce-v2-evidence-ownership"
     MAX_DOCUMENT_CHARACTERS = 180_000
 
     def __init__(
@@ -129,6 +131,11 @@ class CompositionDistiller:
         )
         if reduced is None:
             reduced = self._reduce(name, mode, target_profiles, control_profiles)
+        reduced = normalize_composition_evidence_ownership(
+            reduced,
+            target_profiles,
+            control_available=bool(control_profiles),
+        )
         validate_composition_reduce(reduced, target_profiles, control_profiles)
         self.repository.save_stage_result(
             run_id=run_id,
@@ -264,24 +271,29 @@ class CompositionDistiller:
                     *messages,
                     {"role": "user", "content": f"请修正并返回完整 JSON。校验错误：{last_error}"},
                 ]
-                result = self.siliconflow.chat(
-                    active,
-                    thinking=True,
-                    reasoning_effort="high",
-                    temperature=0.0,
-                    max_tokens=8192,
-                    seed=23,
-                    response_format="json_object",
-                    use_cache=True,
-                    request_attempts=2,
-                    stream=True,
-                    step_id="distill.structure_map",
-                )
-                try:
-                    profile = DocumentCompositionProfile.model_validate_json(result.content)
+
+                def parse_result(value: ChatResult) -> DocumentCompositionProfile:
+                    profile = DocumentCompositionProfile.model_validate_json(value.content)
                     validate_document_profile(profile, source.doc_id, segments)
                     ensure_composition_chinese(profile)
                     return profile
+
+                try:
+                    result = self.siliconflow.chat(
+                        active,
+                        thinking=True,
+                        reasoning_effort="high",
+                        temperature=0.0,
+                        max_tokens=8192,
+                        seed=23,
+                        response_format="json_object",
+                        use_cache=attempt == 0,
+                        request_attempts=2,
+                        stream=True,
+                        result_validator=lambda value: parse_result(value),
+                        step_id="distill.structure_map",
+                    )
+                    return parse_result(result)
                 except (ValidationError, ValueError, StructuredDistillationError) as exc:
                     last_error = str(exc)[:2000]
             raise StructuredDistillationError(f"完整文档谋篇分析失败：{last_error}")
@@ -310,24 +322,34 @@ class CompositionDistiller:
                         "content": f"请修正并返回完整 JSON。校验错误：{last_error}",
                     },
                 ]
-                result = self.siliconflow.chat(
-                    active,
-                    thinking=True,
-                    reasoning_effort="high",
-                    temperature=0.0,
-                    max_tokens=8192,
-                    seed=29,
-                    response_format="json_object",
-                    use_cache=True,
-                    request_attempts=2,
-                    stream=True,
-                    step_id="distill.structure_reduce",
-                )
-                try:
-                    reduced = CompositionReduceResult.model_validate_json(result.content)
+
+                def parse_result(value: ChatResult) -> CompositionReduceResult:
+                    reduced = CompositionReduceResult.model_validate_json(value.content)
+                    reduced = normalize_composition_evidence_ownership(
+                        reduced,
+                        target_profiles,
+                        control_available=bool(control_profiles),
+                    )
                     validate_composition_reduce(reduced, target_profiles, control_profiles)
                     ensure_composition_chinese(reduced)
                     return reduced
+
+                try:
+                    result = self.siliconflow.chat(
+                        active,
+                        thinking=True,
+                        reasoning_effort="high",
+                        temperature=0.0,
+                        max_tokens=8192,
+                        seed=29,
+                        response_format="json_object",
+                        use_cache=attempt == 0,
+                        request_attempts=2,
+                        stream=True,
+                        result_validator=lambda value: parse_result(value),
+                        step_id="distill.structure_reduce",
+                    )
+                    return parse_result(result)
                 except (ValidationError, ValueError, StructuredDistillationError) as exc:
                     last_error = str(exc)[:2500]
             raise StructuredDistillationError(f"谋篇 DNA 归并失败：{last_error}")

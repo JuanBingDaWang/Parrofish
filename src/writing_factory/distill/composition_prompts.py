@@ -94,6 +94,8 @@ def composition_reduce_messages(
             "genre_profiles 按 genre 分组，每个目标文档只能计数一次。",
             "recurrence_document_count 必须等于 supporting_doc_ids 去重后的数量。",
             "evidence_chunk_ids 只能来自对应 supporting_doc_ids 的目标文档画像。",
+            "每个 supporting_doc_id 至少对应一个 evidence_chunk_id；"
+            "不要分别手抄两份互不对应的长列表。",
             "一篇文档的模式不得伪装为跨文档稳定规律。",
             "sequence、relations、applicability 和 variability 必须能直接指导新任务谋篇。",
             "句子尺度描述功能组合；具体句长、词汇和口癖留给 ExpressionDNA。",

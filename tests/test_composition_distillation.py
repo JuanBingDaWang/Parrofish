@@ -17,7 +17,10 @@ from writing_factory.distill.composition_models import (
     ReducedCompositionPattern,
     ReducedGenreCompositionProfile,
 )
-from writing_factory.distill.composition_validation import validate_composition_reduce
+from writing_factory.distill.composition_validation import (
+    normalize_composition_evidence_ownership,
+    validate_composition_reduce,
+)
 from writing_factory.distill.extraction import StructuredDistillationError
 from writing_factory.distill.models import SourceInfo, SourceSegment, SourceUnit
 from writing_factory.distill.runtime import build_runtime_persona
@@ -366,3 +369,242 @@ def test_composition_reduce_requires_exact_genre_partition() -> None:
     )
     with pytest.raises(StructuredDistillationError, match="混入了其他文体"):
         validate_composition_reduce(mixed, [commentary_profile, speech_profile], [])
+
+
+def test_composition_reduce_rebuilds_supporting_docs_from_evidence_owners() -> None:
+    units, sources = _corpus(3)
+    targets = [
+        DocumentCompositionProfile(
+            doc_id=source.doc_id,
+            genre="commentary",
+            genre_label="评论 / 观点文章",
+            purpose="形成公共判断",
+            audience="普通读者",
+            heading_strategy="使用功能标题组织论证",
+            paragraph_strategy="先判断，再给依据并解释意义",
+            patterns=[
+                DocumentPatternCandidate(
+                    name="判断到限定",
+                    scope="document",
+                    description="从公共判断推进到适用边界",
+                    applicability="评论现实问题时",
+                    variability="依据和解释可以交替出现",
+                    evidence_chunk_ids=[unit.segments[0].chunk_id],
+                )
+            ],
+        )
+        for unit, source in zip(units, sources, strict=True)
+    ]
+    reduced = CompositionReduceResult(
+        genre_profiles=[
+            ReducedGenreCompositionProfile(
+                genre="commentary",
+                genre_label="评论 / 观点文章",
+                source_document_count=3,
+                heading_strategy="使用功能标题组织论证",
+                paragraph_strategy="先判断，再给依据并解释意义",
+                patterns=[
+                    ReducedCompositionPattern(
+                        pattern_id="ownership_repair",
+                        name="判断到限定",
+                        scope="document",
+                        description="从公共判断推进到适用边界",
+                        applicability="评论现实问题时",
+                        variability="依据和解释可以交替出现",
+                        evidence_chunk_ids=["chunk_0", "chunk_1"],
+                        supporting_doc_ids=["doc_0", "doc_2"],
+                        recurrence_document_count=2,
+                        specificity="author_distinctive",
+                        confidence="low",
+                    )
+                ],
+            )
+        ]
+    )
+
+    normalized = normalize_composition_evidence_ownership(
+        reduced,
+        targets,
+        control_available=False,
+    )
+    pattern = normalized.genre_profiles[0].patterns[0]
+
+    assert pattern.supporting_doc_ids == ["doc_0", "doc_1"]
+    assert pattern.recurrence_document_count == 2
+    assert pattern.specificity == "unverified"
+    assert pattern.confidence == "medium"
+    validate_composition_reduce(normalized, targets, [])
+
+
+def test_composition_reduce_unknown_evidence_reports_pattern_and_chunk() -> None:
+    units, sources = _corpus(2)
+    targets = [
+        DocumentCompositionProfile(
+            doc_id=source.doc_id,
+            genre="commentary",
+            genre_label="评论 / 观点文章",
+            purpose="形成公共判断",
+            audience="普通读者",
+            heading_strategy="使用功能标题",
+            paragraph_strategy="判断后解释",
+            patterns=[
+                DocumentPatternCandidate(
+                    name="判断后解释",
+                    scope="document",
+                    description="先判断再解释",
+                    applicability="评论任务",
+                    variability="允许插入例证",
+                    evidence_chunk_ids=[unit.segments[0].chunk_id],
+                )
+            ],
+        )
+        for unit, source in zip(units, sources, strict=True)
+    ]
+    reduced = CompositionReduceResult(
+        genre_profiles=[
+            ReducedGenreCompositionProfile(
+                genre="commentary",
+                genre_label="评论 / 观点文章",
+                source_document_count=2,
+                heading_strategy="使用功能标题",
+                paragraph_strategy="判断后解释",
+                patterns=[
+                    ReducedCompositionPattern(
+                        pattern_id="unknown_evidence_pattern",
+                        name="未知证据模式",
+                        scope="document",
+                        description="测试未知证据的定向错误",
+                        applicability="测试",
+                        variability="测试",
+                        evidence_chunk_ids=["missing_chunk"],
+                        supporting_doc_ids=["doc_0"],
+                        recurrence_document_count=1,
+                        specificity="provisional",
+                        confidence="low",
+                    )
+                ],
+            )
+        ]
+    )
+
+    with pytest.raises(
+        StructuredDistillationError,
+        match="unknown_evidence_pattern.*missing_chunk",
+    ):
+        normalize_composition_evidence_ownership(
+            reduced,
+            targets,
+            control_available=False,
+        )
+
+
+class _ValidationAwareReduceClient:
+    def __init__(
+        self,
+        invalid: CompositionReduceResult,
+        repairable: CompositionReduceResult,
+    ) -> None:
+        self.results = [invalid, repairable]
+        self.calls: list[dict[str, object]] = []
+
+    def chat(self, messages, **kwargs):
+        self.calls.append({"messages": messages, **kwargs})
+        result = ChatResult(content=self.results.pop(0).model_dump_json(), model="fixture")
+        validator = kwargs.get("result_validator")
+        if callable(validator):
+            validator(result)
+        return result
+
+
+def test_composition_reduce_retries_with_detailed_error_and_bypasses_bad_cache(
+    tmp_path,
+) -> None:
+    units, sources = _corpus(2)
+    targets = [
+        DocumentCompositionProfile(
+            doc_id=source.doc_id,
+            genre="commentary",
+            genre_label="评论 / 观点文章",
+            purpose="围绕公共问题形成有边界的判断",
+            audience="关注现实议题的普通读者",
+            heading_strategy="用功能明确的小标题推动观点",
+            paragraph_strategy="先判断，再给依据，随后解释并限定",
+            patterns=[
+                DocumentPatternCandidate(
+                    name="判断到限定的推进",
+                    scope="document",
+                    description="先提出判断，再以依据和解释推进，最后说明适用边界",
+                    sequence=["提出判断", "给出依据", "解释意义", "限定边界"],
+                    applicability="评论现实问题时",
+                    variability="依据和解释可以交替出现",
+                    evidence_chunk_ids=[unit.segments[0].chunk_id],
+                )
+            ],
+        )
+        for unit, source in zip(units, sources, strict=True)
+    ]
+
+    def result(pattern: ReducedCompositionPattern) -> CompositionReduceResult:
+        return CompositionReduceResult(
+            genre_profiles=[
+                ReducedGenreCompositionProfile(
+                    genre="commentary",
+                    genre_label="评论 / 观点文章",
+                    source_document_count=2,
+                    typical_purposes=["解释现实问题并形成有边界的公共判断"],
+                    audience_tendencies=["面向具有一般背景知识的公众"],
+                    heading_strategy="以论证功能而不是主题名设置小标题",
+                    paragraph_strategy="判断、依据、解释和限定形成连续推进",
+                    patterns=[pattern],
+                    declared_limits=["当前语料只覆盖评论文体，不能外推到其他文体"],
+                )
+            ]
+        )
+
+    invalid = result(
+        ReducedCompositionPattern(
+            pattern_id="bad_cached_pattern",
+            name="判断到限定的推进",
+            scope="document",
+            description="从明确判断出发，经依据和解释后落到适用边界",
+            sequence=["提出判断", "给出依据", "解释意义", "限定边界"],
+            applicability="面向公众评论现实问题时",
+            variability="可根据篇幅合并依据与解释单元",
+            evidence_chunk_ids=["missing_chunk"],
+            supporting_doc_ids=["doc_0"],
+            recurrence_document_count=1,
+            specificity="provisional",
+            confidence="low",
+        )
+    )
+    repairable = result(
+        ReducedCompositionPattern(
+            pattern_id="repaired_pattern",
+            name="判断到限定的推进",
+            scope="document",
+            description="从明确判断出发，经依据和解释后落到适用边界",
+            sequence=["提出判断", "给出依据", "解释意义", "限定边界"],
+            applicability="面向公众评论现实问题时",
+            variability="可根据篇幅合并依据与解释单元",
+            evidence_chunk_ids=["chunk_0", "chunk_1"],
+            supporting_doc_ids=["doc_0"],
+            recurrence_document_count=1,
+            specificity="provisional",
+            confidence="low",
+        )
+    )
+    database = Database(tmp_path / "composition_retry.db")
+    database.initialize()
+    KnowledgeBaseRepository(database).ensure_default()
+    client = _ValidationAwareReduceClient(invalid, repairable)
+    distiller = CompositionDistiller(client, PersonaRepository(database), max_attempts=2)
+
+    reduced = distiller._reduce("测试主题", "topic", targets, [])
+    pattern = reduced.genre_profiles[0].patterns[0]
+
+    assert pattern.supporting_doc_ids == ["doc_0", "doc_1"]
+    assert [call["use_cache"] for call in client.calls] == [True, False]
+    assert callable(client.calls[0]["result_validator"])
+    retry_prompt = client.calls[1]["messages"][-1]["content"]
+    assert "bad_cached_pattern" in retry_prompt
+    assert "missing_chunk" in retry_prompt

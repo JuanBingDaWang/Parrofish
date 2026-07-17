@@ -90,14 +90,86 @@ def validate_composition_reduce(
             raise StructuredDistillationError("没有对照语料时不得宣称结构具有排他性")
         for chunk_id in pattern.evidence_chunk_ids:
             owner = chunk_owners.get(chunk_id)
-            if owner is None or owner not in docs:
-                raise StructuredDistillationError("谋篇模式的结构证据与支持文档不一致")
+            if owner is None:
+                raise StructuredDistillationError(
+                    f"谋篇模式 {pattern.pattern_id} 引用了单篇画像中不存在的结构证据 "
+                    f"{chunk_id}"
+                )
+            if owner not in docs:
+                declared = ", ".join(sorted(docs))
+                raise StructuredDistillationError(
+                    f"谋篇模式 {pattern.pattern_id} 的结构证据 {chunk_id} 实际属于 "
+                    f"{owner}，但 supporting_doc_ids 为：{declared}"
+                )
     if len(pattern_ids) != len(set(pattern_ids)):
         raise StructuredDistillationError("谋篇模式 pattern_id 必须全局唯一")
     for pattern in reduced.cross_genre_patterns:
         genres = {target_genres[doc_id] for doc_id in pattern.supporting_doc_ids}
         if len(genres) < 2:
             raise StructuredDistillationError("跨文体谋篇模式必须覆盖至少两种文体")
+
+
+def normalize_composition_evidence_ownership(
+    reduced: CompositionReduceResult,
+    targets: list[DocumentCompositionProfile],
+    *,
+    control_available: bool,
+) -> CompositionReduceResult:
+    """以单篇画像为准重建证据归属、复现数和派生置信度。"""
+
+    chunk_owners = {
+        chunk_id: profile.doc_id
+        for profile in targets
+        for pattern in profile.patterns
+        for chunk_id in pattern.evidence_chunk_ids
+    }
+
+    def normalize(pattern: ReducedCompositionPattern) -> ReducedCompositionPattern:
+        evidence_chunk_ids = list(dict.fromkeys(pattern.evidence_chunk_ids))
+        unknown = [chunk_id for chunk_id in evidence_chunk_ids if chunk_id not in chunk_owners]
+        if unknown:
+            raise StructuredDistillationError(
+                f"谋篇模式 {pattern.pattern_id} 引用了未知结构证据："
+                f"{', '.join(unknown)}"
+            )
+        supporting_doc_ids = list(
+            dict.fromkeys(chunk_owners[chunk_id] for chunk_id in evidence_chunk_ids)
+        )
+        count = len(supporting_doc_ids)
+        specificity = pattern.specificity
+        if count == 1:
+            specificity = "provisional"
+        elif not control_available and specificity in {
+            "author_distinctive",
+            "genre_conventional",
+            "cross_genre_author",
+        }:
+            specificity = "unverified"
+        confidence = "high" if count >= 3 else "medium" if count == 2 else "low"
+        return pattern.model_copy(
+            update={
+                "evidence_chunk_ids": evidence_chunk_ids,
+                "supporting_doc_ids": supporting_doc_ids,
+                "recurrence_document_count": count,
+                "specificity": specificity,
+                "confidence": confidence,
+            }
+        )
+
+    genre_profiles = [
+        profile.model_copy(
+            update={"patterns": [normalize(pattern) for pattern in profile.patterns]}
+        )
+        for profile in reduced.genre_profiles
+    ]
+    return reduced.model_copy(
+        update={
+            "genre_profiles": genre_profiles,
+            "cross_genre_patterns": [
+                normalize(pattern) for pattern in reduced.cross_genre_patterns
+            ],
+        }
+    )
 
 
 def assemble_composition_dna(
