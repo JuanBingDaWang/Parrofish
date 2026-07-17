@@ -7,6 +7,8 @@ from importlib.resources import files
 from PyQt6.QtGui import QIcon, QPixmap
 from PyQt6.QtWidgets import QApplication
 
+from writing_factory.assets import icons as icon_assets
+
 APP_NAME = "Parrofish"
 ORGANIZATION_NAME = "Parrofish"
 APP_WINDOW_TITLE = (
@@ -27,7 +29,7 @@ def application_icon() -> QIcon:
     """Load raster icon sizes eagerly so wheel resources remain self-contained."""
 
     icon = QIcon()
-    icon_root = files("writing_factory.assets.icons")
+    icon_root = files(icon_assets)
     for filename in ("parrofish-64.png", "parrofish-256.png"):
         pixmap = QPixmap()
         pixmap.loadFromData(icon_root.joinpath(filename).read_bytes(), "PNG")

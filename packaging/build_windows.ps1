@@ -56,6 +56,48 @@ function Reset-BuildDirectory([string]$Path) {
     New-Item -ItemType Directory -Path $fullPath | Out-Null
 }
 
+function Test-FrozenApplication([string]$ExecutablePath) {
+    $smokeRoot = Join-Path $TemporaryRoot "smoke"
+    Reset-BuildDirectory $smokeRoot
+    $oldLocalAppData = $env:LOCALAPPDATA
+    $oldSmokeTest = $env:PARROFISH_FROZEN_SMOKE_TEST
+    $process = $null
+    try {
+        $env:LOCALAPPDATA = $smokeRoot
+        $env:PARROFISH_FROZEN_SMOKE_TEST = "1"
+        $process = Start-Process `
+            -FilePath $ExecutablePath `
+            -WorkingDirectory (Split-Path $ExecutablePath) `
+            -PassThru `
+            -WindowStyle Hidden
+        $deadline = [DateTime]::UtcNow.AddSeconds(30)
+        while ([DateTime]::UtcNow -lt $deadline) {
+            Start-Sleep -Milliseconds 250
+            $process.Refresh()
+            if ($process.HasExited) {
+                if ($process.ExitCode -ne 0) {
+                    throw "Frozen application smoke test exited with code $($process.ExitCode)"
+                }
+                return
+            }
+        }
+        throw "Frozen application smoke test did not exit within 30 seconds"
+    }
+    finally {
+        $env:LOCALAPPDATA = $oldLocalAppData
+        $env:PARROFISH_FROZEN_SMOKE_TEST = $oldSmokeTest
+        if ($null -ne $process) {
+            $process.Refresh()
+            if (-not $process.HasExited) {
+                Stop-Process -Id $process.Id -Force
+            }
+        }
+        if (Test-Path -LiteralPath $smokeRoot) {
+            Remove-Item -LiteralPath $smokeRoot -Recurse -Force
+        }
+    }
+}
+
 Reset-BuildDirectory $BuildRoot
 Reset-BuildDirectory $WorkRoot
 if (-not (Test-Path -LiteralPath $OutputRoot)) {
@@ -83,6 +125,8 @@ if ($LASTEXITCODE -ne 0) {
 if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller build failed"
 }
+
+Test-FrozenApplication (Join-Path $BuildRoot "Parrofish\Parrofish.exe")
 
 & $IsccPath "/DAppVersion=$Version" "/DBuildRoot=$BuildRoot" "/O$OutputRoot" `
     (Join-Path $PackagingRoot "parrofish.iss")

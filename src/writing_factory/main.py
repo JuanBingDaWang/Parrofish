@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
+from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QApplication
 
 from writing_factory.app import build_application
@@ -525,6 +527,8 @@ def main() -> int:
     )
     application.aboutToQuit.connect(app_context.close)
     window.show()
+    if os.environ.get("PARROFISH_FROZEN_SMOKE_TEST") == "1":
+        QTimer.singleShot(100, application.quit)
     return application.exec()
 
 

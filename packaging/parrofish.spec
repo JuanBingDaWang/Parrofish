@@ -9,13 +9,17 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy
 
 PROJECT_ROOT = Path(SPECPATH).resolve().parent
 PACKAGING_ROOT = PROJECT_ROOT / "packaging"
+ICON_ASSET_ROOT = PROJECT_ROOT / "src" / "writing_factory" / "assets" / "icons"
 
 datas = [
     (str(PROJECT_ROOT / "LICENSE"), "."),
     (str(PROJECT_ROOT / "README.md"), "."),
     (str(PACKAGING_ROOT / "THIRD_PARTY_NOTICES.md"), "."),
 ]
-datas += collect_data_files("writing_factory", includes=["assets/**/*"])
+datas += [
+    (str(ICON_ASSET_ROOT / filename), "writing_factory/assets/icons")
+    for filename in ("parrofish-64.png", "parrofish-256.png", "parrofish.ico")
+]
 datas += collect_data_files("citeproc")
 datas += collect_data_files("jieba")
 datas += copy_metadata("keyring")
@@ -61,7 +65,10 @@ for distribution_name in license_distributions:
         if source.is_file():
             datas.append((str(source), f"licenses/{distribution_name}"))
 
-hiddenimports = collect_submodules("keyring.backends")
+hiddenimports = collect_submodules("keyring.backends") + [
+    "writing_factory.assets",
+    "writing_factory.assets.icons",
+]
 
 analysis = Analysis(
     [str(PROJECT_ROOT / "main.py")],
