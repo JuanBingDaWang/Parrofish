@@ -60,3 +60,4 @@ def test_build_script_requires_the_real_frozen_main_window() -> None:
     assert 'os.environ.get("PARROFISH_FROZEN_SMOKE_TEST") == "1"' in main
     assert "QTimer.singleShot(100, application.quit)" in main
     assert main.index("window.show()") < main.index("QTimer.singleShot")
+    assert '"Programs\\Inno Setup 6\\ISCC.exe"' in script

@@ -26,6 +26,8 @@ if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
 
 if (-not $IsccPath) {
     $candidates = @(
+        (Join-Path ([Environment]::GetFolderPath("LocalApplicationData")) "Programs\Inno Setup 6\ISCC.exe"),
+        (Join-Path ([Environment]::GetFolderPath("LocalApplicationData")) "Programs\Inno\ISCC.exe"),
         "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
         "C:\Program Files\Inno Setup 6\ISCC.exe"
     )
