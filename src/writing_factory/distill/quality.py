@@ -57,7 +57,7 @@ def run_static_quality_check(spec: PersonaSpec) -> StaticQualityReport:
             and len({item.doc_id for item in model.cross_domain_evidence}) >= 2
             for model in spec.mental_models
         )
-    elif options.cross_document_validation and spec.mode == "person":
+    elif options.cross_document_validation:
         model_validation = all(
             model.academic_validation is not None
             and model.academic_validation.eligible

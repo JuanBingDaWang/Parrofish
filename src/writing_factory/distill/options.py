@@ -74,14 +74,8 @@ class DistillationOptions(BaseModel):
 
         if self.preset == "legacy":
             return self
-        if mode == "topic":
-            return self.model_copy(
-                update={
-                    "cross_document_validation": False,
-                    "generative_validation": False,
-                    "exclusivity_validation": False,
-                }
-            )
+        if mode == "topic" and self.exclusivity_validation:
+            return self.model_copy(update={"exclusivity_validation": False})
         if not has_control_corpus and self.exclusivity_validation:
             return self.model_copy(update={"exclusivity_validation": False})
         return self

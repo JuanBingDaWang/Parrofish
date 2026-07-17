@@ -579,6 +579,14 @@ class PersonaPage(QWidget):
         return "topic" if self.topic_button.isChecked() else "person"
 
     def _mode_changed(self) -> None:
+        if self._selected_mode() == "topic":
+            self.corpus_recommendation_label.setText(
+                "主题语料建议：目标 6–12 篇 · 至少 4 篇才能运行留出生成力验证"
+            )
+        else:
+            self.corpus_recommendation_label.setText(
+                "语料建议：目标 6–12 篇 · 对照 4–8 篇同领域、同文体文本"
+            )
         self._update_quality_context()
         self._update_button()
 

@@ -365,7 +365,7 @@ class PersonaSpec(BaseModel):
                 for model in self.mental_models
             ):
                 raise ValueError("历史完整档案的核心模型必须通过三重验证")
-        elif self.mode == "person" and self.distillation_options.cross_document_validation:
+        elif self.distillation_options.cross_document_validation:
             if any(model.academic_validation is None for model in self.mental_models):
                 raise ValueError("跨文档质量模式必须保存代码汇总的验证记录")
         return self

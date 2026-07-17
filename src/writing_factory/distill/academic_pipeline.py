@@ -29,7 +29,7 @@ from writing_factory.distill.academic_prompts import (
 )
 from writing_factory.distill.extraction import StructuredDistillationError
 from writing_factory.distill.language import OutputLanguageError, validate_academic_language
-from writing_factory.distill.models import SourceInfo
+from writing_factory.distill.models import PersonaMode, SourceInfo
 from writing_factory.distill.progress import WeightedProgress
 from writing_factory.distill.selection import select_academic_candidates
 from writing_factory.llm import SiliconFlowClient
@@ -41,13 +41,13 @@ StructuredModel = TypeVar("StructuredModel", bound=BaseModel)
 
 
 class AcademicDistillationEngine:
-    """把 Map 候选变成经过复现、生成力和排他性验证的登记表。"""
+    """把人物或主题 Map 候选变成经过独立验证的登记表。"""
 
-    PAPER_VERSION = "academic-paper-v1"
-    CLUSTER_VERSION = "academic-cluster-v1"
-    GENERATIVE_VERSION = "academic-generative-v1"
+    PAPER_VERSION = "nonfiction-paper-v2-mode-aware"
+    CLUSTER_VERSION = "nonfiction-cluster-v2-mode-aware"
+    GENERATIVE_VERSION = "nonfiction-generative-v2-mode-aware"
     EXCLUSIVITY_VERSION = "academic-exclusivity-v1"
-    REGISTRY_VERSION = "academic-registry-v2-partial-validation"
+    REGISTRY_VERSION = "nonfiction-registry-v3-mode-aware-selection"
 
     def __init__(
         self,
@@ -63,6 +63,7 @@ class AcademicDistillationEngine:
         self,
         *,
         run_id: str,
+        mode: PersonaMode,
         target_label: str,
         domain: str,
         target_bundle: dict[str, object],
@@ -83,6 +84,7 @@ class AcademicDistillationEngine:
             return self._consolidate_corpus(
                 run_id=run_id,
                 stage="target_paper",
+                mode=mode,
                 bundle=target_bundle,
                 source_info=target_source_info,
                 corpus_hash=target_hash,
@@ -110,6 +112,7 @@ class AcademicDistillationEngine:
                 return self._consolidate_corpus(
                     run_id=run_id,
                     stage="control_paper",
+                    mode=mode,
                     bundle=control_bundle,
                     source_info=control_source_info,
                     corpus_hash=control_hash,
@@ -147,6 +150,7 @@ class AcademicDistillationEngine:
         progress(83, "跨文档聚类候选")
         clusters = self._cluster(
             run_id=run_id,
+            mode=mode,
             target_label=target_label,
             domain=domain,
             profiles=training_profiles,
@@ -161,6 +165,7 @@ class AcademicDistillationEngine:
         if run_generative_validation:
             validation_jobs["generative"] = lambda: self._validate_generative(
                 run_id=run_id,
+                mode=mode,
                 clusters=clusters,
                 holdout_profiles=holdout_profiles,
                 target_hash=target_hash,
@@ -192,6 +197,7 @@ class AcademicDistillationEngine:
                         exclusivity = value
                     progress(87 + round(3 * completed / len(futures)), "中性验证完成")
         registry = select_academic_candidates(
+            mode=mode,
             clusters=clusters,
             target_profiles=target_profiles,
             target_doc_ids=[item.doc_id for item in target_source_info],
@@ -222,6 +228,7 @@ class AcademicDistillationEngine:
         *,
         run_id: str,
         stage: str,
+        mode: PersonaMode,
         bundle: dict[str, object],
         source_info: tuple[SourceInfo, ...],
         corpus_hash: str,
@@ -248,6 +255,7 @@ class AcademicDistillationEngine:
             doc_evidence = [item for item in evidence if item.get("evidence_id") in evidence_ids]
             input_hash = _hash_payload(
                 self.PAPER_VERSION,
+                mode,
                 source.doc_id,
                 doc_candidates,
                 doc_evidence,
@@ -297,6 +305,7 @@ class AcademicDistillationEngine:
                     future = executor.submit(
                         copy_context().run,
                         self._consolidate_one,
+                        mode,
                         source.doc_id,
                         doc_candidates,
                         doc_evidence,
@@ -322,6 +331,7 @@ class AcademicDistillationEngine:
 
     def _consolidate_one(
         self,
+        mode: PersonaMode,
         doc_id: str,
         candidates: list[dict[str, object]],
         evidence: list[dict[str, object]],
@@ -332,7 +342,12 @@ class AcademicDistillationEngine:
         )
         with stream_context:
             return self._structured_call(
-                paper_profile_messages(doc_id=doc_id, candidates=candidates, evidence=evidence),
+                paper_profile_messages(
+                    mode=mode,
+                    doc_id=doc_id,
+                    candidates=candidates,
+                    evidence=evidence,
+                ),
                 PaperProfile,
                 seed=23,
                 step_id="distill.paper_profile",
@@ -383,13 +398,16 @@ class AcademicDistillationEngine:
         self,
         *,
         run_id: str,
+        mode: PersonaMode,
         target_label: str,
         domain: str,
         profiles: list[PaperProfile],
         target_hash: str,
     ) -> list[CandidateCluster]:
         payload = [item.model_dump(mode="json") for item in profiles]
-        input_hash = _hash_payload(self.CLUSTER_VERSION, target_label, domain, target_hash, payload)
+        input_hash = _hash_payload(
+            self.CLUSTER_VERSION, mode, target_label, domain, target_hash, payload
+        )
         cached = self.repository.find_compatible_stage_result(
             stage="candidate_clusters", item_id="global", input_hash=input_hash,
             model=CandidateClusterResult, persona_id=None,
@@ -404,6 +422,7 @@ class AcademicDistillationEngine:
         if cached is None:
             cached = self._structured_call(
                 cluster_messages(
+                    mode=mode,
                     target_label=target_label,
                     domain=domain,
                     paper_profiles=payload,
@@ -457,6 +476,7 @@ class AcademicDistillationEngine:
         self,
         *,
         run_id: str,
+        mode: PersonaMode,
         clusters: list[CandidateCluster],
         holdout_profiles: list[PaperProfile],
         target_hash: str,
@@ -466,7 +486,7 @@ class AcademicDistillationEngine:
         candidate_payload = [item.model_dump(mode="json") for item in clusters]
         holdout_payload = [item.model_dump(mode="json") for item in holdout_profiles]
         input_hash = _hash_payload(
-            self.GENERATIVE_VERSION, target_hash, candidate_payload, holdout_payload
+            self.GENERATIVE_VERSION, mode, target_hash, candidate_payload, holdout_payload
         )
         result = self.repository.load_stage_result(
             run_id=run_id, stage="generative_validation", item_id="global",
@@ -475,6 +495,7 @@ class AcademicDistillationEngine:
         if result is None:
             result = self._structured_call(
                 generative_validation_messages(
+                    mode=mode,
                     candidates=candidate_payload,
                     holdout_profiles=holdout_payload,
                 ),

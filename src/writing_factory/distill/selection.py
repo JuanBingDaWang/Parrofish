@@ -11,10 +11,12 @@ from writing_factory.distill.academic import (
     ExclusivityAssessment,
     PaperProfile,
 )
+from writing_factory.distill.models import PersonaMode
 
 
 def select_academic_candidates(
     *,
+    mode: PersonaMode,
     clusters: list[CandidateCluster],
     target_profiles: list[PaperProfile],
     target_doc_ids: list[str],
@@ -24,7 +26,7 @@ def select_academic_candidates(
     generative: list[CandidateAssessment],
     exclusivity: list[ExclusivityAssessment],
 ) -> CandidateRegistry:
-    """个性化优先选 3–7 个核心模型，通用模型只在不足 3 个时补位。"""
+    """按人物个性或主题共性语义确定性选择 3–7 个核心模型。"""
 
     paper_candidates = {
         item.paper_candidate_id: (profile.doc_id, item)
@@ -80,30 +82,40 @@ def select_academic_candidates(
         records.append(CandidateRecord(candidate=updated_cluster, validation=validation))
 
     eligible = [record for record in records if record.validation.eligible]
-    personal = [
-        record
-        for record in eligible
-        if record.validation.specificity in {"author_distinctive", "unverified"}
-    ]
-    generic = [
-        record
-        for record in eligible
-        if record.validation.specificity
-        in {"field_conventional", "general_academic", "general_nonfiction"}
-    ]
-    personal.sort(key=_rank_key)
-    generic.sort(key=_rank_key)
-    core = personal[:7]
-    if len(core) < 3:
-        core.extend(generic[: 3 - len(core)])
-    if len(core) < 3:
-        raise ValueError("全部有证据的候选仍不足 3 个，不能发布作者档案")
+    if mode == "topic":
+        eligible.sort(key=_rank_key)
+        core = eligible[:7]
+        if len(core) < 3:
+            raise ValueError("跨文档复现的有证据候选不足 3 个，不能发布主题档案")
+        convention_ids: set[str] = set()
+    else:
+        personal = [
+            record
+            for record in eligible
+            if record.validation.specificity in {"author_distinctive", "unverified"}
+        ]
+        generic = [
+            record
+            for record in eligible
+            if record.validation.specificity
+            in {"field_conventional", "general_academic", "general_nonfiction"}
+        ]
+        personal.sort(key=_rank_key)
+        generic.sort(key=_rank_key)
+        core = personal[:7]
+        if len(core) < 3:
+            core.extend(generic[: 3 - len(core)])
+        if len(core) < 3:
+            raise ValueError("全部有证据的候选仍不足 3 个，不能发布作者档案")
+        core_ids = {record.candidate.candidate_id for record in core}
+        remaining_generic = [
+            record for record in generic if record.candidate.candidate_id not in core_ids
+        ][:7]
+        convention_ids = {
+            record.candidate.candidate_id for record in remaining_generic
+        }
 
     core_ids = {record.candidate.candidate_id for record in core}
-    remaining_generic = [
-        record for record in generic if record.candidate.candidate_id not in core_ids
-    ][:7]
-    convention_ids = {record.candidate.candidate_id for record in remaining_generic}
     ranks = {record.candidate.candidate_id: index for index, record in enumerate(core, 1)}
     selected_records: list[CandidateRecord] = []
     for record in records:
@@ -116,7 +128,7 @@ def select_academic_candidates(
             )
         elif identifier in convention_ids:
             selected_records.append(record.model_copy(update={"selected_as": "convention"}))
-        elif _passed_validation_count(record) >= 1:
+        elif _passed_validation_count(record, mode=mode) >= 1:
             selected_records.append(record.model_copy(update={"selected_as": "heuristic"}))
         else:
             selected_records.append(record)
@@ -149,14 +161,14 @@ def _rank_key(record: CandidateRecord) -> tuple[int, int, int, int, str]:
     )
 
 
-def _passed_validation_count(record: CandidateRecord) -> int:
+def _passed_validation_count(record: CandidateRecord, *, mode: PersonaMode) -> int:
     """Nüwa 三重验证通过一至两项的候选降级为启发式。"""
 
     validation = record.validation
-    return sum(
-        (
-            validation.recurrence_document_count >= 2,
-            validation.generative_status == "passed",
-            validation.specificity == "author_distinctive",
-        )
-    )
+    checks = [
+        validation.recurrence_document_count >= 2,
+        validation.generative_status == "passed",
+    ]
+    if mode == "person":
+        checks.append(validation.specificity == "author_distinctive")
+    return sum(checks)

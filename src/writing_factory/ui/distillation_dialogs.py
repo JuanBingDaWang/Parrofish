@@ -36,13 +36,13 @@ DISTILLATION_STEP_HELP = (
     ),
     (
         "留出语料生成力验证",
-        "用其余语料提炼出的候选预测留出文档的选择和组织方式。",
+        "用其余语料提炼出的候选解释留出文档的问题框架、信息选择和组织方式。",
         "约 1 次，通常 3–12 分钟",
-        "关闭后不声称模型能预测作者对新问题的处理路径。",
+        "关闭后不声称模型能迁移到作者新问题或同主题的新文本；至少 4 篇才有可用留出项。",
     ),
     (
         "对照语料排他性验证",
-        "与同领域对照文本比较，区分作者特征和通用非虚构惯例。",
+        "人物模式下与同领域对照文本比较，区分作者特征和通用非虚构惯例。",
         "约每篇对照画像 + 1 次验证",
         "关闭后区分度标为未验证；没有对照语料时不可用。",
     ),
@@ -195,12 +195,8 @@ class DistillationQualityPanel(QWidget):
             ).normalized(mode=mode, has_control_corpus=has_control)
         return DistillationOptions(
             preset="custom",
-            cross_document_validation=(
-                mode == "person" and self.cross_document_checkbox.isChecked()
-            ),
-            generative_validation=(
-                mode == "person" and self.generative_checkbox.isChecked()
-            ),
+            cross_document_validation=self.cross_document_checkbox.isChecked(),
+            generative_validation=self.generative_checkbox.isChecked(),
             exclusivity_validation=(
                 mode == "person"
                 and has_control
@@ -255,19 +251,17 @@ class DistillationQualityPanel(QWidget):
         person = self._mode == "person"
         self._updating = True
         try:
-            if custom and not person:
-                self.cross_document_checkbox.setChecked(False)
             cross = self.cross_document_checkbox.isChecked()
-            if custom and (not person or not cross):
+            if custom and not cross:
                 self.generative_checkbox.setChecked(False)
                 self.exclusivity_checkbox.setChecked(False)
-            elif custom and not self._has_control:
+            elif custom and (not person or not self._has_control):
                 self.exclusivity_checkbox.setChecked(False)
         finally:
             self._updating = False
-        self.cross_document_checkbox.setEnabled(custom and person)
+        self.cross_document_checkbox.setEnabled(custom)
         cross = self.cross_document_checkbox.isChecked()
-        self.generative_checkbox.setEnabled(custom and person and cross)
+        self.generative_checkbox.setEnabled(custom and cross)
         self.exclusivity_checkbox.setEnabled(custom and person and cross and self._has_control)
         self.composition_checkbox.setEnabled(custom)
 

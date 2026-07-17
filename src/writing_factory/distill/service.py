@@ -74,7 +74,7 @@ class DistillationService:
     """Persist each map result and publish only a fully validated PersonaSpec."""
 
     MAP_PIPELINE_VERSION = "persona-map-v5-unit-scoped"
-    REDUCE_PIPELINE_VERSION = "persona-reduce-v8-quality-options"
+    REDUCE_PIPELINE_VERSION = "persona-reduce-v9-topic-validation"
     LEGACY_MAP_PIPELINE_VERSION = "persona-map-v4-academic-zh"
     LEGACY_REDUCE_PIPELINE_VERSION = "persona-reduce-v7-composition-dna"
 
@@ -295,7 +295,6 @@ class DistillationService:
         )
         use_academic = (
             self.academic_engine is not None
-            and mode == "person"
             and normalized.cross_document_validation
         )
         input_hash = self._input_hash(
@@ -391,6 +390,7 @@ class DistillationService:
                     with context:
                         return self.academic_engine.build_registry(
                             run_id=run.run_id,
+                            mode=mode,
                             target_label=label,
                             domain=domain.strip(),
                             target_bundle=target_bundle,

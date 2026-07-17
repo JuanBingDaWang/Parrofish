@@ -123,6 +123,7 @@ def test_personal_models_exclude_generic_conventions_after_reaching_three() -> N
     ]
 
     registry = select_academic_candidates(
+        mode="person",
         clusters=clusters,
         target_profiles=profiles,
         target_doc_ids=[profile.doc_id for profile in profiles],
@@ -153,6 +154,7 @@ def test_generic_model_only_fills_core_when_personal_models_are_fewer_than_three
     ]
 
     registry = select_academic_candidates(
+        mode="person",
         clusters=clusters,
         target_profiles=profiles,
         target_doc_ids=[profile.doc_id for profile in profiles],
@@ -178,6 +180,7 @@ def test_selector_refuses_to_fabricate_three_models() -> None:
     profiles = _profiles(2, docs=(1, 2))
     with pytest.raises(ValueError, match="不足 3 个"):
         select_academic_candidates(
+            mode="person",
             clusters=[_cluster(index, (1, 2)) for index in range(2)],
             target_profiles=profiles,
             target_doc_ids=[profile.doc_id for profile in profiles],
@@ -207,6 +210,7 @@ def test_failed_distinctive_candidate_is_downgraded_to_heuristic() -> None:
     )
 
     registry = select_academic_candidates(
+        mode="person",
         clusters=clusters,
         target_profiles=profiles,
         target_doc_ids=[profile.doc_id for profile in profiles],
@@ -223,6 +227,7 @@ def test_failed_distinctive_candidate_is_downgraded_to_heuristic() -> None:
     assert downgraded.selected_as == "heuristic"
 
     messages = academic_supplement_messages(
+        mode="person",
         candidate_bundle={"mental_candidates": []},
         expression=ExpressionAnalyzer().analyze(["先提出问题，再组织证据。"]),
         source_info=tuple(
@@ -428,9 +433,11 @@ class _AcademicFakeClient:
         self.active = 0
         self.peak = 0
         self.lock = threading.Lock()
+        self.requests: list[dict[str, object]] = []
 
     def chat(self, messages, **_kwargs):
         request = json.loads(messages[1]["content"])
+        self.requests.append(request)
         with self.lock:
             self.active += 1
             self.peak = max(self.peak, self.active)
@@ -475,19 +482,28 @@ class _AcademicFakeClient:
         for profile in request["paper_profiles"]:
             for item in profile["candidates"]:
                 grouped.setdefault(item["name"], []).append(item)
+        topic = request.get("persona_mode") == "topic"
         return {
             "candidates": [
                 {
                     "candidate_id": members[0]["paper_candidate_id"],
                     "operation": "argument_structure",
                     "name": name,
-                    "description": "该作者反复通过问题层次安排证据和推论。",
+                    "description": (
+                        "同主题文本反复通过问题层次安排信息和推论。"
+                        if topic
+                        else "该作者反复通过问题层次安排证据和推论。"
+                    ),
                     "paper_candidate_ids": [item["paper_candidate_id"] for item in members],
                     "evidence_ids": [item["evidence_ids"][0] for item in members],
                     "applicability": "需要解释复杂关系的学术论证。",
                     "limits": "简单事实说明中不需要多层展开。",
-                    "attribution_scope": "author_specific",
-                    "attribution_rationale": "该操作在多篇目标论文中稳定复现。",
+                    "attribution_scope": "uncertain" if topic else "author_specific",
+                    "attribution_rationale": (
+                        "这是同主题文本的共同操作，不归因于某位作者。"
+                        if topic
+                        else "该操作在多篇目标论文中稳定复现。"
+                    ),
                 }
                 for name, members in grouped.items()
             ]
@@ -565,6 +581,7 @@ def test_academic_engine_runs_paper_consolidation_and_neutral_holdout(tmp_path) 
 
     registry = engine.build_registry(
         run_id=run.run_id,
+        mode="person",
         target_label="测试作者",
         domain="出版学",
         target_bundle={
@@ -584,6 +601,89 @@ def test_academic_engine_runs_paper_consolidation_and_neutral_holdout(tmp_path) 
     assert len(registry.holdout_doc_ids) == 1
     assert all(item.validation.generative_status == "passed" for item in registry.records)
     assert client.peak == 3
+
+
+def test_topic_engine_runs_cross_document_and_neutral_holdout_validation(tmp_path) -> None:
+    database = Database(tmp_path / "topic_engine.db")
+    database.initialize()
+    KnowledgeBaseRepository(database).ensure_default()
+    repository = PersonaRepository(database)
+    run = repository.begin_or_resume(
+        name="数字出版研究",
+        mode="topic",
+        kb_id="kb_default",
+        source_hash="topic_hash",
+        input_hash="topic_input_hash",
+        source_doc_ids=[f"topic_doc_{index}" for index in range(4)],
+        map_total=4,
+    )
+    evidence_registry: list[dict[str, object]] = []
+    mental_candidates: list[dict[str, object]] = []
+    for doc in range(4):
+        for candidate in range(3):
+            evidence_id = f"topic_ev_{doc}_{candidate}"
+            evidence_registry.append(
+                {
+                    "evidence_id": evidence_id,
+                    "chunk_id": f"topic_chunk_{doc}_{candidate}",
+                    "doc_id": f"topic_doc_{doc}",
+                    "domain": "数字出版",
+                    "summary": "该片段展示了同主题文本的问题框架和组织路径。",
+                    "confidence": "high",
+                }
+            )
+            mental_candidates.append(
+                {
+                    "map_candidate_id": f"topic_map_{doc}_{candidate}",
+                    "unit_id": f"topic_unit_{doc}",
+                    "name": f"主题模型{candidate}",
+                    "description": "通过问题层次组织信息和解释路径。",
+                    "evidence_ids": [evidence_id],
+                    "source_doc_ids": [f"topic_doc_{doc}"],
+                    "generative_rationale": "可迁移解释新的同主题文本。",
+                    "exclusivity_rationale": "主题模式不判断作者排他性。",
+                }
+            )
+    source_info = tuple(
+        SourceInfo(
+            doc_id=f"topic_doc_{index}",
+            title=f"数字出版论文{index}",
+            filename=f"topic_{index}.pdf",
+            chunk_count=1,
+        )
+        for index in range(4)
+    )
+    client = _AcademicFakeClient()
+    engine = AcademicDistillationEngine(client, repository, parallelism=lambda: 3)
+
+    registry = engine.build_registry(
+        run_id=run.run_id,
+        mode="topic",
+        target_label="数字出版研究",
+        domain="",
+        target_bundle={
+            "mental_candidates": mental_candidates,
+            "evidence_registry": evidence_registry,
+        },
+        target_source_info=source_info,
+        target_hash="topic_hash",
+        control_bundle=None,
+        control_source_info=(),
+        control_hash=None,
+        progress=lambda _percent, _message: None,
+        check_cancelled=lambda: None,
+    )
+
+    core = [item for item in registry.records if item.selected_as == "core"]
+    assert len(core) == 3
+    assert len(registry.holdout_doc_ids) == 1
+    assert all(item.validation.generative_status == "passed" for item in core)
+    assert all(item.candidate.attribution_scope == "uncertain" for item in core)
+    assert all(
+        request.get("persona_mode") == "topic"
+        for request in client.requests
+        if request["task"].startswith(("归并", "列出", "逐个检验"))
+    )
 
 
 class _SupplementFakeClient:
@@ -743,3 +843,27 @@ def test_academic_supplement_uses_direct_non_thinking_assembly() -> None:
         "candidate_2",
     ]
     assert persona.decision_heuristics[0].rule.startswith("采用“模型3”")
+
+
+def test_topic_supplement_prompt_requires_evidence_backed_divergence() -> None:
+    registry = CandidateRegistry(target_doc_ids=["doc_1"])
+    messages = academic_supplement_messages(
+        mode="topic",
+        candidate_bundle={"mental_candidates": [], "evidence_registry": []},
+        expression=ExpressionAnalyzer().analyze(["不同路径围绕同一问题展开争论。"]),
+        source_info=(
+            SourceInfo(
+                doc_id="doc_1",
+                title="主题材料",
+                filename="topic.pdf",
+                chunk_count=1,
+            ),
+        ),
+        output_language="zh-CN",
+        academic_registry=registry,
+    )
+
+    request = json.loads(messages[1]["content"])
+    assert request["mode"] == "topic"
+    assert any("school_divergences" in rule for rule in request["conciseness_rules"])
+    assert any("主题共同模式" in item for item in request["required_limits"])

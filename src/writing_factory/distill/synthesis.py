@@ -173,6 +173,11 @@ class PersonaSynthesizer:
         "本档案只是调研截止日的语料快照",
         "公开表达不等于作者的真实想法",
     )
+    TOPIC_REQUIRED_LIMITS = (
+        "主题共同模式不是所有同类文本必然遵循的规律",
+        "本档案只是调研截止日与所选语料范围内的快照",
+        "语料中的流派观点不等于系统认可的结论",
+    )
 
     def __init__(
         self,
@@ -313,6 +318,7 @@ class PersonaSynthesizer:
         """代码装配模型，只让短 Reduce 补充非模型字段。"""
 
         messages = academic_supplement_messages(
+            mode=mode,
             candidate_bundle=bundle,
             expression=expression,
             source_info=source_info,
@@ -441,7 +447,7 @@ class PersonaSynthesizer:
                 evidence_ids=candidate.evidence_ids,
                 applicability=candidate.applicability,
                 limits=candidate.limits,
-                generative=validation.generative_status != "failed",
+                generative=validation.generative_status == "passed",
                 exclusive=validation.specificity == "author_distinctive",
                 generative_rationale=validation.generative_rationale,
                 exclusivity_rationale=validation.exclusivity_rationale,
@@ -533,7 +539,10 @@ class PersonaSynthesizer:
         information_gaps = [
             self._assemble_gap(item, gap_registry) for item in reduced.information_gaps
         ]
-        limits = self._unique_readable_text([*reduced.declared_limits, *self.REQUIRED_LIMITS])
+        required_limits = (
+            self.TOPIC_REQUIRED_LIMITS if mode == "topic" else self.REQUIRED_LIMITS
+        )
+        limits = self._unique_readable_text([*reduced.declared_limits, *required_limits])
         style_tags = reduced.style_tags if mode == "person" else StyleTags()
         style_rules = list(reduced.style_rules)
         taboo_words = reduced.taboo_words
@@ -608,7 +617,7 @@ class PersonaSynthesizer:
             limits=item.limits,
             validation=TripleValidation(
                 cross_domain=academic.recurrence_document_count >= 2,
-                generative=academic.generative_status != "failed",
+                generative=academic.generative_status == "passed",
                 exclusive=academic.specificity == "author_distinctive",
                 generative_rationale=academic.generative_rationale,
                 exclusivity_rationale=academic.exclusivity_rationale,

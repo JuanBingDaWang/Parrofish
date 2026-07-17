@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +34,20 @@ def test_installer_is_per_user_and_preserves_runtime_data() -> None:
     assert "PrivilegesRequired=lowest" in installer
     assert "UninstallDelete" not in installer
     assert "Parrofish-Setup-{#AppVersion}-x64" in installer
+
+
+def test_windows_file_version_matches_release_version() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    version = project["project"]["version"]
+    major, minor, patch = (int(item) for item in version.split("."))
+    version_info = (ROOT / "packaging" / "windows_version_info.txt").read_text(
+        encoding="utf-8"
+    )
+
+    assert f"filevers=({major}, {minor}, {patch}, 0)" in version_info
+    assert f"prodvers=({major}, {minor}, {patch}, 0)" in version_info
+    assert f"FileVersion', '{version}'" in version_info
+    assert f"ProductVersion', '{version}'" in version_info
 
 
 def test_build_script_requires_the_real_frozen_main_window() -> None:

@@ -54,8 +54,8 @@ def test_distillation_options_enforce_dependencies_and_source_capabilities() -> 
         "deep",
         has_control_corpus=True,
     ).normalized(mode="topic", has_control_corpus=True)
-    assert not topic.cross_document_validation
-    assert not topic.generative_validation
+    assert topic.cross_document_validation
+    assert topic.generative_validation
     assert not topic.exclusivity_validation
     assert topic.composition_dna
 
@@ -75,7 +75,7 @@ def test_quality_help_describes_every_optional_step(qtbot) -> None:
     assert any("4–8 篇" in label.text() for label in dialog.findChildren(QLabel))
 
 
-def test_quality_panel_help_button_is_accessible_and_topic_custom_is_honest(qtbot) -> None:
+def test_quality_panel_supports_topic_cross_document_and_generative_steps(qtbot) -> None:
     panel = DistillationQualityPanel(
         counts_provider=lambda: (10, 3),
         concurrency_provider=lambda: 4,
@@ -88,9 +88,19 @@ def test_quality_panel_help_button_is_accessible_and_topic_custom_is_honest(qtbo
     panel.set_context(mode="topic", has_control=True)
 
     assert panel.help_button.accessibleName() == "蒸馏质量步骤说明"
-    assert not panel.cross_document_checkbox.isChecked()
-    assert not panel.generative_checkbox.isChecked()
-    assert not panel.options().cross_document_validation
+    assert panel.cross_document_checkbox.isChecked()
+    assert panel.generative_checkbox.isChecked()
+    assert panel.cross_document_checkbox.isEnabled()
+    assert panel.generative_checkbox.isEnabled()
+    assert panel.options().cross_document_validation
+    assert panel.options().generative_validation
+    assert not panel.options().exclusivity_validation
+
+    panel.preset_combo.setCurrentIndex(panel.preset_combo.findData("deep"))
+    assert panel.cross_document_checkbox.isChecked()
+    assert panel.generative_checkbox.isChecked()
+    assert panel.composition_checkbox.isChecked()
+    assert not panel.exclusivity_checkbox.isChecked()
 
 
 def test_upgrade_dialog_restores_original_roles_when_returning_to_incremental(qtbot) -> None:
